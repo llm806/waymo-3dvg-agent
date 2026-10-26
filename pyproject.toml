@@ -1,0 +1,21 @@
+[project]
+name = "waymo-3dvg-agent"
+version = "0.1.0"
+description = "Evidence-grounded Waymo annotation for reproducible 3D visual grounding research"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi[standard]>=0.142.2",
+    "numpy>=2.4.6",
+    "openai>=3.24.0",
+    "pillow>=12.3.0",
+    "pyarrow>=25.0.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
