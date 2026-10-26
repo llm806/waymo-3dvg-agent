@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { setImmediate } from 'node:timers/promises'
-import { readJson, readPollingJson, errorMessage, isAnnotationResult, isProcessingRecord, providerDiagnosisLabel, categoryLabel, reasonLabel, phases, automaticCheckState, automaticCheckLabels } from '../src/shared/annotationDisplay.ts'
+import { readJson, readPollingJson, errorMessage, isAnnotationResult, isProcessingRecord, providerDiagnosisLabel, categoryLabel, reasonLabel, phases, automaticCheckState, automaticCheckLabels, sampleFilterLabels, matchesSampleFilter } from '../src/shared/annotationDisplay.ts'
 import { taskName, taskDetails, parseAnnotationCount, exportTaskSelection } from '../src/shared/taskName.ts'
 import { formatDuration, formatTiming, hasIncompleteTiming } from '../src/shared/duration.ts'
 import { taskLocation, taskUrl, openTask, sampleUrl } from '../src/navigation.ts'
@@ -733,7 +733,7 @@ test('deletion and rework preserve user decisions when follow-up operations fail
     {phase:'ground_permuted',text:'换一种输入顺序再次检查'},
     {task:'paused',text:'返工已暂停'},
     {status:'needs_evidence',reason:'target_spatially_ambiguous',text:'返工未通过'},
-    {status:'calibration_hold',automatic_passed:true,text:'返工完成'},
+    {status:'calibration_hold',automatic_passed:true,text:'文本核验通过 · 反馈请人工确认'},
   ]){
     const props={items:[{...base,...row}],task:{status:row.task??'running',executor_active:!row.task,control:null,reason:null},
       preparationLabel:()=> '校验点云与图片',onResult(){}}
@@ -749,6 +749,25 @@ test('deletion and rework preserve user decisions when follow-up operations fail
     task:{status:'completed',executor_active:false,control:null,reason:null},
   }))
   for(const text of ['The original pickup.','The silver pickup.','请补充区分信息。','6','7','不能唯一定位','最多 1 版草稿'])assert.ok(failure.includes(text),text)
+  const unmet=renderToStaticMarkup(require('react').createElement(rework.default,{
+    items:[{...base,status:'calibration_hold',automatic_passed:true,feedback:'补充向右行驶的运动状态',
+      feedback_check:{passed:false,historical:true,requirements:[{kind:'motion',label:'运动状态／行驶方向',status:'unsupported',reason:'单帧不能证明运动。'}]},
+      attempts:[{expression:'The sedan in front of the ego vehicle.',errors:[],ground_rounds:2}]}],
+    task:{status:'running',executor_active:true,control:null,reason:null},
+  }))
+  assert.match(unmet,/文本核验通过 · 反馈未满足/)
+  assert.match(unmet,/当前证据能力不支持/)
+  assert.match(unmet,/原自动核验结论、样本状态和调用记录未改写/)
+  assert.doesNotMatch(unmet,/返工完成|失败草稿保留供人工判断/)
+  const suggestion=renderToStaticMarkup(require('react').createElement(rework.default,{
+    items:[{...base,status:'calibration_hold',automatic_passed:true,
+      feedback_check:{passed:false,blocking_errors:[],requirements:[{kind:'motion',label:'运动状态',status:'unsupported',required:false,reason:'已继续寻找有依据的空间线索。'}]},
+      attempts:[{expression:'The blue SUV ahead of the ego vehicle.',errors:[],ground_rounds:2}]}],
+    task:{status:'running',executor_active:true,control:null,reason:null},
+  }))
+  assert.match(suggestion,/部分建议未采用/)
+  assert.match(suggestion,/建议／示例/)
+  assert.doesNotMatch(suggestion,/返工未通过|反馈未满足|class="error"/)
   const mismatch=renderToStaticMarkup(require('react').createElement(rework.default,{
     items:[{...base,status:'needs_evidence',reason:'description_validation_failed',attempts:[{
       expression:'The sedan near the red car in the left-side view.',
@@ -776,7 +795,10 @@ test('sample discard is available outside localization and protects the displaye
     const storage=new Map(),job={job_id:'remembered-job',status:'completed',counts:{needs_evidence:60}}
     const samples=Array.from({length:61},(_,i)=>({ordinal:100+i,category:'vehicle',expression:`Vehicle ${i}.`,run_id:`run-${i}`,packet_id:`packet-${i}`,
       revision:`revision-${i}`,status:i?'needs_evidence':'calibration_hold',automatic_passed:!i,can_review:true,manual_review:null}))
-    const list={job_id:job.job_id,status:'completed',samples,review_summary:{unreviewed:61,usable:1,accepted:0,rejected:0,discarded:0}}
+    samples[0].usable=true
+    Object.assign(samples[1],{manual_approved:true,usable:true,manual_review:{verdict:'accepted'}})
+    Object.assign(samples[2],{usable:false,manual_review:{verdict:'discarded'}})
+    const list={job_id:job.job_id,status:'completed',samples,review_summary:{unreviewed:59,usable:2,accepted:1,rejected:0,discarded:1}}
     const requests=[]
     function mount(hash){
       let index=0,serial=0,tree
@@ -804,7 +826,7 @@ test('sample discard is available outside localization and protects the displaye
           useEffect(fn,deps){const i=index++;if(!same(effects[i]?.deps,deps))pending.push(()=>{effects[i]?.cleanup?.();effects[i]={deps,cleanup:fn()}})},
         }
         if(name==='./resultViewState')return resultViewState
-        if(name.endsWith('/annotationDisplay'))return {readJson,readPollingJson,errorMessage,automaticCheckState,automaticCheckLabels,categoryLabel,objectName:id=>id,manualReviewLabels:{}}
+        if(name.endsWith('/annotationDisplay'))return {readJson,readPollingJson,errorMessage,automaticCheckState,automaticCheckLabels,sampleFilterLabels,matchesSampleFilter,categoryLabel,objectName:id=>id,manualReviewLabels:{}}
         if(name.endsWith('/taskName'))return {taskName:()=> '原任务'}
         if(name.endsWith('/cameraViews'))return {cameraViewLabel:()=> '前方'}
         if(name.endsWith('/navigation'))return {sampleUrl}
@@ -822,7 +844,12 @@ test('sample discard is available outside localization and protects the displaye
     let ui
     try{
       ui=mount('#results');let nodes=await ui.settle()
-      nodes.find(n=>n.props?.['aria-label']==='自动核验筛选').props.onChange({target:{value:'failed'}})
+      nodes.find(n=>n.props?.['aria-label']==='样本状态筛选').props.onChange({target:{value:'failed'}})
+      nodes=ui.render()
+      assert.equal(nodes.find(n=>n.type==='option'&&n.props.value==='failed').props.children.join(''),'自动核验未通过（58）')
+      const failedList=nodes.find(n=>n.type==='ol'&&n.props.onScroll)
+      assert.ok(flatten(failedList).filter(n=>n.type==='strong').every(n=>![101,102].includes(Number(n.props.children[1]))))
+      assert.equal(automaticCheckState(samples[1]),'failed') // Approval preserves the original automatic result.
       nodes=ui.render();nodes.find(n=>n.props?.['aria-label']==='下一页样本').props.onClick()
       nodes=ui.render();nodes.find(n=>n.type==='button'&&flatten(n.props.children).some(c=>c.type==='strong'&&c.props.children?.includes(145))).props.onClick()
       nodes=await ui.settle();ui.listDom.scrollTop=365
@@ -833,12 +860,49 @@ test('sample discard is available outside localization and protects the displaye
       const saved=JSON.parse(storage.get(resultViewState.resultViewKey))
       assert.deepEqual([saved.ordinal,saved.filter,saved.page,saved.listScroll,saved.pageScroll],[145,'failed',1,365,420])
       ui.close();ui=mount(href);nodes=await ui.settle()
-      assert.equal(nodes.find(n=>n.props?.['aria-label']==='自动核验筛选').props.value,'failed')
+      assert.equal(nodes.find(n=>n.props?.['aria-label']==='样本状态筛选').props.value,'failed')
       assert.ok(nodes.find(n=>n.type==='button'&&n.props['aria-current']==='true'&&flatten(n.props.children).some(c=>c.type==='strong'&&c.props.children?.includes(145))))
       assert.equal(nodes.find(n=>n.type==='ol'&&n.props.onScroll).props.start,31)
       assert.equal(ui.listDom.scrollTop,365);assert.equal(globalThis.window.scrollY,420)
       assert.equal(resultViewState.initialResultView(sampleUrl(job.job_id,102)).restored,false)
+      assert.equal(resultViewState.initialResultView(sampleUrl(job.job_id,102)).filter,'failed')
       assert.equal(resultViewState.initialResultView('#results').ordinal,145)
+      // Hash navigation to an out-of-filter sample retains both the list and
+      // that sample's detail, instead of broadening the filter to show it.
+      globalThis.window.location.hash=sampleUrl(job.job_id,102);ui.listeners.get('hashchange')()
+      nodes=await ui.settle()
+      assert.equal(nodes.find(n=>n.props?.['aria-label']==='样本状态筛选').props.value,'failed')
+      assert.ok(nodes.some(n=>n.type==='h2'&&n.props.children?.includes(102)))
+      assert.ok(nodes.some(n=>n.type==='p'&&n.props.className==='notice'&&n.props.children?.includes('”列表中，详情仍保留；左侧筛选未改变。')))
+      globalThis.window.location.hash=sampleUrl(job.job_id,145);ui.listeners.get('hashchange')()
+      nodes=await ui.settle()
+      nodes.find(n=>n.type==='button'&&n.props.children==='填写反馈／Agent 返工').props.onClick()
+      nodes=ui.render()
+      nodes.find(n=>n.props?.onRetry).props.onRetry({job_id:job.job_id,ordinal:145,started:true})
+      // Once queued, 145 moves from failed to pending. Detail remains pinned;
+      // paging/counts stay based solely on the failed list.
+      Object.assign(samples[45],{status:'running',can_review:false})
+      ui.listeners.get('hashchange')();nodes=await ui.settle()
+      assert.equal(nodes.find(n=>n.props?.['aria-label']==='样本状态筛选').props.value,'failed')
+      assert.ok(nodes.some(n=>n.type==='h2'&&n.props.children?.includes(145)))
+      assert.ok(flatten(nodes.find(n=>n.type==='ol'&&n.props.onScroll)).filter(n=>n.type==='strong').every(n=>!n.props.children.includes(145)))
+      nodes.find(n=>n.type==='a'&&n.props.children==='查看该样本').props.onClick({button:0,preventDefault(){}})
+      nodes=await ui.settle()
+      assert.equal(nodes.find(n=>n.props?.['aria-label']==='样本状态筛选').props.value,'failed')
+      const retryHash=globalThis.window.location.hash
+      ui.close();ui=mount(retryHash);nodes=await ui.settle()
+      assert.equal(nodes.find(n=>n.props?.['aria-label']==='样本状态筛选').props.value,'failed')
+      assert.ok(nodes.some(n=>n.type==='h2'&&n.props.children?.includes(145)))
+      Object.assign(samples[45],{status:'needs_evidence',can_review:true})
+      for(const [filter,expected] of [['manual_approved',[101]],['discarded',[102]],['usable',[100,101]]]){
+        nodes.find(n=>n.props?.['aria-label']==='样本状态筛选').props.onChange({target:{value:filter}})
+        nodes=await ui.settle()
+        const list=nodes.find(n=>n.type==='ol'&&n.props.onScroll)
+        assert.deepEqual(flatten(list).filter(n=>n.type==='strong').map(n=>Number(n.props.children[1])),expected)
+        const hash=globalThis.window.location.hash
+        ui.close();ui=mount(hash);nodes=await ui.settle()
+        assert.equal(nodes.find(n=>n.props?.['aria-label']==='样本状态筛选').props.value,filter)
+      }
       assert.ok(requests.every(r=>!r.method)) // Restoring never reviews or starts work.
       ui.close();ui=null
       storage.set(resultViewState.resultViewKey,'broken JSON')
@@ -866,7 +930,7 @@ test('sample discard is available outside localization and protects the displaye
         useState(initial) { const slot=index++;if (!(slot in states)) states[slot]=initial;return [states[slot],value=>{states[slot]=typeof value==='function'?value(states[slot]):value}] },
         useRef(initial) { return {current:initial} }, useEffect() {}, useMemo(fn) { return fn() },
       }
-      if (name.endsWith('/annotationDisplay')) return {readJson,errorMessage,automaticCheckState,automaticCheckLabels,categoryLabel,
+      if (name.endsWith('/annotationDisplay')) return {readJson,errorMessage,automaticCheckState,automaticCheckLabels,sampleFilterLabels,matchesSampleFilter,categoryLabel,
         objectName:value=>value,manualReviewLabels:{discarded:'已废弃'}}
       if (name.endsWith('/taskName')) return {taskName:()=> '原任务'}
       if (name.endsWith('/cameraViews')) return {cameraViewLabel:()=> '前方'}
@@ -988,7 +1052,7 @@ test('sample discard is available outside localization and protects the displaye
         useMemo(fn){return fn()},
         useEffect(fn,deps){const i=index++;if(!same(effects[i]?.deps,deps))pending.push(()=>{effects[i]?.cleanup?.();effects[i]={deps,cleanup:fn()}})},
       }
-      if(name.endsWith('/annotationDisplay'))return {readJson,readPollingJson,errorMessage,automaticCheckState,automaticCheckLabels,categoryLabel,objectName:id=>id,manualReviewLabels:{accepted:'审核通过'}}
+      if(name.endsWith('/annotationDisplay'))return {readJson,readPollingJson,errorMessage,automaticCheckState,automaticCheckLabels,sampleFilterLabels,matchesSampleFilter,categoryLabel,objectName:id=>id,manualReviewLabels:{accepted:'审核通过'}}
       if(name.endsWith('/taskName'))return {taskName:()=> '原任务'}
       if(name.endsWith('/cameraViews'))return {cameraViewLabel:()=> '前方'}
       if(name.endsWith('/navigation'))return {sampleUrl}

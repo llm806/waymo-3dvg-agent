@@ -369,9 +369,20 @@ class BatchExecution:
             packet = self.prepare_item(item, performance)
             performance.phase('annotation_setup')
             if packet.task.get('annotation_search'):
-                from app.agent.scene_grounding import POLICY
+                from app.agent.scene_grounding import POLICY, CLAIM_POLICY
                 packet = packet.model_copy(deep=True)
                 packet.task['scene_grounding_policy']=POLICY
+                packet.task['scene_claim_policy']=CLAIM_POLICY
+                packet.task['attribute_repair_policy']='disputed-attribute-omission-v1'
+                packet.task['scene_geometry_authority_policy']='native-table-authority-v1'
+                packet.task['scene_relation_reading_policy']='explicit-subject-landmark-v2-bidirectional'
+                packet.task['scene_binding_policy']='anonymous-region-binding-v1'
+                packet.task['scene_input_policy']='sentence-scoped-scene-input-v1'
+                packet.task['feedback_revision_policy']='feedback-evidence-revision-v1'
+                packet.task['feedback_acquisition_policy']='feedback-landmark-recheck-v1'
+                packet.task['landmark_salience_policy']='aligned-landmark-preference-v1'
+                packet.task['feedback_acceptance_policy']='feedback-acceptance-v4-relation-corrections'
+                packet.task['manual_feedback_policy']='verified-feedback-planning-v1'
                 from app.quality.description_search import TRAFFIC_SCENE_POLICY
                 packet.task['reference_preference_policy']=TRAFFIC_SCENE_POLICY
                 from app.quality.relations import VEHICLE_HEADING_POLICY

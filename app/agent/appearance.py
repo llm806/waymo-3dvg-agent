@@ -900,3 +900,47 @@ def filter_visual_candidates(candidate_ids, attributes, observations, *, visible
         else:
             survivors.append(oid)
     return survivors, excluded
+
+
+FEEDBACK_ACQUISITION_POLICY = 'feedback-landmark-recheck-v1'
+
+
+def feedback_landmark_manifest(packet):
+    """Acquire requested attribute KINDS before abandoning the reviewed view.
+
+    Geometry ranks anonymous candidates; neither desired values nor feedback
+    text enter the observer prompt. Unknown image candidates remain competitors.
+    """
+    if packet.task.get('feedback_acquisition_policy') != FEEDBACK_ACQUISITION_POLICY:
+        return []
+    import math
+    from app.quality.joint_reference import feedback_relations
+    from app.quality.relations import vehicle_forward_region_match, vehicle_heading_match
+    requests = [r for r in feedback_relations(packet.task) if not r['denied'] and r['attributes']
+        and r['relation'] in {'vehicle_behind','vehicle_ahead','vehicle_directly_behind','vehicle_directly_ahead'}]
+    if not requests:
+        return []
+    camera = next((v.camera_name for v in packet.views if v.camera_label == packet.source_view), None)
+    native = {o.object_id:o for o in packet.candidates}
+    ranked = []
+    for item in packet.provenance.get('appearance_candidates', []):
+        anchor = native.get(item['object_id'])
+        if anchor is None or anchor.object_id == packet.target_object_id:
+            continue
+        source = next((m for m in [item,*item.get('alternatives',[])] if m.get('camera_name') == camera),None)
+        if source is None:
+            continue
+        kinds = set(); ranks = []
+        for request in requests:
+            if anchor.category != request['category']:
+                continue
+            sign = -1 if request['relation'].endswith('behind') else 1
+            if vehicle_forward_region_match(packet.target, anchor, sign) is not True:
+                continue
+            kinds.update(a['kind'] for a in request['attributes'])
+            ranks.append(vehicle_heading_match(packet.target, anchor, sign) is not True)
+        if kinds:
+            distance = math.hypot(*(packet.target.center_m[i]-anchor.center_m[i] for i in (0,1)))
+            ranked.append(((min(ranks),distance,anchor.object_id), {**source,'attribute_recheck':sorted(kinds)}))
+    # One bounded call; preserve budget for writing and two independent checks.
+    return [item for _,item in sorted(ranked,key=lambda row:row[0])[:3]]

@@ -44,7 +44,7 @@ def packet():
     catalog = predicate_catalog(candidates)
     return EvidencePacket(packet_id="a" * 24, context="example", frame_timestamp_micros=10,
                           target_object_id=candidates[0].object_id,
-                          task={k: v for k, v in TASK.items() if k not in {'spatial_relation_policy', 'vehicle_forward_region_policy', 'joint_reference_policy', 'claim_normalization_policy', 'vehicle_heading_policy', 'scene_grounding_policy', 'landmark_description_policy', 'reference_preference_policy', 'image_position_policy', 'reference_policy', 'observation_policy', 'description_detail_policy', 'execution_policy', 'requires_native_camera_link', 'natural_description', 'contrastive_appearance', 'image_first', 'admission_policy', 'annotation_search', 'image_reference_frame', 'image_identity_policy', 'visibility_policy', 'view_selection_policy'}}, policy=POLICY,
+                          task={k: v for k, v in TASK.items() if k not in {'attribute_repair_policy','scene_geometry_authority_policy','feedback_acquisition_policy', 'landmark_salience_policy', 'feedback_acceptance_policy', 'feedback_revision_policy', 'scene_input_policy', 'scene_binding_policy', 'manual_feedback_policy', 'scene_relation_reading_policy', 'spatial_relation_policy', 'vehicle_forward_region_policy', 'joint_reference_policy', 'claim_normalization_policy', 'vehicle_heading_policy', 'scene_grounding_policy', 'landmark_description_policy', 'reference_preference_policy', 'image_position_policy', 'reference_policy', 'observation_policy', 'description_detail_policy', 'execution_policy', 'requires_native_camera_link', 'natural_description', 'contrastive_appearance', 'image_first', 'admission_policy', 'annotation_search', 'image_reference_frame', 'image_identity_policy', 'visibility_policy', 'view_selection_policy'}}, policy=POLICY,
                           target=candidates[0], candidates=candidates, predicates=catalog,
                           contrast=contrast_plan(candidates, candidates[0].object_id, catalog),
                           views=[], track={}, provenance={}, ready_for_generation=True)
@@ -562,6 +562,22 @@ def exercise_manual_reviews(root, monkeypatch, scene_folder):
             assert round_view['item']['attempts'][-1]['expression']==updated['final_expression']
             assert round_view['item']['attempts'][-1]['ground_rounds']==2
             assert routes.rework(job,4,request)['item'] is None
+            # Historical feedback diagnostics are read-only, including in the
+            # small task progress list; automatic success remains its own fact.
+            with runner.store.connect() as db:
+                db.execute('BEGIN')
+                historical=json.loads(json.dumps(updated))
+                historical.pop('feedback_check',None)
+                historical['current_packet']['task'].pop('feedback_acceptance_policy',None)
+                historical['current_packet']['task']['manual_review_feedback']['reason']='请描述向右行驶的运动状态'
+                encoded=json.dumps(historical)
+                db.execute('UPDATE runs SET snapshot=? WHERE run_id=?',(encoded,updated['run_id']))
+                old_progress=BatchStore.review_retry_progress(db,job,1)[0]
+                assert old_progress['automatic_passed']
+                assert old_progress['feedback_check']['historical']
+                assert old_progress['feedback_check']['passed'] is False
+                assert db.execute('SELECT snapshot FROM runs WHERE run_id=?',(updated['run_id'],)).fetchone()[0]==encoded
+                db.rollback()
             assert updated['final_expression']!='The vehicle to the left of the ego vehicle.'
             assert len(updated['attempts'][-1]['ground_checks'])==2 and 'manual_review' not in updated
             assert service.store.execution_progress(job)['passed']==3
@@ -2226,6 +2242,69 @@ def test_projected_inventory_preserves_unresolved_native_competitors(tmp_path, m
         assert 'joint_reference_pair_unverified' in check(wrong)['errors']
         wrong.relation_pairs[0].landmark_id=reverse[joint.target_object_id]
         assert not check(wrong)['diagnostic_pass']
+    # A descriptor/ID binding error remains a failed observation. One fresh
+    # blind read is bounded by the existing budget and survives interruption.
+    binding=joint.model_copy(deep=True)
+    binding.task['scene_binding_policy']=scene_grounding.BINDING_POLICY
+    msgs,mapping,receipt=scene_grounding.messages(binding,joint_generated.expression,601)
+    reverse={oid:cid for cid,oid in mapping.items()}
+    wrong=scene_grounding.SceneGroundResult(expression_supported=True,candidate_ids=[reverse[binding.target_object_id]],
+        ambiguous_candidate_ids=[],unsupported_claims=[],reason='Candidate binding example.',
+        relation_pairs=[{'candidate_id':reverse[binding.target_object_id],'landmark_id':reverse['other-sedan'],
+            'relation_key':'vehicle_directly_ahead'}])
+    failure=scene_grounding.verify(binding,wrong,mapping,receipt,generated=joint_generated.model_dump())
+    assert 'joint_reference_landmark_identity_mismatch' in failure['errors']
+    retry=lambda f,used=0,left=2:scene_grounding.binding_retry_allowed(binding,f,retries_used=used,remaining_calls=left,phase='scene_ground')
+    assert retry(failure) and not retry(failure,used=1) and not retry(failure,left=1)
+    for field,value in [('expression_supported',False),('ambiguous_candidate_ids',[reverse['other-sedan']]),
+            ('candidate_ids',[reverse['other-sedan']]),('unsupported_claims',['The relation is false.'])]:
+        rejected=scene_grounding.verify(binding,wrong.model_copy(update={field:value}),mapping,receipt,generated=joint_generated.model_dump())
+        assert not retry(rejected)
+    unknown_binding=binding.model_copy(deep=True)
+    for predicate in unknown_binding.predicates:
+        if predicate.predicate_id==joint_rule.predicate_id:
+            proof=json.loads(predicate.value);proof['possible_anchor_ids'].append('other-sedan');predicate.value=json.dumps(proof)
+    assert not retry(scene_grounding.verify(unknown_binding,wrong,mapping,receipt,generated=joint_generated.model_dump()))
+    swapped=binding.model_copy(deep=True);swapped.target_object_id='other-sedan';swapped.target=swapped.candidates[1]
+    assert scene_grounding.messages(swapped,joint_generated.expression,601)[0]==msgs
+    assert receipt['scene_binding_policy']==scene_grounding.BINDING_POLICY
+    # More than a page of regions preserves EVERY box without a tall sheet.
+    import io
+    photo=io.BytesIO();Image.new('RGB',(100,100)).save(photo,format='JPEG')
+    guides=scene_grounding.anonymous_image_guides(photo.getvalue(),[
+        {'candidate_id':f'C{i:03d}','image_boxes_xyxy':[[0,0,70,70]]} for i in range(25)],binding=True)
+    assert len(guides)==4
+    assert all(Image.open(io.BytesIO(data)).height<=960 for _,data in guides)
+    class BindingCalls(LocalCalls):
+        def call(self,messages,schema,folder,heartbeat=None):
+            self.count+=1
+            payload=json.loads(messages[-1]['content'][0]['text'])
+            assert 'expected' not in payload and 'feedback' not in payload
+            assert payload['region_identity_check']['policy']==scene_grounding.BINDING_POLICY
+            rows=payload['candidates']
+            tid=next(r['candidate_id'] for r in rows if r['original_image_boxes_xyxy']==[[1,5,50,55]])
+            anchor=next(r['candidate_id'] for r in rows if r['original_image_boxes_xyxy']==([[61,5,110,55]] if self.count==1 else [[121,5,170,55]]))
+            answer=schema(expression_supported=True,candidate_ids=[tid],ambiguous_candidate_ids=[],unsupported_claims=[],reason='Read the complete scene.',
+                relation_pairs=[{'candidate_id':tid,'landmark_id':anchor,'relation_key':'vehicle_directly_ahead'}])
+            if self.count==2:
+                atomic_json(folder/'parsed-output.json',answer.model_dump())
+                raise KeyboardInterrupt()
+            return answer
+    calls=BindingCalls();root=tmp_path/'binding-retry'
+    initial=initial_run(binding,calls,0,3)
+    initial.update(phase='scene_ground',relations_acquired=True,admission={'passed':True},
+        candidate_appearance=joint_records,attempts=[{'attempt':0,'generated':joint_generated.model_dump(),
+            'appearance_check':{'passed':True},'ground_checks':[]}])
+    RunStore(root/'runs.sqlite3').create(initial)
+    with pytest.raises(KeyboardInterrupt):
+        run_agent(binding,calls,0,root,3,resume_run_id=initial['run_id'])
+    result=run_agent(binding,calls,0,root,3,resume_run_id=initial['run_id'])
+    assert result['diagnostic_pass'] and result['quality_gate']['scene_grounding_checks_passed'],result
+    checks=result['attempts'][0]['ground_checks']
+    assert calls.count==3 and result['model_calls_used']==3 and len(checks)==3
+    assert not checks[0]['diagnostic_pass'] and checks[0]['binding_retry_scheduled']
+    assert scene_grounding.two_rounds_passed(checks) and not scene_grounding.two_rounds_passed(checks[:2])
+    assert len(list((root/result['run_id']).glob('private-map*')))==3
     rival=joint.model_copy(deep=True)
     next(o for o in rival.candidates if o.object_id=='other-sedan').center_m=(40,5,1)
     rival.predicates=predicate_catalog(rival.candidates)
@@ -2429,6 +2508,111 @@ def test_projected_inventory_preserves_unresolved_native_competitors(tmp_path, m
     graph=json.loads(msgs[-1]['content'][0]['text'])['spatial_relations']
     assert not any(d['reference_frame']=='source_image' for d in graph['definitions'])
     assert all(not row['relation_key'].startswith('image_') for row in graph['rows'])
+    # Appearance-only language needs no invented landmark. New prompt scope is
+    # target-independent; old packets keep the exact historical request.
+    scoped=native_heading.model_copy(deep=True)
+    scoped.task['scene_claim_policy']=scene_grounding.CLAIM_POLICY
+    appearance_text='The white truck with a wooden cargo bed is visible in the front view.'
+    appearance_claim={'predicate_ids':['category:vehicle'], 'visual_attributes':[]}
+    for seed in (601,602):
+        scoped_messages,scoped_map,scoped_receipt=scene_grounding.messages(scoped,appearance_text,seed)
+        payload=json.loads(scoped_messages[-1]['content'][0]['text'])
+        assert payload['claim_evaluation']['policy']==scene_grounding.CLAIM_POLICY
+        assert 'No spatial relation, landmark' in scoped_messages[0]['content']
+        assert 'Only IF the sentence asserts a landmark relation' in scoped_messages[0]['content']
+        assert 'Resolve attributes AND relation jointly.' not in scoped_messages[0]['content']
+        assert scoped_receipt['scene_claim_policy']==scene_grounding.CLAIM_POLICY
+        swapped=scoped.model_copy(deep=True)
+        swapped.target=next(o for o in swapped.candidates if o.object_id!=scoped.target_object_id)
+        swapped.target_object_id=swapped.target.object_id
+        assert scene_grounding.messages(swapped,appearance_text,seed)[0]==scoped_messages
+        cid=next(cid for cid,oid in scoped_map.items() if oid==scoped.target_object_id)
+        answer=scene_grounding.SceneGroundResult(expression_supported=True,candidate_ids=[cid],
+            ambiguous_candidate_ids=[],unsupported_claims=[],reason='All stated appearance details identify one object.')
+        check=lambda a,g=appearance_claim:scene_grounding.verify(scoped,a,scoped_map,scoped_receipt,generated=g)
+        assert check(answer)['diagnostic_pass']
+        # Never reinterpret a model rejection as a pass based on its prose.
+        rejected=answer.model_copy(update={'expression_supported':False,'candidate_ids':[],
+            'ambiguous_candidate_ids':[cid],'unsupported_claims':[appearance_text]})
+        assert not check(rejected)['diagnostic_pass']
+        assert not check(answer.model_copy(update={'unsupported_claims':['wooden cargo bed']}))['diagnostic_pass']
+        other=next(c for c in scoped_map if c!=cid)
+        assert not check(answer.model_copy(update={'ambiguous_candidate_ids':[other]}))['diagnostic_pass']
+        assert 'joint_reference_pair_missing' in check(answer,{'predicate_ids':[right.predicate_id]})['errors']
+    legacy=native_heading.model_copy(deep=True)
+    legacy.task.pop('scene_claim_policy',None)
+    legacy_messages,_,legacy_receipt=scene_grounding.messages(legacy,appearance_text,601)
+    assert 'claim_evaluation' not in json.loads(legacy_messages[-1]['content'][0]['text'])
+    assert 'scene_claim_policy' not in legacy_receipt
+    assert 'Resolve attributes AND relation jointly.' in legacy_messages[0]['content']
+    # The same pair may be ego-right and vehicle-ahead. The sentence-only
+    # index names subjects and landmarks explicitly without leaking feedback.
+    indexed=native_heading.model_copy(deep=True)
+    indexed.task['scene_relation_reading_policy']=spatial.READING_POLICY
+    indexed.task['manual_review_feedback']={'reason':'private review hint'}
+    text='The white sedan directly in front of a red sedan in the front view.'
+    indexed_messages,indexed_map,indexed_receipt=scene_grounding.messages(indexed,text,801)
+    index=json.loads(indexed_messages[-1]['content'][0]['text'])['sentence_relation_index']
+    assert indexed_receipt['scene_relation_reading_policy']==spatial.READING_POLICY
+    # Native spatial truth must never be delegated back to photo/lane impressions.
+    authority = indexed.model_copy(deep=True)
+    authority.task['scene_geometry_authority_policy'] = 'native-table-authority-v1'
+    authority_inputs, _, authority_receipt = scene_grounding.messages(authority, joint_generated.expression, seed=609)
+    assert authority_receipt['scene_geometry_authority_policy']=='native-table-authority-v1'
+    assert 'PHOTOGRAPHS establish appearance and visible identity ONLY' in authority_inputs[0]['content']
+    assert 'Do NOT judge any spatial assertion by apparent' in authority_inputs[0]['content']
+
+    # The subject and landmark indices encode the exact same full relation table.
+    table = spatial.sentence_relation_index({'definitions':[{'key':'vehicle_behind','reference_frame':'landmark_vehicle_heading','meaning':'behind'}],
+        'checked_subject_ids':['V09','V02','V03'], 'rows':[
+            {'relation_key':'vehicle_behind','landmark_id':'V02','true_subject_ids':['V09'],'unknown_subject_ids':['V03']},
+            {'relation_key':'vehicle_behind','landmark_id':'V03','true_subject_ids':['V09'],'unknown_subject_ids':[]}]},
+        'The black vehicle is behind a red car.')
+    subject = next(r for r in table['by_subject'] if r['subject_id']=='V09')
+    assert subject['true_landmark_ids']==['V02','V03']  # A second anchor does not negate the red anchor.
+    assert next(r for r in table['by_subject'] if r['subject_id']=='V03')['unknown_landmark_ids']==['V02']
+    assert all(r['relation_key']=='vehicle_behind' for r in table['by_subject'])
+
+    assert {row['relation_key'] for row in index['rows']}=={'vehicle_directly_ahead'}
+    reverse={v:k for k,v in indexed_map.items()}
+    row=next(r for r in index['rows'] if r['landmark_id']==reverse[red.object_id])
+    assert reverse[indexed.target_object_id] in row['true_subject_ids']
+    assert f'{reverse[indexed.target_object_id]} is directly in front of {reverse[red.object_id]}' in ' '.join(row['true_statements'])
+    assert 'private review hint' not in json.dumps(indexed_messages)
+    swapped=indexed.model_copy(deep=True)
+    swapped.target=next(o for o in swapped.candidates if o.object_id==red.object_id)
+    swapped.target_object_id=red.object_id
+    assert scene_grounding.messages(swapped,text,801)[0]==indexed_messages
+    focused=indexed.model_copy(deep=True)
+    focused.task['scene_input_policy']=scene_grounding.INPUT_POLICY
+    focused.candidates.append(obj('unpictured-zero',100,100,points=0))
+    focused_messages,focused_map,focused_receipt=scene_grounding.messages(focused,text,801)
+    focused_wire=json.loads(focused_messages[-1]['content'][0]['text'])
+    columns=focused_wire['unpictured_native_candidates']['columns']
+    unpictured=[dict(zip(columns,row)) for row in focused_wire['unpictured_native_candidates']['rows']]
+    assert {r['candidate_id'] for r in focused_wire['candidates']+unpictured}==set(focused_map)
+    assert any(r['lidar_points']==0 for r in unpictured)
+    assert all(r['candidate_id'].startswith('V') and r['image_boxes_xyxy'] for r in focused_wire['candidates'])
+    assert all(r['candidate_id'].startswith('N') for r in unpictured)
+    full_graph=spatial.scene_graph(focused,focused.views[0].camera_name,focused_map)
+    keys={d['key'] for d in focused_wire['sentence_relation_index']['definitions']}
+    assert focused_wire['spatial_relations']['rows']==[r for r in full_graph['rows'] if r['relation_key'] in keys]
+    assert focused_wire['spatial_relations']['checked_subject_ids']==full_graph['checked_subject_ids']
+    assert focused_wire['sentence_relation_index']==spatial.sentence_relation_index(full_graph,text)
+    assert len(focused_wire['spatial_relations']['rows'])<len(full_graph['rows'])
+    assert focused_receipt['scene_input_policy']==scene_grounding.INPUT_POLICY
+    swapped=focused.model_copy(deep=True);swapped.target_object_id='other-sedan';swapped.target=swapped.candidates[1]
+    assert scene_grounding.messages(swapped,text,801)[0]==focused_messages
+    assert 'unpictured_native_candidates' not in json.loads(indexed_messages[-1]['content'][0]['text'])
+    assert 'sentence_relation_index' not in json.loads(msgs[-1]['content'][0]['text'])
+    assert spatial.sentence_relation_index(graph,appearance_text)['rows']==[]
+    mixed=spatial.sentence_relation_keys('directly in front of a red car and in front of a van')
+    assert mixed=={'vehicle_directly_ahead','vehicle_ahead'}
+    assert spatial.sentence_relation_keys('farther behind than a red car relative to the ego vehicle')=={'native_behind'}
+    assert spatial.sentence_relation_keys('ahead of the ego vehicle in the front view')==set()
+    for original,index_row in [(r,next(x for x in index['rows'] if x['landmark_id']==r['landmark_id']))
+            for r in graph['rows'] if r['relation_key']=='vehicle_directly_ahead']:
+        assert original['unknown_subject_ids']==index_row['unknown_subject_ids']
     from app.agent.harness import generation_messages
     main_messages=generation_messages(native_heading,None,heading_records)
     main_payload=json.loads(main_messages[-1]['content'][0]['text'])
@@ -2450,6 +2634,194 @@ def test_projected_inventory_preserves_unresolved_native_competitors(tmp_path, m
         chosen=writing_plan(planning,heading_records)
         assert chosen['unique_plan_found'] and not chosen['joint_reference']
         assert chosen['predicate_ids']==['category:vehicle','lateral:left']
+    from app.quality.joint_reference import FEEDBACK_POLICY,writer_contract_errors
+    planning.task.update(manual_feedback_policy=FEEDBACK_POLICY,
+        manual_review_feedback={'reason':'Use a red sedan relation directly in front of it.'})
+    assert writing_plan(planning,heading_records)['unique_plan_found']
+    assert not writing_plan(planning,heading_records)['joint_reference']
+    feedback_packet=native_heading.model_copy(deep=True)
+    next(o for o in feedback_packet.candidates if o.object_id=='other-sedan').center_m=feedback_packet.target.center_m
+    feedback_packet.predicates=predicate_catalog(feedback_packet.candidates)
+    feedback_packet,_=expand_relations(feedback_packet,heading_records)
+    feedback_packet.provenance.pop('admission_plan',None)
+    feedback_packet.task.update(manual_feedback_policy=FEEDBACK_POLICY,
+        manual_review_feedback={'reason':'给出准确线索，比如 white sedan 在一个 red car 的正前方',
+            'previous_expression':'The white sedan behind a van.'})
+    feedback_plan=writing_plan(feedback_packet,heading_records)
+    facts=[p for p in feedback_packet.predicates if p.predicate_id in feedback_plan['predicate_ids']]
+    assert feedback_plan['feedback_alignment']['requested_relation_selected']
+    assert any('directly in front of a red' in p.phrase for p in facts)
+    assert feedback_plan['requires_full_scene'] and not feedback_plan['unique_plan_found']
+    payload=json.loads(writer_messages(feedback_packet,feedback_plan,None,heading_records)[-1]['content'][0]['text'])
+    assert payload['human_feedback']==feedback_packet.task['manual_review_feedback']['reason']
+    assert payload['reviewed_sentence']=='The white sedan behind a van.'
+    assert 'Do not add, reverse' in payload['writing_scope']
+    assert writer_contract_errors(feedback_packet,feedback_plan,'The white sedan directly behind a red car.')
+    assert not writer_contract_errors(feedback_packet,feedback_plan,fallback_sentence(feedback_packet,feedback_plan,heading_records))
+    no_relation={'predicate_ids':['category:vehicle']}
+    assert writer_contract_errors(feedback_packet,no_relation,'The white sedan behind a red car.')
+    assert not writer_contract_errors(feedback_packet,no_relation,'The white sedan in the front view.')
+    from app.quality.joint_reference import REVISION_POLICY,ego_requests
+    ego_packet=native_heading.model_copy(deep=True)
+    ego_packet.task.update(manual_feedback_policy=FEEDBACK_POLICY,feedback_revision_policy=REVISION_POLICY,
+        manual_review_feedback={'reason':'缺少区分线索和相对空间位置','previous_expression':'The white sedan visible in the front view.'})
+    ego_plan=writing_plan(ego_packet,heading_records)
+    assert ego_plan and any(i.startswith(('longitudinal:','lateral:')) for i in ego_plan['predicate_ids'])
+    assert ego_plan['feedback_alignment']['requested_spatial_cue']
+    assert 'declared_ego_direction_not_in_text' in writer_contract_errors(ego_packet,ego_plan,'The white sedan visible in the front view.')
+    assert not writer_contract_errors(ego_packet,ego_plan,fallback_sentence(ego_packet,ego_plan,heading_records))
+    ego_packet.task['manual_review_feedback']['reason']='自车前方的一辆车'
+    ego_plan=writing_plan(ego_packet,heading_records)
+    assert 'longitudinal:front' in ego_plan['predicate_ids']
+    assert ego_plan['feedback_alignment']['requested_relation_keys']==[]
+    assert ego_plan['feedback_alignment']['requested_ego_predicate_ids']==['longitudinal:front']
+    from app.quality.joint_reference import ACCEPTANCE_POLICY, feedback_acceptance, feedback_requirements
+    from app.schemas.contracts import Predicate
+    # #2984: a negated white landmark must never earn positive feedback credit.
+    from app.quality.joint_reference import feedback_relations, landmark_salience, SALIENCE_POLICY, CONCISION_POLICY
+    correction = {'feedback_acceptance_policy': ACCEPTANCE_POLICY, 'manual_review_feedback': {
+        'reason': '明显是 behind a red car 啊，behind a white sedan是错误的'}}
+    signed = feedback_relations(correction)
+    assert len(signed) == 2 and not signed[0]['denied'] and signed[1]['denied']
+    assert signed[0]['attributes'] == [{'kind':'color','value':'red'}]
+    rejected = feedback_acceptance(correction, {'expression': 'The black vehicle is behind a white sedan in the front view.'})
+    assert rejected['blocking_errors'] == ['manual_feedback_landmark_missing', 'manual_feedback_rejected_relation_repeated']
+    assert feedback_acceptance(correction, {'expression': 'The black vehicle is behind a red sedan in the front view.'})['passed']
+    assert 'manual_feedback_landmark_missing' in feedback_acceptance(correction, {'expression': 'The black vehicle is behind an orange car.'})['blocking_errors']
+    assert not feedback_relations({**correction,'feedback_acceptance_policy':CONCISION_POLICY})
+    for reason in ('not behind a white sedan but behind a red car', '不是behind a white sedan，而是behind a red car'):
+        parsed = feedback_relations({**correction, 'manual_review_feedback': {'reason': reason}})
+        assert parsed[0]['denied'] and not parsed[1]['denied']
+    # Ranking may prefer alignment without narrowing the weak behind predicate.
+    salience = native_heading.model_copy(deep=True)
+    salience.task['landmark_salience_policy'] = SALIENCE_POLICY
+    salience.target.center_m = (0,0,1)
+    close = salience.target.model_copy(update={'object_id':'near-anchor','center_m':(15,0,1),'heading_rad':0,'lidar_points':100})
+    remote = close.model_copy(update={'object_id':'side-anchor','center_m':(20,15,1)})
+    salience.candidates += [close,remote]
+    def salience_rule(anchor):
+        return Predicate(predicate_id='image_joint_heading:1:rearward:'+anchor,kind='image_relation',
+            value=json.dumps({'direction':'rearward','confirmed_anchor_ids':[anchor]}),phrase='behind a vehicle',
+            matches={},source='test',required_capability='rgb')
+    assert landmark_salience(salience,[salience_rule('near-anchor')]) < landmark_salience(salience,[salience_rule('side-anchor')])
+    from app.agent.appearance import feedback_landmark_manifest, FEEDBACK_ACQUISITION_POLICY
+    salience.task.update(correction, feedback_acquisition_policy=FEEDBACK_ACQUISITION_POLICY)
+    source_camera = next(v.camera_name for v in salience.views if v.camera_label == salience.source_view)
+    salience.provenance['appearance_candidates'] = [
+        {'object_id':o.object_id,'candidate_id':str(i),'camera_name':source_camera}
+        for i,o in enumerate([remote,close,salience.target])]
+    manifest = feedback_landmark_manifest(salience)
+    assert manifest[0]['object_id'] == 'near-anchor'
+    assert all(m['object_id'] != salience.target_object_id for m in manifest)
+    assert all(m['attribute_recheck'] == ['color'] for m in manifest)
+    assert 'red' not in json.dumps(manifest)  # No desired answer leaks into anonymous observation.
+    assert 'attribute_recheck' not in salience.provenance['appearance_candidates'][0]
+    frozen = salience.model_copy(deep=True)
+    frozen.task.pop('feedback_acquisition_policy')
+    assert not feedback_landmark_manifest(frozen)
+    from app.quality.joint_reference import disputed_attribute_kinds
+    attribute_failure = {'generated':{'visual_attributes':[{'kind':'color','value':'black'}]},
+        'ground_checks':[{'unsupported_claims':['The subject is a truck but it is not black; it appears grey or blue.']}]}
+    assert disputed_attribute_kinds(attribute_failure)=={'color'}
+    relation_failure = {**attribute_failure,'ground_checks':[{'unsupported_claims':['The black vehicle is not behind the red car.']}]}
+    assert not disputed_attribute_kinds(relation_failure)
+    repair_packet = feedback_packet.model_copy(deep=True)
+    repair_packet.task['attribute_repair_policy']='disputed-attribute-omission-v1'
+    first_plan = writing_plan(repair_packet,heading_records)
+    old_color = next(a['value'] for a in first_plan['visual_attributes'] if a['kind']=='color')
+    failed = {'generated':first_plan, 'ground_checks':[{'unsupported_claims':['The subject is not '+old_color+'.']}],
+        'verification':{'diagnostic_pass':False,'errors':['scene_grounding_unsupported_claims']}}
+    repaired = writing_plan(repair_packet,heading_records,attempts=[failed])
+    assert repaired and repaired['omitted_disputed_attribute_kinds']==['color']
+    assert not any(a['kind']=='color' for a in repaired['visual_attributes'])
+    assert repaired['joint_reference'] and repaired['requires_full_scene']  # Cannot bypass fresh whole-scene checks.
+
+
+    # #5665: concision is an actionable rewrite constraint, not unrecognized feedback.
+    from app.quality.joint_reference import SUGGESTIONS_POLICY, concision_budget
+    concise_task = {'feedback_acceptance_policy': ACCEPTANCE_POLICY, 'manual_review_feedback': {
+        'reason': '文本描述请简洁一些',
+        'previous_expression': "In the front-left view, the pedestrian wearing a brown coat and holding a bag is located farther behind than the pedestrian in the black top relative to the ego vehicle's orientation."}}
+    assert feedback_requirements(concise_task)['required_concise']
+    assert concision_budget(concise_task) == 24
+    long_draft = {'expression': ' '.join(['word'] * 29)}
+    assert feedback_acceptance(concise_task, long_draft)['blocking_errors'] == ['manual_feedback_concision_missing']
+    assert not feedback_acceptance(concise_task, long_draft, check_style=False)['blocking_errors']
+    assert feedback_acceptance(concise_task, {'expression': 'The pedestrian in a brown top in the front-left view.'})['passed']
+    for reason in ('不要缩短文本', '无需精简', 'do not shorten the text'):
+        assert not feedback_requirements({**concise_task, 'manual_review_feedback': {'reason': reason}})['concise']
+    assert not feedback_requirements({**concise_task, 'feedback_acceptance_policy': SUGGESTIONS_POLICY})['concise']
+    brief_packet = ego_packet.model_copy(deep=True)
+    brief_packet.task.update(concise_task)
+    brief_plan = writing_plan(brief_packet, heading_records)
+    assert brief_plan and brief_plan['unique_plan_found']
+    brief_payload = json.loads(writer_messages(brief_packet, brief_plan, None, heading_records)[-1]['content'][0]['text'])
+    assert 'at most 24' in brief_payload['concision_instruction']
+    strict_ego=ego_packet.model_copy(deep=True)
+    strict_ego.task['feedback_acceptance_policy']=ACCEPTANCE_POLICY
+    strict_plan=writing_plan(strict_ego,heading_records)
+    assert strict_plan and 'longitudinal:front' in strict_plan['predicate_ids']
+    assert feedback_acceptance(strict_ego.task,{**strict_plan,'expression':fallback_sentence(strict_ego,strict_plan,heading_records)})['passed']
+    assert feedback_acceptance(strict_ego.task,{'predicate_ids':['category:vehicle'],
+        'expression':'The sedan visible in the front view.'})['errors']==['manual_feedback_spatial_missing']
+    for ego_rule in strict_ego.predicates:
+        if ego_rule.predicate_id=='longitudinal:front':ego_rule.matches[strict_ego.target_object_id]=None
+    assert writing_plan(strict_ego,heading_records) is None
+    # #5408: ego position covers only one part of this request. A native speed
+    # label, heading, or a writer's motion words do not provide a motion proof.
+    motion_task={**strict_ego.task,'manual_review_feedback':{'reason':'可以说明目标的运动状态，比如该灰色轿车在自车前方，是向右行驶的'}}
+    motion_report=feedback_acceptance(motion_task,{'predicate_ids':['category:vehicle','longitudinal:front'],
+        'expression':'The sedan in front of the ego vehicle is moving right.'})
+    assert motion_report['passed'] is False and motion_report['errors']==['manual_feedback_motion_unsupported']
+    assert motion_report['blocking_errors']==[]
+    assert [r['status'] for r in motion_report['requirements']]==['unsupported','covered']
+    example_text='可以说明目标的运动状态以减少歧义，比如该灰色轿车在自车前方，是向右行驶咖的'
+    optional_task={**motion_task,'manual_review_feedback':{'reason':example_text}}
+    optional=feedback_requirements(optional_task)
+    assert optional['motion'] and optional['ego']==['longitudinal:front']
+    assert not optional['required_motion'] and optional['required_ego']==[]
+    assert not feedback_acceptance(optional_task,{'predicate_ids':['category:vehicle'],
+        'expression':'The white sedan.'})['blocking_errors']
+    optional_packet=ego_packet.model_copy(deep=True);optional_packet.task=optional_task
+    assert writing_plan(optional_packet,heading_records) is not None
+    for mandatory_text in ['必须描述运动状态，比如向右行驶', '可以说明颜色，但必须说明运动状态',
+            '比如在自车前方，但必须保留运动状态', 'You must describe motion, for example moving right.']:
+        mandatory_task={**motion_task,'manual_review_feedback':{'reason':mandatory_text}}
+        assert feedback_acceptance(mandatory_task)['blocking_errors']==['manual_feedback_motion_unsupported']
+    from app.quality.joint_reference import LEGACY_ACCEPTANCE_POLICY
+    assert feedback_acceptance({**optional_task,'feedback_acceptance_policy':LEGACY_ACCEPTANCE_POLICY})['blocking_errors']==['manual_feedback_motion_unsupported']
+    for text in ['Describe its motion.', 'The car is driving right.', '补充行驶方向', '是否静止', '不要忽略运动状态']:
+        assert feedback_requirements({'manual_review_feedback':{'reason':text}})['motion']
+    for text in ['不要描述运动，只说明自车前方', 'Do not infer motion; describe the sedan ahead of the ego vehicle.',
+            '去掉向右行驶的描述', '车头朝右', '右侧的一辆车', '没有要求运动状态']:
+        assert not feedback_requirements({'manual_review_feedback':{'reason':text}})['motion']
+    # The same source view never silently stands for being ahead of ego.
+    assert not ego_requests('visible in the front view')[0]
+    assert ego_requests('in front of the ego vehicle')[0]=={'longitudinal:front'}
+    assert 'unselected_ego_direction_in_text' in writer_contract_errors(ego_packet,{'predicate_ids':['category:vehicle']},'The sedan in front of the ego vehicle.')
+    # A true ego cue may still need two blind checks; retain the competitor.
+    ambiguous_ego=ego_packet.model_copy(deep=True)
+    next(o for o in ambiguous_ego.candidates if o.object_id=='other-sedan').center_m=ambiguous_ego.target.center_m
+    ambiguous_ego.predicates=predicate_catalog(ambiguous_ego.candidates)
+    ambiguous_ego,_=expand_relations(ambiguous_ego,heading_records)
+    ambiguous_plan=writing_plan(ambiguous_ego,heading_records)
+    assert 'longitudinal:front' in ambiguous_plan['predicate_ids'] and ambiguous_plan['requires_full_scene']
+    # Local rejection of the reviewed text also retires its evidence bundle,
+    # rather than paying for paraphrases before any ground check took place.
+    old={'generated':ego_plan,'ground_checks':[],
+        'verification':{'diagnostic_pass':False,'errors':['manual_review_rejected_text_repeated']}}
+    revised=writing_plan(ego_packet,heading_records,attempts=[old])
+    assert revised is None or set(revised['predicate_ids'])!=set(ego_plan['predicate_ids']) or revised['visual_attributes']!=ego_plan['visual_attributes']
+    for p in ego_packet.predicates:
+        if p.kind in {'longitudinal','lateral'}:p.matches[ego_packet.target_object_id]=None
+    safe_ego=writing_plan(ego_packet,heading_records)
+    assert safe_ego is None or not any(i.startswith(('longitudinal:','lateral:')) for i in safe_ego['predicate_ids'])
+    # A requested but false/unknown relation never becomes usable evidence.
+    for p in feedback_packet.predicates:
+        if p.predicate_id.startswith(('image_joint_heading:','image_joint_spatial:')):
+            p.matches[feedback_packet.target_object_id]=None
+    safe_plan=writing_plan(feedback_packet,heading_records)
+    assert safe_plan is None or not safe_plan['joint_reference']
     # A scene check rejected this relation: reselect a different bundle rather
     # than rendering the same failed relation with 'is ...' over and over.
     replanning=native_heading.model_copy(deep=True)
@@ -2470,7 +2842,10 @@ def test_projected_inventory_preserves_unresolved_native_competitors(tmp_path, m
     # both fresh scene checks without being forced to invent a landmark.
     # After a rejected bundle, a new writer call uses a different contract.
     ordinary=native_heading.model_copy(deep=True)
-    ordinary.task.update(execution_policy='evidence-fast-v1',visibility_policy=RECOGNIZABLE_POLICY)
+    ordinary.task.update(execution_policy='evidence-fast-v1',visibility_policy=RECOGNIZABLE_POLICY,
+        scene_claim_policy=scene_grounding.CLAIM_POLICY,manual_feedback_policy=FEEDBACK_POLICY,
+        scene_relation_reading_policy=spatial.READING_POLICY,feedback_acceptance_policy=ACCEPTANCE_POLICY,
+        manual_review_feedback={'reason':'可以考虑运动状态帮助消歧，比如向右行驶。'})
     next(o for o in ordinary.candidates if o.object_id=='other-sedan').center_m=ordinary.target.center_m
     ordinary.predicates=predicate_catalog(ordinary.candidates)
     ordinary,_=expand_relations(ordinary,heading_records)
@@ -2483,10 +2858,13 @@ def test_projected_inventory_preserves_unresolved_native_competitors(tmp_path, m
             payload=json.loads(messages[-1]['content'][0]['text'])
             if schema is WrittenSentence:
                 self.writes+=1
+                assert 'Only required_meaning supplies spatial claims' in payload['writing_scope']
                 assert not any('above' in phrase or 'below' in phrase for phrase in payload['required_meaning'])
                 return schema(expression='The white sedan visible in the front view.' if any('visible' in phrase for phrase in payload['required_meaning']) else 'The white sedan.')
             assert schema is scene_grounding.SceneGroundResult
             self.scenes+=1
+            assert payload['claim_evaluation']['policy']==scene_grounding.CLAIM_POLICY
+            assert payload['sentence_relation_index']['rows']==[]
             if self.scenes==1:
                 return schema(expression_supported=False,candidate_ids=[],ambiguous_candidate_ids=[],
                     unsupported_claims=['The current description needs a clearer scope.'],reason='Reject the first bundle.')
@@ -2500,6 +2878,8 @@ def test_projected_inventory_preserves_unresolved_native_competitors(tmp_path, m
     RunStore(root/'runs.sqlite3').create(initial)
     result=run_agent(ordinary,ordinary_calls,1,root,5,resume_run_id=initial['run_id'])
     assert result['diagnostic_pass'] and ordinary_calls.count==5,result
+    assert result['feedback_check']['passed'] is False and not result['feedback_check']['blocking_errors']
+    assert result['feedback_check']['requirements'][0]['required'] is False
     assert ordinary_calls.writes==2 and ordinary_calls.scenes==3
     assert all(not a['writing_contract']['joint_reference'] for a in result['attempts'])
     assert result['attempts'][0]['generated']['predicate_ids']!=result['attempts'][1]['generated']['predicate_ids']
@@ -3577,6 +3957,35 @@ def test_adaptive_loop_two_blind_orders_and_idempotent_completion(tmp_path, monk
     early = run_agent(packet(),early_calls,0,tmp_path/'bad-binding',4,resume_run_id=initial['run_id'])
     assert not early['diagnostic_pass'] and early['stop_reason'] == 'sample_identity_binding_failed'
     assert early['model_calls_used'] == early_calls.count == 0
+    from app.quality.joint_reference import ACCEPTANCE_POLICY
+    motion_packet=packet()
+    motion_packet.task.update(feedback_acceptance_policy=ACCEPTANCE_POLICY,
+        manual_review_feedback={'reason':'目标在自车前方，向右行驶，补充运动状态'})
+    motion_packet.target.speed_label_mps=(0.6,-7.3,0.04)
+    motion_calls=LocalCalls()
+    motion_root=tmp_path/'unsupported-feedback'
+    motion_result=run_agent(motion_packet,motion_calls,2,motion_root,12)
+    assert motion_result['stop_reason']=='manual_feedback_motion_unsupported'
+    assert not motion_result['diagnostic_pass'] and not motion_result['attempts']
+    assert motion_result['model_calls_used']==motion_calls.count==0
+    assert run_agent(motion_packet,motion_calls,2,motion_root,12)==motion_result
+    # A resumed candidate can pass both localization checks yet still fail the
+    # distinct feedback gate at commit. Neither blind result is rewritten.
+    incomplete=packet()
+    incomplete.task.update(feedback_acceptance_policy=ACCEPTANCE_POLICY,
+        manual_review_feedback={'reason':'需要补充自车前方'})
+    final_feedback_calls=LocalCalls()
+    feedback_root=tmp_path/'final-feedback'
+    initial=initial_run(incomplete,final_feedback_calls,0,4)
+    initial.update(phase='ground',relations_acquired=True,attempts=[{'attempt':0,'ground_checks':[],
+        'generated':{'expression':'The vehicle to the left of the ego vehicle.',
+            'predicate_ids':['category:vehicle','lateral:left'],'visual_attributes':[]}}])
+    RunStore(feedback_root/'runs.sqlite3').create(initial)
+    final_feedback=run_agent(incomplete,final_feedback_calls,0,feedback_root,4,resume_run_id=initial['run_id'])
+    assert final_feedback_calls.count==4  # Two blind parses plus legacy counterfactual checks.
+    assert all(c['diagnostic_pass'] for c in final_feedback['attempts'][0]['ground_checks'])
+    assert not final_feedback['diagnostic_pass'] and final_feedback['stop_reason']=='manual_feedback_spatial_missing'
+    assert not final_feedback['feedback_check']['passed']
     # Even two successful blind parses cannot bypass the final identity gate.
     from app.quality import sample_review
     original_binding = sample_review.validate_sample_identity

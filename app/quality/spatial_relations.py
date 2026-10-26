@@ -7,6 +7,8 @@ import math
 
 LEGACY_POLICY = 'typed-spatial-relations-v1'
 POLICY = 'native-3d-spatial-relations-v1'
+LEGACY_READING_POLICY = 'explicit-subject-landmark-v1'
+READING_POLICY = 'explicit-subject-landmark-v2-bidirectional'
 
 
 def native_only(packet):
@@ -72,6 +74,60 @@ def requested_relations(feedback):
         if strict in keys:
             keys.discard(plain)
     return keys
+
+
+def sentence_relation_keys(expression):
+    """Index recognized clauses only; never infer claims from generated IDs."""
+    # Consume explicit native clauses first: 'farther behind than' must not
+    # also select vehicle_behind, which has a different reference frame.
+    keys=set()
+    remainder=expression
+    for relation in NATIVE_RELATIONS:
+        pattern=r'\b'+re.escape(relation.words)+r'\b'
+        if re.search(pattern,remainder,re.IGNORECASE):
+            keys.add(relation.key)
+            remainder=re.sub(pattern,'',remainder,flags=re.IGNORECASE)
+    # Ego itself is not a candidate landmark; its unary directions have their
+    # own predicates and are not looked up in an object-to-object graph.
+    remainder=re.sub(r'\b(?:in front of|ahead of|behind|to the left of|to the right of)\s+(?:the\s+)?ego vehicle\b',
+        '',remainder,flags=re.IGNORECASE)
+    keys.update(requested_relations(remainder))
+    # A conjunction may include both a strict and a plain vehicle relation.
+    remainder=re.sub(r'\b(?:directly|immediately)\s+(?:in front of|ahead of|behind)\b','',remainder,flags=re.IGNORECASE)
+    keys.update(requested_relations(remainder))
+    return keys
+
+
+def sentence_relation_index(graph, expression, *, policy=READING_POLICY):
+    """A sentence-only view of ALL pairs, with no target or appearance hint."""
+    keys=sentence_relation_keys(expression)
+    definitions={d['key']:d for d in graph['definitions'] if d['key'] in keys}
+    rows=[]
+    for row in graph['rows']:
+        definition=definitions.get(row['relation_key'])
+        if not definition:
+            continue
+        anchor=row['landmark_id']
+        frame=definition['reference_frame']
+        reference=f'{anchor} vehicle heading' if frame=='landmark_vehicle_heading' else frame
+        rows.append({**row,'reference_frame':frame,
+            'true_statements':[f'{subject} is {definition["meaning"]} {anchor} (reference: {reference}).'
+                for subject in row['true_subject_ids']]})
+    by_subject = []
+    if policy == READING_POLICY:
+        for key in sorted(definitions):
+            related = [r for r in rows if r['relation_key'] == key]
+            for subject in graph['checked_subject_ids']:
+                by_subject.append({'subject_id':subject, 'relation_key':key,
+                    'true_landmark_ids':[r['landmark_id'] for r in related if subject in r['true_subject_ids']],
+                    'unknown_landmark_ids':[r['landmark_id'] for r in related if subject in r['unknown_subject_ids']]})
+    return {'policy':policy,'definitions':list(definitions.values()),'rows':rows,
+        **({'by_subject':by_subject, 'lookup_instruction':'After visually identifying a subject and landmark, read the exact subject_id and relation_key row in by_subject. Check membership of the landmark ID in true_landmark_ids or unknown_landmark_ids; cross-check the matching landmark row. Both tables encode identical complete geometry and contain no designated target.'} if policy == READING_POLICY else {}),
+        'semantics':'Every listed sentence is SUBJECT relation LANDMARK. Read the landmark row, never invert it. '
+            'Ego-native behind and landmark-vehicle ahead can BOTH be true for the same pair. '
+            'Use the key asserted by the sentence, not a similarly named key in a different frame. '
+            'Unlisted checked subjects are false; unknown_subject_ids and unchecked IDs remain unknown. '
+            'This index includes every source landmark for these relation keys; no appearance or target filtering.'}
 
 
 def pair_match(relation, subject, landmark, boxes, native):

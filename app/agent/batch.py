@@ -469,6 +469,10 @@ class BatchStore:
             COALESCE(json_extract(r.snapshot,'$.model_calls_used'),0) AS calls,
             COALESCE(json_extract(r.snapshot,'$.model_call_budget'),12) AS call_budget,
             json_type(r.snapshot,'$.inflight')='object' AS model_pending,
+            json_extract(r.snapshot,'$.feedback_check') AS feedback_check,
+            json_extract(r.snapshot,'$.current_packet.task.feedback_acceptance_policy') AS feedback_policy,
+            json_extract(r.snapshot,'$.current_packet.task.manual_review_feedback') AS feedback_request,
+            json_extract(r.snapshot,'$.attempts[#-1].generated') AS feedback_generated,
             json_extract(r.snapshot,'$.diagnostic_pass')=1
                 AND length(json_extract(r.snapshot,'$.final_expression'))>0
                 AND json_extract(r.snapshot,'$.status') IN ('calibration_hold','auto_pass') AS automatic_passed
@@ -480,6 +484,16 @@ class BatchStore:
         result = [{**dict(row), 'automatic_passed':bool(row['automatic_passed']),
             'model_pending':bool(row['model_pending']), 'preparation_stage':None} for row in rows]
         for item in result:
+            check = item['feedback_check']
+            policy = item.pop('feedback_policy')
+            request = item.pop('feedback_request')
+            generated = item.pop('feedback_generated')
+            item['feedback_check'] = json.loads(check) if check else None
+            if request and not check and item['status'] not in {'pending','preparing','running','paused','stopped'}:
+                from app.quality.joint_reference import ACCEPTANCE_POLICY, feedback_acceptance
+                item['feedback_check'] = {**feedback_acceptance({'manual_review_feedback': json.loads(request),
+                    **({'feedback_acceptance_policy': policy} if policy else {})},
+                    json.loads(generated) if generated else None), 'historical': policy != ACCEPTANCE_POLICY}
             if item['status'] != 'preparing':
                 continue
             # The existing (job,kind,seq) index bounds this to the new round.

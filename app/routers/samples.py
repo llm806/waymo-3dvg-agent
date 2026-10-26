@@ -277,6 +277,7 @@ def rework(job_id: Id, ordinal: int, request: Request):
                 proof = check.get('multimodal_candidate_proof') or {}
                 attempts.append({'expression':attempt['generated']['expression'], 'errors':check.get('errors', []),
                     'unsupported_claims':check.get('unsupported_claims', []),
+                    'binding_retries':sum(bool(c.get('binding_retry_scheduled')) for c in attempt.get('ground_checks', [])),
                     'native_remaining':len(proof['native']) if 'native' in proof else None,
                     'image_remaining':len(proof['image_only']) if 'image_only' in proof else None,
                     'ground_rounds':len(attempt.get('ground_checks', []))})

@@ -1,5 +1,5 @@
 export const phases: Record<string, string> = { precheck_target: '检查目标是否可见', precheck_candidates: '观察竞争物体与地标', precheck_decision: '寻找区分线索', decide: '选择下一步操作', execute: '执行工具或准备生成', observe_candidates: '比较场景物体外观', generate: '生成目标描述', appearance: '核对图像中的外观属性',
-  relook_candidates: '补看阻塞对象与其它视角', recheck_source_attributes: '复核目标属性冲突与竞争物体', ground: '按文本描述查找目标', ground_permuted: '换一种输入顺序再次检查', scene_ground: '完整场景盲定位复核', scene_ground_permuted: '交换候选编号再次盲定位', counterfactual: '改词对照检查' }
+  recheck_feedback_landmarks: '在原视角复核反馈指定的地标属性', relook_candidates: '补看阻塞对象与其它视角', recheck_source_attributes: '复核目标属性冲突与竞争物体', ground: '按文本描述查找目标', ground_permuted: '换一种输入顺序再次检查', scene_ground: '完整场景盲定位复核', scene_ground_permuted: '交换候选编号再次盲定位', counterfactual: '改词对照检查' }
 export async function readJson(response: Response) {
   const body = await response.text()
   let value
@@ -65,9 +65,17 @@ export function reasonLabel(reason: string) {
     text_claims_disagree_with_declared_predicates: '实际文本与模型声明的定位条件不一致，需要同步改写文字和条件。',
     unsupported_text_claim: '文本包含尚无已核验证据支持的说法。',
     declared_image_order_not_in_text: '模型仍声明了画面排序条件，但改写后的文本已没有对应排序描述。',
-    declared_joint_relation_not_in_text: '文本遗漏或改变了已选定的车辆相对关系，需要保留完整联合描述。',
+    manual_feedback_landmark_missing: '尚无完整证据支持反馈指定的地标与关系，不能用其它地标代替完成要求。',
+    manual_feedback_rejected_relation_repeated: '仍使用了人工明确否定的地标关系，需要重新选择并核验证据。',
+    manual_feedback_concision_missing: '描述尚未达到本轮精简目标；请减少冗余措辞并保留必要定位线索。',
+    declared_joint_relation_not_in_text: '文本遗漏或改变了已选定的物体相对关系或地标限定词，需要保留完整联合描述。',
+    unselected_spatial_relation_in_text: '草稿添加或反转了未被所选证据支持的空间关系，已在盲核验前拦截；人工反馈需由真实证据支持。',
+    declared_ego_direction_not_in_text: '草稿遗漏了已选定的自车方位线索；来源视角不能替代“在自车前方”等真实空间关系。',
+    unselected_ego_direction_in_text: '草稿添加了所选证据方案之外的自车方位，需要按已核实的方向改写。',
     joint_reference_pair_missing: '完整场景盲定位未提供支持该描述的目标与车辆地标组合。',
     joint_reference_pair_unverified: '盲定位返回的目标与车辆地标组合未通过原生身份及朝向几何核验。',
+    joint_reference_landmark_identity_mismatch: '盲定位选中的地标编号与描述的地标属性不符，可能混淆了重叠物体；这不等于已证明文本有歧义。',
+    joint_reference_relation_key_mismatch: '盲定位返回的关系类型与文本声明不符，需要重新核对关系方向及参照物。',
     image_visibility_scope_not_explicit: '声明的排序仅针对可见物体，但文本没有明确“可见”这一比较范围。',
     image_visibility_not_explicit_in_text: '声明使用了可见性条件，但文本没有明确说物体可见。',
     image_camera_not_explicit_in_text: '文本使用图像线索却没有明确对应的相机视角。',
@@ -102,6 +110,8 @@ export function reasonLabel(reason: string) {
     agent_abstained: '系统判断现有证据或预算不足，结束此次尝试。',
     target_spatially_ambiguous: '现有空间线索仍无法可靠区分目标，已跳过，不作为训练标签。',
     description_validation_failed: '描述中的属性或区分线索未通过核验，未取得通过检查的修复版本，不作为训练标签。',
+    manual_feedback_motion_unsupported: '反馈要求描述运动状态或行驶方向，但当前单帧标注尚无可用的运动核验链；本轮未完成，不会省略要求后报成功。',
+    manual_feedback_spatial_missing: '反馈要求的空间线索尚未落实到有证据支持的描述中；来源视角不能代替位置或关系。',
     insufficient_validation_budget: '剩余调用额度不足以完成生成和核验，已停止，避免留下未检查的标注。',
     model_call_budget_exhausted: '本次模型调用额度已用完，未继续发送请求。',
     no_useful_action_within_budget: '现有线索无法区分目标，且没有可执行的补充或修复操作。此次标注已停止，样本和原因已保存。',
@@ -148,4 +158,21 @@ export function automaticCheckState(sample: { automatic_passed?: boolean; status
   if (sample.automatic_passed !== false) return 'unknown'
   return !sample.can_review && ['running', 'paused', 'stopped', 'pending', 'preparing', 'prepared'].includes(sample.status)
     ? 'pending' : 'failed'
+}
+
+export const sampleFilterLabels = {
+  all: '全部描述', usable: '当前可用', passed: '自动核验通过', manual_approved: '人工审批通过',
+  failed: '自动核验未通过', discarded: '已废弃', pending: '自动核验未完成', unknown: '核验状态未读取',
+}
+export type SampleFilter = keyof typeof sampleFilterLabels
+export function matchesSampleFilter(sample: { automatic_passed?: boolean; status: string; can_review: boolean;
+  manual_approved?: boolean; usable?: boolean; manual_review?: { verdict: string } | null }, filter: SampleFilter): boolean {
+  if (filter === 'all') return true
+  const discarded = sample.manual_review?.verdict === 'discarded' || sample.status === 'discarded'
+  // Human dispositions take precedence in the working lists. The original
+  // automatic verdict remains available through automaticCheckState/details.
+  if (discarded) return filter === 'discarded'
+  if (filter === 'usable') return sample.usable === true
+  if (sample.manual_approved === true) return filter === 'manual_approved'
+  return automaticCheckState(sample) === filter
 }

@@ -13,6 +13,27 @@ from app.datasets.evidence import EVIDENCE_ROOT
 from app.infrastructure.artifacts import checked_asset
 
 POLICY = 'two-round-blind-scene-v1'
+CLAIM_POLICY = 'explicit-claims-only-v1'
+BINDING_POLICY = 'anonymous-region-binding-v1'
+INPUT_POLICY = 'sentence-scoped-scene-input-v1'
+CLAIM_GUIDE = """Evaluate only claims actually made by the sentence, not a required description template.
+Appearance alone can uniquely identify an object. No spatial relation, landmark, ego direction, or
+relative position is required when the sentence does not assert one. 'Visible in the front view'
+specifies the source camera; it does NOT mean 'in front of another object' or require a landmark.
+Inspect the entire referring phrase, including visible materials, body parts, attachments, and patterns;
+do not reduce it to only color and category or restrict it to a predefined attribute vocabulary.
+Verify each such detail directly in the photograph; wording or human preference is not evidence.
+For an appearance-only sentence, return relation_pairs=[] and select the uniquely matching candidate
+when supported. Missing UNMENTIONED relations are never unsupported_claims or reasons for ambiguity.
+Use the geometry graph only for spatial clauses actually present. If a sentence asserts a relation,
+that clause still requires the specified native geometry and supporting pairs; never ignore it.
+For an indefinite landmark, existence of a supported target-landmark pair suffices for that clause;
+other landmarks failing it do not refute it. Compare ALL possible target objects for full-sentence uniqueness.
+Distinguish a competing OBJECT from alternative landmarks for the same object. Report actual unresolved
+matches, identity uncertainty, or unsupported stated details, not the absence of an optional cue.
+Before returning, check that candidate_ids, ambiguous_candidate_ids, expression_supported and your
+reason agree: identifying one matching object is not ambiguous merely because it lacks a landmark.
+If a stated attribute is unverifiable or a real competitor remains, reject it normally."""
 GUIDE = """Resolve the English description in this complete source photograph and anonymous native 3D scene.
 You are NOT told the intended object. Treat all native and unmatched image candidates as competitors.
 Read the natural sentence itself, including conjunctions and spatial modifiers such as 'directly in front'.
@@ -28,6 +49,39 @@ Report unsupported/fabricated parts of the sentence. Set expression_supported=fa
 claim cannot be verified. Do not choose an object just because its box is large, its ID is first, or it is near.
 Return JSON matching the schema. candidate_ids contains native or image IDs from this request only.
 Your answer is an automated same-provider check, not an independent human quality certificate."""
+
+
+NATIVE_SCENE_GUIDE = """Independently resolve the entire referring sentence among ALL anonymous scene candidates.
+There is no designated target. Return the supplied JSON schema.
+Use TWO distinct sources of evidence in this order:
+1. PHOTOGRAPHS establish appearance and visible identity ONLY. Bind the subject and landmark descriptors
+   to their OWN labeled regions, comparing all possible objects in the full original photo and every card.
+   Crops may overlap or contain occluders: do not transfer one object's attributes to another ID.
+   Partial truncation is not rejection by itself. Keep genuinely unresolved appearance/identity competitors.
+2. TOOL RELATION TABLES establish ALL spatial assertions, including ordinary in front of/behind another
+   vehicle, directly in front of/behind, and ego directions. Do NOT judge any spatial assertion by apparent
+   photo position, lane impression, apparent size or mentally recomputing numeric coordinates.
+   For each visually matching SUBJECT and LANDMARK, read the exact relation_key in sentence_relation_index.
+   In by_subject, find subject_id and test landmark ID membership in true_landmark_ids or unknown_landmark_ids.
+   Cross-check that landmark's row. Both tables are identical authoritative native-3D geometry.
+   A true pair is spatially supported; a false pair is not. Unknown stays unknown, never false or true.
+   A true relationship to one landmark does not rule out a true relationship to a different landmark.
+Plain behind means vehicle_behind, not vehicle_directly_behind. Plain in front of means vehicle_ahead,
+not vehicle_directly_ahead. Plain relations do not assert same lane, lateral alignment, adjacency or motion.
+Do not add these conditions or deny a true table entry because the photo appears to place vehicles side by side.
+Vehicle-heading relations follow the LANDMARK's heading; native_left/right/ahead/behind follow EGO axes.
+For each subject apply the COMPLETE conjunction of its appearance and all stated native relations.
+An indefinite landmark need not be independently unique; the FINAL SUBJECT must be unique.
+Return every supporting target-landmark combination in relation_pairs with its exact relation_key.
+Report all actual unresolved competing subjects in ambiguous_candidate_ids. Keep all native, image-only,
+zero-point and unpictured inventory; an unverified image/native association cannot be guessed or merged.
+If a relation is true but an attribute or identity cannot be verified, reject for THAT uncertainty;
+do not describe the geometry as absent. Do not silently exclude unknown identity or geometry.
+Appearance-only sentences require no relation or landmark. Named camera scopes appearance, not ego direction.
+Reject unsupported actually stated motion, distance, identity or appearance. Never infer unspoken details.
+Set expression_supported only after BOTH visual claims and authoritative spatial table claims have been checked.
+The final candidate IDs, ambiguity IDs, supporting pairs and reason must agree. No expected answer is supplied.
+This is an automated same-provider check, not independent research certification."""
 
 
 class SceneRelationPair(BaseModel):
@@ -54,7 +108,7 @@ def available(packet):
         and any(v.camera_label==packet.source_view and v.artifacts.get('scene') for v in packet.views))
 
 
-def anonymous_image_guides(photo, rows):
+def anonymous_image_guides(photo, rows, *, binding=False):
     """Every source box gets the same anonymous label and crop treatment.
 
     The unmodified full photograph is still supplied separately. These guides
@@ -69,15 +123,21 @@ def anonymous_image_guides(photo, rows):
     if not boxes:
         return []
     width,height = original.size
-    tile_w,tile_h,columns = 240,166,5
-    sheet = Image.new('RGB',(columns*tile_w,math.ceil(len(boxes)/columns)*tile_h),'#f4f4f4')
-    label_draw = ImageDraw.Draw(sheet)
+    tile_w,tile_h,columns = (320,240,3) if binding else (240,166,5)
+    # Bounded image dimensions prevent the provider from shrinking one tall
+    # contact sheet until overlapping vehicles and labels become unreadable.
+    page_size = 12 if binding else len(boxes)
+    sheets = [Image.new('RGB',(columns*tile_w,math.ceil(min(page_size,len(boxes)-start)/columns)*tile_h),'#f4f4f4')
+        for start in range(0,len(boxes),page_size)]
     for index,(cid,box_index,box) in enumerate(boxes):
         x1,y1,x2,y2 = box
         x1,y1=max(0,min(width,math.floor(x1))),max(0,min(height,math.floor(y1)))
         x2,y2=max(0,min(width,math.ceil(x2))),max(0,min(height,math.ceil(y2)))
         label = cid + (f' / {box_index+1}' if box_index else '')
-        left,top=(index%columns)*tile_w,(index//columns)*tile_h
+        sheet=sheets[index//page_size]
+        label_draw=ImageDraw.Draw(sheet)
+        position=index%page_size
+        left,top=(position%columns)*tile_w,(position//columns)*tile_h
         label_draw.text((left+5,top+3),label,font=font,fill='#111111')
         if x2<=x1 or y2<=y1:
             label_draw.text((left+5,top+35),'Region outside image',font=font,fill='#333333')
@@ -91,11 +151,15 @@ def anonymous_image_guides(photo, rows):
         # Uniform small padding preserves local context. Projected boxes may
         # contain occluders, so tiles never stand in for verified identity.
         pad=max(2,round(max(x2-x1,y2-y1)*.08))
-        crop=original.crop((max(0,x1-pad),max(0,y1-pad),min(width,x2+pad),min(height,y2+pad)))
+        cx,cy=max(0,x1-pad),max(0,y1-pad)
+        crop=original.crop((cx,cy,min(width,x2+pad),min(height,y2+pad)))
+        if binding:
+            ImageDraw.Draw(crop).rectangle((x1-cx,y1-cy,x2-cx-1,y2-cy-1),outline='#00ffff',width=3)
         crop.thumbnail((tile_w-10,tile_h-30))
         sheet.paste(crop,(left+(tile_w-crop.width)//2,top+27))
     result=[]
-    for kind,img in [('anonymous full-scene regions',overlay),('all anonymous source-region tiles',sheet)]:
+    pages=[(f'all anonymous source-region tiles {i+1}/{len(sheets)}',sheet) for i,sheet in enumerate(sheets)] if binding else [('all anonymous source-region tiles',sheets[0])]
+    for kind,img in [('anonymous full-scene regions',overlay),*pages]:
         buffer=io.BytesIO();img.save(buffer,format='JPEG',quality=90)
         data=buffer.getvalue()
         result.append((kind,data))
@@ -110,6 +174,9 @@ def messages(packet, expression, seed):
     photo = checked_asset(EVIDENCE_ROOT/packet.packet_id,name,digest).read_bytes()
     from app.quality.joint_reference import POLICY as JOINT_POLICY
     joint = packet.task.get('joint_reference_policy')==JOINT_POLICY
+    binding = joint and packet.task.get('scene_binding_policy')==BINDING_POLICY
+    focused = joint and packet.task.get('scene_input_policy')==INPUT_POLICY
+    claim_scoped = packet.task.get('scene_claim_policy') == CLAIM_POLICY
     with Image.open(io.BytesIO(photo)) as decoded:
         image_width,image_height = decoded.size
     inventory = [c for c in packet.provenance['scene_image_candidates'] if c['camera_name']==view.camera_name]
@@ -117,6 +184,14 @@ def messages(packet, expression, seed):
     ids = sorted(set(native) | {c['object_id'] for c in inventory})
     random.Random(seed).shuffle(ids)
     mapping = {f'C{i+1:03d}':oid for i,oid in enumerate(ids)}
+    if focused:
+        source_ids={c['object_id'] for c in inventory}
+        # Both groups retain every candidate. Separate anonymous namespaces
+        # prevent a boxless object from being mistaken for a numbered crop.
+        visible=[oid for oid in ids if oid in source_ids]
+        unpictured=[oid for oid in ids if oid not in source_ids]
+        mapping={**{f'V{i+1:02d}':oid for i,oid in enumerate(visible)},
+            **{f'N{i+1:03d}':oid for i,oid in enumerate(unpictured)}}
     rows = []
     for cid,oid in mapping.items():
         boxes = [c['xyxy'] for c in inventory if c['object_id']==oid]
@@ -139,10 +214,29 @@ def messages(packet, expression, seed):
         'units':'provided image pixels' if joint else 'original source-image pixels'},
         'coordinate_frame':'ego vehicle: x forward, y left, z up', 'candidates':rows,
         'output_schema':SceneGroundResult.model_json_schema()}
+    if claim_scoped:
+        payload['claim_evaluation'] = {
+            'policy': CLAIM_POLICY,
+            'scope': 'Every claim in the sentence; no mandatory spatial or landmark clause.',
+            'appearance': 'Verify the complete visible description, including distinctive details, in the photograph.',
+            'camera': 'A named view limits the source image; it is not an object-to-object spatial claim.',
+            'relations': 'Only asserted spatial clauses require graph support and relation_pairs.',
+            'uniqueness': 'Exactly one matching object, with no unresolved competing object or identity.'}
     from app.quality.spatial_relations import enabled as spatial_enabled, native_only, scene_graph
     typed = joint and spatial_enabled(packet)
     if typed:
         payload['spatial_relations']=scene_graph(packet,view.camera_name,mapping)
+        from app.quality.spatial_relations import READING_POLICY, LEGACY_READING_POLICY, sentence_relation_index
+        if packet.task.get('scene_relation_reading_policy') in {READING_POLICY,LEGACY_READING_POLICY}:
+            payload['sentence_relation_index']=sentence_relation_index(payload['spatial_relations'],expression,policy=packet.task['scene_relation_reading_policy'])
+            if focused:
+                keys={d['key'] for d in payload['sentence_relation_index']['definitions']}
+                if keys:
+                    # Select relation TYPES from the sentence only, never
+                    # subjects or landmarks from generated claims/feedback.
+                    graph=payload['spatial_relations']
+                    graph['definitions']=[d for d in graph['definitions'] if d['key'] in keys]
+                    graph['rows']=[r for r in graph['rows'] if r['relation_key'] in keys]
     elif joint:
         from app.quality.relations import vehicle_heading_match, vehicle_forward_region_match, VEHICLE_FORWARD_REGION_POLICY
         reverse = {oid:cid for cid,oid in mapping.items()}
@@ -203,16 +297,64 @@ def messages(packet, expression, seed):
                 'vehicle_ahead/behind follow LANDMARK vehicle heading. native_above/below require native vertical '
                 'separation AND overlapping horizontal footprints; a distant object higher in the photo is not above. '
                 'Unlinked image objects keep UNKNOWN native relationships. Do not certify them using image layout.')
+    if claim_scoped:
+        extra = extra.replace('Resolve attributes AND relation jointly.',
+            'Only IF the sentence asserts a landmark relation, resolve attributes AND that relation jointly.')
+    if 'sentence_relation_index' in payload:
+        extra+=('\nUse sentence_relation_index to look up the exact asserted relation for EVERY plausible subject and landmark. '
+            'Its explicit statements are derived from the same complete native graph, without a target hint. '
+            'SUBJECT and LANDMARK are not interchangeable. A subject can be behind a landmark in EGO coordinates '
+            'and directly ahead of that SAME landmark along its VEHICLE heading. Those facts do not contradict. '
+            'Before claiming geometry is unsupported, check that exact relation_key and landmark_id row. '
+            'Report genuine appearance or identity uncertainty separately; graph support alone never resolves it.')
+    if payload.get('sentence_relation_index',{}).get('by_subject'):
+        extra+=('\nFor plain behind use vehicle_behind, NOT vehicle_directly_behind. Plain behind does not assert '
+            'direct lateral alignment, the same lane, adjacency or following behavior. Different lanes alone cannot '
+            'refute this weaker relation. Use by_subject to check ALL candidate landmark IDs for the visible subject; '
+            'one different supported landmark is not exclusive and does not disprove another supported pair. '
+            'Cross-check the exact landmark row before reporting absent geometry. Still reject real appearance, '
+            'identity, unknown-pair or uniqueness failures; do not infer which target is expected.')
+    if binding:
+        payload['region_identity_check'] = {
+            'policy':BINDING_POLICY,
+            'rule':'Bind each subject AND landmark to its own visible object before using its geometry row. '
+                'Overlapping rectangles and crops can contain several objects. Attributes of a foreground occluder '
+                'do not belong to the candidate whose region contains it. Compare all overlapping candidate cards against the full photo. '
+                'The cyan outline is the projected region, not a segmentation mask. '
+                'If the visible object cannot be bound confidently to an ID, report identity uncertainty; never guess.'}
+    if focused:
+        columns=['candidate_id','category','identity','center_m','size_m','heading_rad','geometry_valid','lidar_points']
+        payload['candidates']=[row for row in rows if row['image_boxes_xyxy']]
+        payload['unpictured_native_candidates']={'columns':columns,
+            'rows':[[row.get(key) for key in columns] for row in rows if not row['image_boxes_xyxy']],
+            'semantics':'Complete remaining native inventory, not excluded competitors. No source image identity is established '
+                'for these IDs; do not assign them the appearance of a visible crop by guessing coordinates. '
+                'Uncertain identity and relationships remain UNKNOWN, including zero-point objects.'}
+        payload['scene_input_policy']=INPUT_POLICY
+        extra+=('\nFirst bind the sentence subject and each landmark to the V labels printed on their OWN image cards. '
+            'V labels are source-image candidates; N labels retain all other native objects, with no source-region identity. '
+            'Read the candidate label again before using its graph row; never swap the subject and landmark IDs. '
+            'For geometry use the supplied exact relation rows, not an inverse phrase or a different frame. '
+            'The relation table contains ALL source candidates for the relation types named by the sentence, without attribute filtering. '
+            'Native numeric data is archival scene context; do not override tool-computed relations by mental arithmetic. '
+            'In your reason explicitly name the visible subject ID and landmark ID you actually used.')
     content = [
         {'type':'text','text':json.dumps(payload,ensure_ascii=False,allow_nan=False)},
         {'type':'image_url','image_url':{'url':f'data:{mime};base64,'+base64.b64encode(photo).decode()}}]
     guide_receipts=[]
-    for kind,data in (anonymous_image_guides(photo,rows) if joint else []):
+    for kind,data in (anonymous_image_guides(photo,rows,binding=binding) if joint else []):
         content.extend([{'type':'text','text':kind},
             {'type':'image_url','image_url':{'url':'data:image/jpeg;base64,'+base64.b64encode(data).decode()}}])
         guide_receipts.append({'kind':kind,'sha256':hashlib.sha256(data).hexdigest()})
-    return [{'role':'system','content':GUIDE+extra}, {'role':'user','content':content}], mapping, {
+    system_guide = (NATIVE_SCENE_GUIDE if packet.task.get('scene_geometry_authority_policy') == 'native-table-authority-v1' and native_only(packet)
+        else GUIDE+('\n'+CLAIM_GUIDE if claim_scoped else '')+extra)
+    return [{'role':'system','content':system_guide}, {'role':'user','content':content}], mapping, {
+            **({'scene_geometry_authority_policy':'native-table-authority-v1'} if system_guide == NATIVE_SCENE_GUIDE else {}),
             'image_sha256':digest,'camera_name':view.camera_name,'permutation_seed':seed,
+            **({'scene_claim_policy':CLAIM_POLICY} if claim_scoped else {}),
+            **({'scene_binding_policy':BINDING_POLICY} if binding else {}),
+            **({'scene_input_policy':INPUT_POLICY} if focused else {}),
+            **({'scene_relation_reading_policy':packet.task['scene_relation_reading_policy']} if 'sentence_relation_index' in payload else {}),
             **({'anonymous_image_guides':guide_receipts} if joint else {}),
             'native_candidate_count':len(native),'source_image_candidate_count':len(inventory)}
 
@@ -237,6 +379,8 @@ def verify(packet, answer, mapping, receipt, *, generated=None):
     joint_rules = [p for p in packet.predicates if p.predicate_id in (generated or {}).get('predicate_ids',[])
         and p.predicate_id.startswith(JOINT_PREFIXES)]
     verified_pairs = []
+    pair_diagnostics = []
+    binding = packet.task.get('scene_binding_policy')==BINDING_POLICY
     if joint_rules:
         from app.quality.relations import vehicle_heading_match, vehicle_forward_region_match, VEHICLE_FORWARD_REGION_POLICY
         native = {o.object_id:o for o in packet.candidates}
@@ -267,6 +411,19 @@ def verify(packet, answer, mapping, receipt, *, generated=None):
                         covered[index].add(pair.candidate_id)
                 if not supported:
                     errors.append('joint_reference_pair_unverified')
+                    if binding:
+                        relevant=[p for i,p in enumerate(proofs)
+                            if int(joint_rules[i].predicate_id.split(':')[1])==receipt['camera_name']
+                            and pair.relation_key==relation_key(p)]
+                        code='joint_reference_pair_unverified'
+                        if target in native and anchor in native and pair.candidate_id in ids and relevant:
+                            if all(anchor not in p.get('possible_anchor_ids',p['confirmed_anchor_ids']) for p in relevant):
+                                code='joint_reference_landmark_identity_mismatch'
+                        elif target in native and anchor in native and any(anchor in p['confirmed_anchor_ids'] for p in proofs):
+                            code='joint_reference_relation_key_mismatch'
+                        if code not in errors:
+                            errors.append(code)
+                        pair_diagnostics.append({**pair.model_dump(),'error':code})
                 else:
                     verified_pairs.append({'target_object_id':target,'landmark_object_id':anchor,
                         **({'relation_key':pair.relation_key,'predicate_ids':[joint_rules[i].predicate_id for i in supported]} if typed else {})})
@@ -276,4 +433,33 @@ def verify(packet, answer, mapping, receipt, *, generated=None):
         'tool_grounded_candidates':grounded,'ambiguous_candidate_ids':answer.ambiguous_candidate_ids,
         'unsupported_claims':answer.unsupported_claims,'reason':answer.reason,
         **({'verified_relation_pairs':verified_pairs,'joint_reference_policy':'joint-target-landmark-v1'} if joint_rules else {}),
+        **({'pair_diagnostics':pair_diagnostics} if binding else {}),
         'scope':'two fresh contexts with full anonymous scene; same-provider visual grounding, not independent certification'}
+
+
+def binding_retry_allowed(packet, feedback, *, retries_used, remaining_calls, phase):
+    """One new blind read for a descriptor/ID mismatch, never for semantic rejection.
+
+    This only requests another independently numbered read. It supplies no
+    expected ID or rejection feedback and cannot turn a failed answer into a pass.
+    """
+    return (packet.task.get('scene_binding_policy')==BINDING_POLICY and retries_used==0
+        and remaining_calls >= (2 if phase=='scene_ground' else 1)
+        and bool(feedback.get('pair_diagnostics'))
+        and all(p['error']=='joint_reference_landmark_identity_mismatch' for p in feedback['pair_diagnostics'])
+        and set(feedback['errors'])=={'joint_reference_landmark_identity_mismatch',
+            'joint_reference_pair_unverified','joint_reference_pair_missing'})
+
+
+def two_rounds_passed(checks):
+    if not any(c.get('binding_retry_scheduled') for c in checks):
+        return len(checks)==2 and all(c['diagnostic_pass'] for c in checks)
+    rejected=[c for c in checks if c.get('binding_retry_scheduled')]
+    accepted=[c for c in checks if not c.get('binding_retry_scheduled')]
+    return (len(rejected)==1 and rejected[0].get('scene_binding_policy')==BINDING_POLICY
+        and not rejected[0]['diagnostic_pass']
+        and set(rejected[0]['errors'])=={'joint_reference_landmark_identity_mismatch',
+            'joint_reference_pair_unverified','joint_reference_pair_missing'}
+        and len(accepted)==2 and all(c['diagnostic_pass'] for c in accepted)
+        and {c.get('blind_round') for c in accepted}=={'scene_ground','scene_ground_permuted'}
+        and len({c['permutation_seed'] for c in checks})==3)

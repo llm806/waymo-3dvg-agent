@@ -310,6 +310,12 @@ or comparison group; return [] only when the text states no target appearance at
 MINIMAL_CLAIM_PARSE_GUIDE = """Independently parse the literal claims of one 3D referring expression.
 Use only the supplied scene-wide predicate vocabulary and attribute schema. No target is designated.
 Map all and only spoken facts. Do not infer an ego direction, subtype, color or landmark from context.
+Always include the SUBJECT category separately, even when also selecting a compound relation.
+For example, "the pedestrian in a brown top farther right than a vehicle relative to the ego vehicle's orientation"
+states category:pedestrian, upper_clothing_color:brown and the matching joint relation.
+The landmark's category:vehicle must NOT replace or be added to the subject category.
+Person/pedestrian explicitly states category:pedestrian; cyclist states category:cyclist; sign states category:sign.
+Check subject category coverage before returning; do not derive it from the selected object's identity.
 Ahead/in front of the ego vehicle means longitudinal:front; behind means longitudinal:behind;
 left/right of the ego vehicle means lateral:left/right. An explicitly coordinated direction states both.
 Sedan/SUV/van/truck/bus imply category:vehicle AND a separate subtype visual attribute.

@@ -3,7 +3,7 @@ import TaskScene from './TaskScene'
 import { taskName } from '../../shared/taskName'
 import { cameraViewLabel } from '../../shared/cameraViews'
 import type { Confirmation, TaskSceneData } from './TaskScene'
-import { objectName, categoryLabel, errorMessage, readJson, readPollingJson, manualReviewLabels, automaticCheckLabels, automaticCheckState } from '../../shared/annotationDisplay'
+import { objectName, categoryLabel, errorMessage, readJson, readPollingJson, manualReviewLabels, automaticCheckLabels, automaticCheckState, sampleFilterLabels, matchesSampleFilter } from '../../shared/annotationDisplay'
 import SampleReview from './SampleReview'
 import type { ManualReview } from './SampleReview'
 import { sampleUrl } from '../../navigation'
@@ -14,7 +14,7 @@ import type { ReworkState } from './ReworkProgress'
 
 type Job = { job_id: string; created_at: number; status: string; counts: Record<string,number> }
 type Sample = { ordinal: number; category: string; expression: string; run_id: string; packet_id: string; status: string; automatic_passed?: boolean; manual_approved?:boolean; usable?:boolean; viewing_previous?:boolean; reviewed: boolean; source_view?: string | null; legacy_rules?: boolean; revision: string | null; can_review: boolean; can_retry?: boolean; retry_failed_run_id?: string; manual_review: ManualReview | null }
-type CheckFilter = 'all' | ReturnType<typeof automaticCheckState>
+type CheckFilter = ResultView['filter']
 type Samples = { task_goal?: number | null; job_id: string; status: string; samples: Sample[]; total_objects: number; created_at: number; review_summary: { unreviewed: number; accepted: number; rejected: number; discarded: number; usable: number } }
 const jobLabels: Record<string,string> = { ready:'待启动', running:'执行中', paused:'已暂停', completed:'已完成', stopped:'已停止', blocked:'执行受阻' }
 const pageSize = 30
@@ -62,25 +62,29 @@ export default function TaskSamples() {
   const rows=samples?.job_id===jobId?samples.samples:emptySamples
   const linkedOrdinal=urlTarget.job===jobId&&urlTarget.ordinal===requestedOrdinal&&!rows.some(s=>s.ordinal===requestedOrdinal)?requestedOrdinal:0
   const listedRows=useMemo(()=>{if(!queue)return rows;const byOrdinal=new Map(rows.map(s=>[s.ordinal,s]));return queue.map(n=>byOrdinal.get(n)).filter((s):s is Sample=>!!s)},[rows,queue])
-  const visibleRows=useMemo(()=>listedRows.filter(s=>checkFilter==='all'||automaticCheckState(s)===checkFilter),[listedRows,checkFilter])
-  const ordinal=linkedOrdinal|| (visibleRows.some(s=>s.ordinal===requestedOrdinal)?requestedOrdinal:visibleRows[0]?.ordinal??0)
+  const visibleRows=useMemo(()=>listedRows.filter(s=>matchesSampleFilter(s,checkFilter)),[listedRows,checkFilter])
+  const navigationJob=useRef(jobId)
+  const navigationRows=useRef(visibleRows)
+  useEffect(()=>{navigationJob.current=jobId;navigationRows.current=visibleRows},[jobId,visibleRows])
+  // Selection belongs to the detail pane. A retry/approval can move the selected
+  // sample out of the list filter without replacing either selection or filter.
+  const ordinal=linkedOrdinal|| (rows.some(s=>s.ordinal===requestedOrdinal)?requestedOrdinal:visibleRows[0]?.ordinal??0)
   function focusSample(id:string,n:number){
     restoreScroll.current=null
     scrollToSample.current=true
     pageTarget.current={job:id,ordinal:n}
-    const position=(sampleCache.current.get(id)?.samples??(id===jobId?rows:[])).findIndex(s=>s.ordinal===n)
+    if(id!==navigationJob.current){setQueue(null);setCheckFilter('all');setListPage(0)}
+    const position=(id===navigationJob.current?navigationRows.current:sampleCache.current.get(id)?.samples??[]).findIndex(s=>s.ordinal===n)
     if(position>=0){setListPage(Math.floor(position/pageSize));pageTarget.current=null}
-    setJobId(id);setOrdinal(n);setQueue(null);setCheckFilter('all');setReview(false)
+    setJobId(id);setOrdinal(n);setReview(false)
     setScene(null);setSelected('');setConfirmation(null);setSceneError('');setSelectionError('');setSampleActionError('')
   }
   useEffect(()=>{
     const follow=()=>{
       const location=fromUrl()
       if(!window.location.hash.startsWith('#results?')||!location.job||!location.ordinal)return
-      restoreScroll.current=null
-      scrollToSample.current=true;pageTarget.current={job:location.job,ordinal:location.ordinal}
-      setJobId(location.job);setOrdinal(location.ordinal);setQueue(null);setCheckFilter('all');setReview(false)
-      setScene(null);setSelected('');setConfirmation(null);setSceneError('');setSelectionError('');setSampleActionError('');setRefresh(v=>v+1)
+      focusSample(location.job,location.ordinal)
+      setRefresh(v=>v+1)
     }
     window.addEventListener('hashchange',follow)
     return()=>window.removeEventListener('hashchange',follow)
@@ -118,16 +122,19 @@ export default function TaskSamples() {
       sampleCache.current.delete(jobId);sampleCache.current.set(jobId,value)
       if(sampleCache.current.size>4)sampleCache.current.delete(sampleCache.current.keys().next().value!)
       setSamples(current=>JSON.stringify(current)===JSON.stringify(value)?current:value);setError('')
-      if(pageTarget.current?.job===jobId){
-        const position=value.samples.findIndex(s=>s.ordinal===pageTarget.current?.ordinal)
-        if(position>=0){setListPage(Math.floor(position/pageSize));pageTarget.current=null}
-      }
       intervalMs=['running','ready','queued'].includes(value.status)?5000:30000
       setOrdinal(current=>{const link=fromUrl();if(link.job===jobId&&link.ordinal===current)return current;if(value.samples.some(s=>s.ordinal===current))return current;const url=fromUrl();return value.samples.find(s=>s.run_id===url.run||s.packet_id===url.packet)?.ordinal??value.samples[0]?.ordinal??0})
     }catch(e){if(!c.signal.aborted)setError(errorMessage(e))}finally{if(!c.signal.aborted){setLoading(false);schedule()}}}
     void poll();return()=>{c.abort();clearTimeout(timer)}
   },[jobId,refresh])
-  const sample=visibleRows.find(s=>s.ordinal===ordinal)
+  useEffect(()=>{
+    const target=pageTarget.current
+    if(!target||target.job!==jobId||samples?.job_id!==jobId)return
+    const position=visibleRows.findIndex(s=>s.ordinal===target.ordinal)
+    if(position>=0)setListPage(Math.floor(position/pageSize))
+    if(rows.some(s=>s.ordinal===target.ordinal))pageTarget.current=null
+  },[jobId,samples,rows,visibleRows])
+  const sample=rows.find(s=>s.ordinal===ordinal)
   const sampleVersion=sample?JSON.stringify([sample.expression,sample.packet_id,sample.run_id,sample.status,sample.revision]):''
   useEffect(()=>{
     if(!jobId||!ordinal)return
@@ -209,9 +216,9 @@ export default function TaskSamples() {
     setReworkTarget('');openSample(jobId,id)
   }
   function jumpToIndex(){
-    const index=Number(jumpIndex),rows=samples?.job_id===jobId?samples.samples:[]
+    const index=Number(jumpIndex),rows=visibleRows
     if(!Number.isSafeInteger(index)||index<1||index>rows.length){setSelectionError(`请输入 1～${rows.length} 的列表索引。`);return}
-    setSelectionError('');setQueue(null);setCheckFilter('all');setListPage(Math.floor((index-1)/pageSize));setReview(true);chooseSample(rows[index-1].ordinal);setScene(null);setSelected('');setConfirmation(null);setSceneRequest(v=>v+1)
+    setSelectionError('');setListPage(Math.floor((index-1)/pageSize));setReview(true);chooseSample(rows[index-1].ordinal);setScene(null);setSelected('');setConfirmation(null);setSceneRequest(v=>v+1)
   }
   function reviewed(value:ManualReview){
     const reviewedJob=value.job_id??jobId, reviewedOrdinal=value.ordinal??ordinal
@@ -321,7 +328,7 @@ export default function TaskSamples() {
   const pageRows=visibleRows.slice(page*pageSize,(page+1)*pageSize)
   function stepSample(offset:number){const next=index+offset;if(next<0||next>=visibleRows.length)return;setListPage(Math.floor(next/pageSize));chooseSample(visibleRows[next].ordinal)}
   function reloadResults(){sceneCache.current.clear();setSceneRequest(v=>v+1);setRefresh(v=>v+1)}
-  function filterChecks(value:CheckFilter){pageTarget.current=null;if(value!=='all'&&!listedRows.some(s=>s.ordinal===requestedOrdinal&&automaticCheckState(s)===value))setOrdinal(0);setCheckFilter(value);setListPage(0);setSceneError('');setSelectionError('')}
+  function filterChecks(value:CheckFilter){pageTarget.current=null;if(value!=='all'&&!listedRows.some(s=>s.ordinal===requestedOrdinal&&matchesSampleFilter(s,value)))setOrdinal(0);setCheckFilter(value);setListPage(0);setSceneError('');setSelectionError('')}
   const checkState=sample?automaticCheckState(sample):null
   const feedbackAvailable=checkState==='passed'||checkState==='failed'
   const reworkOpen=feedbackAvailable&&reworkTarget===`${jobId}:${ordinal}`
@@ -344,7 +351,7 @@ export default function TaskSamples() {
       {!!rows.length&&<section className="panel review-selection" aria-label="审核样本选择">
         <div className="review-toolbar"><form className="review-draw" onSubmit={e=>{e.preventDefault();void drawSamples()}}><label htmlFor="review-count">抽样数量</label><input id="review-count" type="number" min="1" max="1000" value={drawCount} disabled={busy} onChange={e=>setDrawCount(e.target.value)}/><label className="review-checkbox"><input type="checkbox" checked={unreviewed} disabled={busy} onChange={e=>setUnreviewed(e.target.checked)}/>仅未审核</label><button className="primary" disabled={busy}>随机抽样审核</button></form>
           <form className="review-jump" onSubmit={event=>{event.preventDefault();jumpToSampleId()}}><label htmlFor="review-sample-id">样本 #ID <span className="muted">当前任务</span></label><input id="review-sample-id" type="text" value={sampleIdInput} placeholder="例如 #4104" disabled={busy} onChange={event=>setSampleIdInput(event.target.value)}/><button disabled={busy}>按 ID 跳转</button></form>
-          <form className="review-jump" onSubmit={e=>{e.preventDefault();jumpToIndex()}}><label htmlFor="review-index">列表索引 <span className="muted">1–{rows.length}</span></label><input id="review-index" type="number" min="1" max={rows.length} value={jumpIndex} disabled={busy} onChange={e=>setJumpIndex(e.target.value)}/><button disabled={busy}>跳转审核</button></form>
+          <form className="review-jump" onSubmit={e=>{e.preventDefault();jumpToIndex()}}><label htmlFor="review-index">列表索引 <span className="muted">1–{visibleRows.length}</span></label><input id="review-index" type="number" min="1" max={visibleRows.length} value={jumpIndex} disabled={busy} onChange={e=>setJumpIndex(e.target.value)}/><button disabled={busy}>跳转审核</button></form>
           {queue&&<button className="text-button" disabled={busy} onClick={()=>{setQueue(null);setListPage(Math.floor(rows.findIndex(s=>s.ordinal===ordinal)/pageSize))}}>退出抽样</button>}
         </div>
         {queue&&<p className="muted">本轮随机抽样 {queue.length} 条，按抽样顺序逐条审核；再次抽样才会更换队列。</p>}
@@ -352,9 +359,10 @@ export default function TaskSamples() {
       </section>}
       {!samples||samples.job_id!==jobId?<section className="panel results-loading" role="status"><span className="loading-dot"/><div><strong>{error?'样本读取未完成':'正在读取该任务的样本…'}</strong><p className="muted">{error?'点击上方“重新读取”重试。':'文本列表优先展示，图像与点云按所选样本加载。'}</p></div></section>:!samples.samples.length&&!linkedOrdinal?<section className="panel"><h3>该任务还没有生成文本样本</h3><p className="muted">标注生成描述后，会自动显示在此任务下。</p></section>:<div className="sample-browser-grid">
         <aside className="sample-list panel" aria-label="当前任务样本"><div className="sample-list-heading"><h3>{queue?'本轮抽样':'标注样本'}</h3><span className="count-badge">{visibleRows.length}</span></div>
-          <label className="sample-check-filter"><span>自动核验筛选</span><select aria-label="自动核验筛选" value={checkFilter} disabled={busy} onChange={e=>filterChecks(e.target.value as CheckFilter)}><option value="all">全部描述（{listedRows.length}）</option>{(Object.keys(automaticCheckLabels) as ReturnType<typeof automaticCheckState>[]).map(key=><option key={key} value={key}>{automaticCheckLabels[key]}（{listedRows.filter(s=>automaticCheckState(s)===key).length}）</option>)}</select></label>
+          <label className="sample-check-filter"><span>样本状态筛选</span><select aria-label="样本状态筛选" value={checkFilter} disabled={busy} onChange={e=>filterChecks(e.target.value as CheckFilter)}>{(Object.keys(sampleFilterLabels) as CheckFilter[]).map(key=><option key={key} value={key}>{sampleFilterLabels[key]}（{listedRows.filter(s=>matchesSampleFilter(s,key)).length}）</option>)}</select></label>
           <ol ref={listArea} onScroll={event=>{if(savedView.current&&(!restoreScroll.current||restoreScroll.current.listDone)){savedView.current.listScroll=Math.round(event.currentTarget.scrollTop);saveResultView(savedView.current)}}} start={page*pageSize+1}>{pageRows.map(s=><li key={s.ordinal}><button disabled={busy} aria-current={s.ordinal===ordinal?'true':undefined} onClick={()=>chooseSample(s.ordinal)}><span><strong>#{s.ordinal} · {categoryLabel(s.category)}</strong><small className={`review-status ${s.manual_review?.verdict??''}`}>{s.manual_approved?'人工审批通过':s.manual_review?manualReviewLabels[s.manual_review.verdict]:s.reviewed?'已定位 · 人工待审':'人工待审'}</small></span><span className={`automatic-check-badge ${automaticCheckState(s)}`}>{automaticCheckLabels[automaticCheckState(s)]}</span><p lang="en">{s.expression}</p></button></li>)}</ol>{visibleRows.length>pageSize&&<nav className="sample-list-pages" aria-label="样本列表分页"><button disabled={busy||page===0} onClick={()=>setListPage(page-1)} aria-label="上一页样本">←</button><span>{page+1} / {Math.ceil(visibleRows.length/pageSize)}</span><button disabled={busy||(page+1)*pageSize>=visibleRows.length} onClick={()=>setListPage(page+1)} aria-label="下一页样本">→</button></nav>}</aside>
-        <div className="sample-main" ref={sampleArea}>{!sample?<section className="panel sample-filter-empty">{linkedOrdinal?<><h2>样本 #{linkedOrdinal}</h2><p>该样本暂未出现在当前文本列表中，可查看返工进度或刷新。返工期间新描述可能尚未生成。</p>{currentRework?.item&&currentRework.task&&<ReworkProgress items={[currentRework.item]} task={currentRework.task} measuredAt={currentRework.measured_at} jobId={jobId}/>}<button disabled={loading} onClick={reloadResults}>刷新该样本</button>{reworkError&&<p className="error" role="alert">{reworkError}</p>}</>:<><h2>没有符合筛选条件的描述</h2><button onClick={()=>filterChecks('all')}>查看全部描述</button></>}</section>:<section className="panel sample-content"><div className="section-heading"><h2>#{sample.ordinal} · {categoryLabel(sample.category)}</h2><span className="muted">{queue?'抽样队列':checkFilter==='all'?'列表索引':'筛选结果'} {index+1} / {visibleRows.length}</span></div>
+        <div className="sample-main" ref={sampleArea}>{!sample?<section className="panel sample-filter-empty">{linkedOrdinal?<><h2>样本 #{linkedOrdinal}</h2><p>该样本暂未出现在当前文本列表中，可查看返工进度或刷新。返工期间新描述可能尚未生成。</p>{currentRework?.item&&currentRework.task&&<ReworkProgress items={[currentRework.item]} task={currentRework.task} measuredAt={currentRework.measured_at} jobId={jobId}/>}<button disabled={loading} onClick={reloadResults}>刷新该样本</button>{reworkError&&<p className="error" role="alert">{reworkError}</p>}</>:<><h2>没有符合筛选条件的描述</h2><button onClick={()=>filterChecks('all')}>查看全部描述</button></>}</section>:<section className="panel sample-content"><div className="section-heading"><h2>#{sample.ordinal} · {categoryLabel(sample.category)}</h2><span className="muted">{index<0?'当前样本不在筛选列表':`${queue?'抽样队列':checkFilter==='all'?'列表索引':'筛选结果'} ${index+1} / ${visibleRows.length}`}</span></div>
+          {index<0&&<p className="notice">该样本不在当前“{sampleFilterLabels[checkFilter]}”列表中，详情仍保留；左侧筛选未改变。</p>}
           {checkState&&<div className={`sample-check-notice ${sample.manual_approved?'passed':checkState}`}><strong>{sample.manual_approved?'人工审批通过 · 当前可用':automaticCheckLabels[checkState]}</strong><span>{sample.manual_approved?'该版本已纳入当前可用集和后续导出；自动核验未通过的原结论保留。':checkState==='passed'?['rejected','discarded'].includes(sample.manual_review?.verdict??'')?'该版本已被人工拒绝或废弃，不纳入当前可用样本。':'发现颜色、属性或定位错误时，仍可反馈给 Agent 返工；导出时仍会检查任务状态与资源完整性。':checkState==='failed'?'当前描述自动核验未通过。核对图像、点云并确认定位后，可人工审批纳入可用集，也可反馈返工或废弃。':checkState==='pending'?'自动核验尚未完成，当前描述暂不能作为有效样本导出。':'请刷新结果读取自动核验状态，不能仅凭人工审核判断样本可用。'}</span>
             {feedbackAvailable&&<div className="sample-check-actions"><button disabled={busy} onClick={()=>setReworkTarget(`${jobId}:${ordinal}`)}>填写反馈／Agent 返工</button>{checkState==='failed'&&!sample.manual_approved&&<button className="primary" disabled={busy||!sample.can_review} onClick={beginApproval}>{review?'查看人工审批步骤':'开始人工审批'}</button>}{checkState==='failed'&&<span>选择物体 → 确认定位 → 提交审批；提交成功后更新可用数量。</span>}</div>}
           </div>}
