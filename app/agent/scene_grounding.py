@@ -16,6 +16,7 @@ POLICY = 'two-round-blind-scene-v1'
 CLAIM_POLICY = 'explicit-claims-only-v1'
 BINDING_POLICY = 'anonymous-region-binding-v1'
 INPUT_POLICY = 'sentence-scoped-scene-input-v1'
+REGION_CARD_POLICY = 'explicit-anonymous-region-cards-v1'
 CLAIM_GUIDE = """Evaluate only claims actually made by the sentence, not a required description template.
 Appearance alone can uniquely identify an object. No spatial relation, landmark, ego direction, or
 relative position is required when the sentence does not assert one. 'Visible in the front view'
@@ -78,6 +79,9 @@ zero-point and unpictured inventory; an unverified image/native association cann
 If a relation is true but an attribute or identity cannot be verified, reject for THAT uncertainty;
 do not describe the geometry as absent. Do not silently exclude unknown identity or geometry.
 Appearance-only sentences require no relation or landmark. Named camera scopes appearance, not ego direction.
+Do not strengthen a color adjective into a solid-color or unpatterned-garment claim. Striped includes
+horizontal and vertical stripes unless an orientation is explicitly stated. Check actual visible color
+and patterns without inventing a uniformity, exact-shade or stripe-orientation requirement.
 Reject unsupported actually stated motion, distance, identity or appearance. Never infer unspoken details.
 Set expression_supported only after BOTH visual claims and authoritative spatial table claims have been checked.
 The final candidate IDs, ambiguity IDs, supporting pairs and reason must agree. No expected answer is supplied.
@@ -108,7 +112,7 @@ def available(packet):
         and any(v.camera_label==packet.source_view and v.artifacts.get('scene') for v in packet.views))
 
 
-def anonymous_image_guides(photo, rows, *, binding=False):
+def anonymous_image_guides(photo, rows, *, binding=False, cards=False):
     """Every source box gets the same anonymous label and crop treatment.
 
     The unmodified full photograph is still supplied separately. These guides
@@ -118,7 +122,7 @@ def anonymous_image_guides(photo, rows, *, binding=False):
     original = Image.open(io.BytesIO(photo)).convert('RGB')
     overlay = original.copy()
     draw = ImageDraw.Draw(overlay)
-    font = ImageFont.load_default(size=16)
+    font = ImageFont.load_default(size=24 if cards else 16)
     boxes = [(row['candidate_id'],index,box) for row in rows for index,box in enumerate(row['image_boxes_xyxy'])]
     if not boxes:
         return []
@@ -127,6 +131,11 @@ def anonymous_image_guides(photo, rows, *, binding=False):
     # Bounded image dimensions prevent the provider from shrinking one tall
     # contact sheet until overlapping vehicles and labels become unreadable.
     page_size = 12 if binding else len(boxes)
+    if cards:
+        # One explicitly captioned image per region prevents cross-page label
+        # association. Dense scenes keep every region on small four-card pages.
+        tile_w,tile_h,columns = (640,480,1) if len(boxes)<=24 else (480,360,2)
+        page_size = 1 if len(boxes)<=24 else 4
     sheets = [Image.new('RGB',(columns*tile_w,math.ceil(min(page_size,len(boxes)-start)/columns)*tile_h),'#f4f4f4')
         for start in range(0,len(boxes),page_size)]
     for index,(cid,box_index,box) in enumerate(boxes):
@@ -155,10 +164,19 @@ def anonymous_image_guides(photo, rows, *, binding=False):
         crop=original.crop((cx,cy,min(width,x2+pad),min(height,y2+pad)))
         if binding:
             ImageDraw.Draw(crop).rectangle((x1-cx,y1-cy,x2-cx-1,y2-cy-1),outline='#00ffff',width=3)
-        crop.thumbnail((tile_w-10,tile_h-30))
-        sheet.paste(crop,(left+(tile_w-crop.width)//2,top+27))
+        crop.thumbnail((tile_w-10,tile_h-(80 if cards else 30)))
+        sheet.paste(crop,(left+(tile_w-crop.width)//2,top+(40 if cards else 27)))
+        if cards:
+            label_draw.text((left+5,top+tile_h-32),'Region '+label,font=font,fill='#111111')
     result=[]
     pages=[(f'all anonymous source-region tiles {i+1}/{len(sheets)}',sheet) for i,sheet in enumerate(sheets)] if binding else [('all anonymous source-region tiles',sheets[0])]
+    if cards:
+        pages = []
+        for index,sheet in enumerate(sheets):
+            names = [cid + f' region {n+1}' for cid,n,_ in boxes[index*page_size:(index+1)*page_size]]
+            pages.append(('Anonymous region card: '+', '.join(names)+'. Match these exact printed IDs to the geometry table. '
+                'Cyan is a region boundary, not a segmentation mask; overlapping objects may belong to different IDs. '
+                'Keep identity uncertainty if the object cannot be separated.',sheet))
     for kind,img in [('anonymous full-scene regions',overlay),*pages]:
         buffer=io.BytesIO();img.save(buffer,format='JPEG',quality=90)
         data=buffer.getvalue()
@@ -338,18 +356,32 @@ def messages(packet, expression, seed):
             'The relation table contains ALL source candidates for the relation types named by the sentence, without attribute filtering. '
             'Native numeric data is archival scene context; do not override tool-computed relations by mental arithmetic. '
             'In your reason explicitly name the visible subject ID and landmark ID you actually used.')
+    from app.quality.contrast import EGO_PROXIMITY_POLICY, states_ego_near, ego_near_match
+    proximity = packet.task.get('ego_proximity_policy') == EGO_PROXIMITY_POLICY and states_ego_near(expression)
+    if proximity:
+        payload['ego_proximity'] = {'policy':EGO_PROXIMITY_POLICY,
+            'definition':'close/very close/near the ego vehicle: native 3D box center within 5m of vehicle-frame origin; 5..7m unknown, >7m false. Not bumper clearance or nearest rank.',
+            'candidates':[{'candidate_id':cid,'close':ego_near_match(native[oid]) if oid in native else None} for cid,oid in mapping.items()],
+            'rule':'Use this complete target-independent table for the distance clause. Unknown identity/geometry remains unknown; never use photo size or crop edges. No landmark pair is needed for ego proximity.'}
     content = [
         {'type':'text','text':json.dumps(payload,ensure_ascii=False,allow_nan=False)},
         {'type':'image_url','image_url':{'url':f'data:{mime};base64,'+base64.b64encode(photo).decode()}}]
     guide_receipts=[]
-    for kind,data in (anonymous_image_guides(photo,rows,binding=binding) if joint else []):
+    cards = joint and packet.task.get('scene_region_card_policy') == REGION_CARD_POLICY
+    for kind,data in (anonymous_image_guides(photo,rows,binding=binding,cards=cards) if joint else []):
         content.extend([{'type':'text','text':kind},
             {'type':'image_url','image_url':{'url':'data:image/jpeg;base64,'+base64.b64encode(data).decode()}}])
         guide_receipts.append({'kind':kind,'sha256':hashlib.sha256(data).hexdigest()})
     system_guide = (NATIVE_SCENE_GUIDE if packet.task.get('scene_geometry_authority_policy') == 'native-table-authority-v1' and native_only(packet)
         else GUIDE+('\n'+CLAIM_GUIDE if claim_scoped else '')+extra)
+    native_guide = system_guide == NATIVE_SCENE_GUIDE
+    if cards:
+        system_guide += '\nEach region card has its own explicit ID caption and repeats that ID below the pixels. Read the ID on that SAME card before looking up geometry. Never assign an ID by page order or by a nearby label in the crowded overview. Overlapping objects inside a rectangle need not share its native ID. Do not assume the foreground object owns the region. If identity cannot be separated, retain uncertainty; do not guess. No target is marked.'
+    if proximity:
+        system_guide += '\nFor close/very close/near the ego vehicle use the supplied ego_proximity table, not object-to-object relation_pairs or visual size. This unary distance condition must be true for the selected native ID. All unknown candidates remain competitors. Independently verify the entire sentence, appearance and uniqueness.'
     return [{'role':'system','content':system_guide}, {'role':'user','content':content}], mapping, {
-            **({'scene_geometry_authority_policy':'native-table-authority-v1'} if system_guide == NATIVE_SCENE_GUIDE else {}),
+            **({'scene_geometry_authority_policy':'native-table-authority-v1'} if native_guide else {}),
+            **({'scene_region_card_policy':REGION_CARD_POLICY} if cards else {}),
             'image_sha256':digest,'camera_name':view.camera_name,'permutation_seed':seed,
             **({'scene_claim_policy':CLAIM_POLICY} if claim_scoped else {}),
             **({'scene_binding_policy':BINDING_POLICY} if binding else {}),
@@ -363,6 +395,8 @@ def verify(packet, answer, mapping, receipt, *, generated=None):
     ids = answer.candidate_ids
     known = set(mapping)
     errors = []
+    from app.quality.contrast import ego_near_errors
+    errors.extend(ego_near_errors(packet,(generated or {}).get('expression',''),(generated or {}).get('predicate_ids',[])))
     if not set(ids+answer.ambiguous_candidate_ids) <= known or len(set(ids))!=len(ids):
         errors.append('scene_grounding_invalid_candidate_ids')
     if not answer.expression_supported or answer.unsupported_claims:
@@ -406,6 +440,9 @@ def verify(packet, answer, mapping, receipt, *, generated=None):
                         matcher=vehicle_forward_region_match if ordinary else vehicle_heading_match
                         valid=(anchor in native and (not ordinary or packet.task.get('vehicle_forward_region_policy')==VEHICLE_FORWARD_REGION_POLICY)
                             and matcher(native[target],native[anchor],1 if proof['direction'] in {'front','ahead'} else -1) is True)
+                    if valid:
+                        from app.quality.relations import local_landmark_pair
+                        valid=local_landmark_pair(packet,native.get(target),native.get(anchor))
                     if valid:
                         supported.append(index)
                         covered[index].add(pair.candidate_id)

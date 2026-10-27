@@ -9,6 +9,7 @@ LEGACY_POLICY = 'typed-spatial-relations-v1'
 POLICY = 'native-3d-spatial-relations-v1'
 LEGACY_READING_POLICY = 'explicit-subject-landmark-v1'
 READING_POLICY = 'explicit-subject-landmark-v2-bidirectional'
+PLAIN_SPATIAL_POLICY = 'plain-spatial-language-v1'
 
 
 def native_only(packet):
@@ -78,6 +79,8 @@ def requested_relations(feedback):
 
 def sentence_relation_keys(expression):
     """Index recognized clauses only; never infer claims from generated IDs."""
+    from app.quality.contrast import expand_coordinated_ego_clause
+    expression = expand_coordinated_ego_clause(expression)
     # Consume explicit native clauses first: 'farther behind than' must not
     # also select vehicle_behind, which has a different reference frame.
     keys=set()
@@ -209,6 +212,10 @@ def catalog(packet,camera,items,observed,all_ids):
         descriptor=('an ' if noun[0] in 'aeiou' else 'a ')+noun
         code=hashlib.sha256(json.dumps((category,key)).encode()).hexdigest()[:12]
         for relation in (NATIVE_RELATIONS if native_only(packet) else RELATIONS):
+            # Axis order is not distance or a landmark's heading. Do not offer
+            # technical frame-qualified comparisons as ordinary prose.
+            if packet.task.get('spatial_language_policy') == PLAIN_SPATIAL_POLICY and relation.frame == 'ego_native':
+                continue
             supported=confirmed if relation.frame=='source_image' else confirmed & set(native)
             if not supported:
                 continue

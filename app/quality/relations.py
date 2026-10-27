@@ -10,6 +10,34 @@ from app.quality.contrast import POLICY, contrast_plan, remaining, guarded_rank
 VERSION = "safe-anchor-relations-v5-source-salience"
 VEHICLE_HEADING_POLICY = 'vehicle-heading-landmark-v1'
 VEHICLE_FORWARD_REGION_POLICY = 'vehicle-forward-region-v1'
+LOCAL_LANDMARK_POLICY = 'local-landmark-selection-v1'
+MAX_LANDMARK_DISTANCE_M = 20.0
+
+
+def local_landmark_pair(packet, obj, anchor):
+    """Reference suitability only; never a distance claim or candidate exclusion."""
+    if packet.task.get('landmark_locality_policy') != LOCAL_LANDMARK_POLICY:
+        return True
+    return bool(obj is not None and anchor is not None and obj.object_id != anchor.object_id
+        and obj.geometry_valid and anchor.geometry_valid and obj.lidar_points and anchor.lidar_points
+        and math.dist(obj.center_m,anchor.center_m) <= MAX_LANDMARK_DISTANCE_M)
+
+
+def local_landmark_predicate(packet, predicate):
+    if (packet.task.get('landmark_locality_policy') != LOCAL_LANDMARK_POLICY
+            or not predicate.predicate_id.startswith('image_joint_heading:')):
+        return True
+    import json
+    proof=json.loads(predicate.value)
+    native={o.object_id:o for o in packet.candidates}
+    matcher=vehicle_forward_region_match if proof['direction'] in {'ahead','rearward'} else vehicle_heading_match
+    sign=1 if proof['direction'] in {'front','ahead'} else -1
+    witnesses=[native[oid] for oid in proof.get('confirmed_anchor_ids',[]) if oid in native
+        and matcher(packet.target,native[oid],sign) is True]
+    # Do not silently make "a truck" mean only a nearby truck. Reject the
+    # writing plan if its confirmed supporting anchors include a remote one.
+    # The original relation table and every unknown competitor remain intact.
+    return bool(witnesses) and all(local_landmark_pair(packet,packet.target,a) for a in witnesses)
 
 
 def vehicle_forward_region_match(obj, anchor, sign=1):
@@ -281,6 +309,8 @@ def expand_relations(packet: EvidencePacket, observations=None, *, target_observ
     # Rebuilding evidence must not duplicate predicates after a checkpoint/relook.
     base = [p for p in packet.predicates if p.kind not in {'relative_left', 'relative_right',
         'ahead_of', 'behind_anchor', 'vehicle_heading', 'nearest_to_anchor', 'vertical_rank', 'image_relation'}]
+    from app.quality.contrast import ego_near_catalog, EGO_NEAR_ID
+    base = [p for p in base if p.predicate_id != EGO_NEAR_ID] + ego_near_catalog(packet)
     packet = packet.model_copy(update={'predicates': base})
     relations, proofs = relation_catalog(packet, observations)
     image_predicates, image_anchors = [], []

@@ -471,6 +471,9 @@ class BatchStore:
             json_type(r.snapshot,'$.inflight')='object' AS model_pending,
             json_extract(r.snapshot,'$.feedback_check') AS feedback_check,
             json_extract(r.snapshot,'$.current_packet.task.feedback_acceptance_policy') AS feedback_policy,
+            json_extract(r.snapshot,'$.current_packet.task.feedback_detail_policy') AS feedback_detail_policy,
+            json_extract(r.snapshot,'$.current_packet.task.feedback_relation_policy') AS feedback_relation_policy,
+            json_extract(r.snapshot,'$.current_packet.task.feedback_feature_policy') AS feedback_feature_policy,
             json_extract(r.snapshot,'$.current_packet.task.manual_review_feedback') AS feedback_request,
             json_extract(r.snapshot,'$.attempts[#-1].generated') AS feedback_generated,
             json_extract(r.snapshot,'$.diagnostic_pass')=1
@@ -486,6 +489,9 @@ class BatchStore:
         for item in result:
             check = item['feedback_check']
             policy = item.pop('feedback_policy')
+            detail_policy = item.pop('feedback_detail_policy')
+            relation_policy = item.pop('feedback_relation_policy')
+            feature_policy = item.pop('feedback_feature_policy')
             request = item.pop('feedback_request')
             generated = item.pop('feedback_generated')
             item['feedback_check'] = json.loads(check) if check else None
@@ -494,6 +500,48 @@ class BatchStore:
                 item['feedback_check'] = {**feedback_acceptance({'manual_review_feedback': json.loads(request),
                     **({'feedback_acceptance_policy': policy} if policy else {})},
                     json.loads(generated) if generated else None), 'historical': policy != ACCEPTANCE_POLICY}
+            if request and detail_policy != 'explicit-feedback-details-v1' and item['status'] not in {'pending','preparing','running','paused','stopped'}:
+                from app.quality.joint_reference import feedback_acceptance, NATURAL_CONCISION_POLICY
+                supplement = feedback_acceptance({'manual_review_feedback':json.loads(request),
+                    'feedback_acceptance_policy':NATURAL_CONCISION_POLICY,
+                    'feedback_detail_policy':'explicit-feedback-details-v1'}, json.loads(generated) if generated else None)
+                details = [r for r in supplement['requirements'] if r['kind'] in {'ego_distance','retained_phrase'}]
+                if details:
+                    # Presentation only: preserve the frozen run and original
+                    # verdict, calls, and budget. No historical re-execution.
+                    original = item['feedback_check'] or {}
+                    item['feedback_check'] = {**original, 'historical':True,
+                        'requirements':[*original.get('requirements',[]),*details]}
+            if request and relation_policy != 'bilingual-landmark-feedback-v2-omissions' and item['status'] not in {'pending','preparing','running','paused','stopped'}:
+                from app.quality.joint_reference import feedback_acceptance, NATURAL_CONCISION_POLICY, RELATION_FEEDBACK_POLICY
+                supplement = feedback_acceptance({'manual_review_feedback':json.loads(request),
+                    'feedback_acceptance_policy':NATURAL_CONCISION_POLICY,
+                    'feedback_relation_policy':RELATION_FEEDBACK_POLICY}, json.loads(generated) if generated else None)
+                original = item['feedback_check'] or {}
+                known = {(r['kind'],r['label']) for r in original.get('requirements',[])}
+                details = [r for r in supplement['requirements'] if r['kind']=='landmark_correction' and (r['kind'],r['label']) not in known]
+                if details:
+                    # A historically misread positive request must not remain
+                    # beside the corrected omission as if both were required.
+                    corrected = {r['label'].split('：',1)[-1] for r in details if r['label'].startswith('排除：')}
+                    retained = [r for r in original.get('requirements',[]) if not (
+                        r['kind']=='landmark_correction' and r['label'].split('：',1)[-1] in corrected)]
+                    item['feedback_check'] = {**original, 'historical':True,
+                        'requirements':[*retained,*details],
+                        'passed':bool(original.get('passed')) and not any(r['status']=='missing' for r in details),
+                        'blocking_errors':list(dict.fromkeys([*original.get('blocking_errors',[]),
+                            *supplement.get('blocking_errors',[])]))}
+            if request and feature_policy != 'verified-target-feature-feedback-v1' and item['status'] not in {'pending','preparing','running','paused','stopped'}:
+                from app.quality.joint_reference import feedback_acceptance, TARGET_FEATURE_FEEDBACK_POLICY
+                supplement = feedback_acceptance({'manual_review_feedback':json.loads(request),
+                    'feedback_feature_policy':TARGET_FEATURE_FEEDBACK_POLICY}, json.loads(generated) if generated else None)
+                details = [r for r in supplement['requirements'] if r['kind']=='target_feature']
+                if details:
+                    original = item['feedback_check'] or {}
+                    item['feedback_check'] = {**original,'historical':True,
+                        'requirements':[*original.get('requirements',[]),*details],
+                        'passed':bool(original.get('passed')) and not any(r['status']=='missing' for r in details),
+                        'blocking_errors':list(dict.fromkeys([*original.get('blocking_errors',[]),*supplement['blocking_errors']]))}
             if item['status'] != 'preparing':
                 continue
             # The existing (job,kind,seq) index bounds this to the new round.

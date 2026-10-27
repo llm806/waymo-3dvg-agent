@@ -65,7 +65,7 @@ export default function ReworkProgress({items, task, measuredAt, preparationLabe
         {item.feedback&&<div className="rework-feedback"><strong>本次人工反馈</strong><p>{item.feedback}</p></div>}
         {item.feedback_check&&<div className="rework-feedback"><strong>反馈要求检查</strong>
           {item.feedback_check.requirements.map(requirement=><p key={`${requirement.kind}:${requirement.label}`} className={['unsupported','missing','not_verified'].includes(requirement.status)?requirement.required===false?'notice':'error':'muted'}>
-            {requirement.label}{requirement.required===false?'（建议／示例）':''}：{({covered:'已写入描述',missing:requirement.required===false?'未采用':'尚未落实',unsupported:'当前证据能力不支持',pending:'待检查',not_verified:'本轮未完成核验'} as Record<string,string>)[requirement.status]??requirement.status}。{requirement.reason}
+            {requirement.label}{requirement.required===false?'（建议／示例）':''}：{({covered:requirement.kind==='concision'?'精简检查已满足（定位核验另计）':'已写入描述',missing:requirement.required===false?'未采用':'尚未落实',unsupported:'当前证据能力不支持',pending:'待检查',not_verified:'本轮未完成核验'} as Record<string,string>)[requirement.status]??requirement.status}。{requirement.reason}
           </p>)}
           {!item.feedback_check.requirements.length&&<p className="muted">此条自由文本反馈尚无自动验收规则，请人工确认是否满足。</p>}
           {item.feedback_check.historical&&<p className="muted">这是对历史返工的补充提示；原自动核验结论、样本状态和调用记录未改写。</p>}
@@ -80,7 +80,7 @@ export default function ReworkProgress({items, task, measuredAt, preparationLabe
           <p className="muted">已执行 {attempt.ground_rounds} 次盲解析核验{attempt.binding_retries ? `（含 ${attempt.binding_retries} 次地标编号复核；原失败保留，通过仍需两轮有效核验）` : ''}</p>
         </details>)}
         <div className="rework-record-footer"><span className="muted">{item.run_id?`本次运行模型调用 ${item.calls} / ${item.call_budget} 次`:'尚未进入模型调用阶段'}</span>
-          {view.state==='failed'&&!item.automatic_passed&&<span className="muted">{item.manual_approved?'当前版本已人工审批，可纳入后续导出。':'失败草稿保留供人工判断；人工审批通过后可纳入可用集。'}</span>}</div>
+          {view.state==='failed'&&!item.automatic_passed&&<span className="muted">{item.manual_approved?'当前版本已人工审批，可纳入后续导出。':item.attempts?.length?'失败草稿保留供人工判断；人工审批通过后可纳入可用集。':'本轮未生成新草稿；返工前版本仅供查看，不能直接审批。'}</span>}</div>
       </article>
     })}
   </section>

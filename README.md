@@ -50,7 +50,7 @@ uv run uvicorn app.main:app
 
 ## 标注流程与文本质量
 
-当前执行器为 `adaptive-evidence-harness-v88-attribute-dispute-repair`。
+当前执行器为 `adaptive-evidence-harness-v96-explicit-region-cards`。
 
 完整场景双轮盲核验使用 `explicit-claims-only-v1`：只检查句中实际声明，外观足以唯一定位时不强求地标；“front view”等只限定来源相机。材质、结构和附件等细节须由完整原图确认，真实关系仍核验三维几何，真实歧义与未知身份仍拒绝。历史记录不改写。
 

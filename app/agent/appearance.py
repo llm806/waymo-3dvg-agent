@@ -18,6 +18,11 @@ OBSERVATION_SCOPE_GUIDE = (
     'Use feature=handheld bag for a bag visibly held or carried at the hand/side; '
     'use backpack for a bag visibly worn on the back. Do not confuse these with each other '
     'or with a neighboring person. Report these in attributes, not only visibility_reason. '
+    'Use feature=handheld camera for a camera or camcorder visibly held by this person, and '
+    'feature=binoculars for confirmed binoculars. Inspect the hands and device separately from '
+    'any shoulder bag: a person can hold a camera and also carry a bag. Do not substitute bag '
+    'for a camera or binoculars because a device is small. If the device type is unclear, omit it. '
+    'Include confirmed held-device features in attributes, not only visibility_reason. '
     'Nighttime or distance alone does not make a target invisible. A recognizable vehicle silhouette '
     'and its own lamp arrangement can establish partial visibility without known paint or subtype. '
     'Record feature=illuminated headlights or illuminated taillights when confirmed on this unit, '
@@ -51,7 +56,12 @@ OBSERVATION_SCOPE_GUIDE = (
     'A rectangular sign panel mounted on a single pole/post is NOT an A-frame sign. '
     'The a-frame sign subtype requires visible folding legs or a triangular stand belonging to '
     'the selected unit itself. A mounting bracket, support pole, sign back or unreadable face '
-    'does not establish that subtype; omit subtype and report only confirmed shape when unsure. '
+    'does not establish that subtype; omit uncertain subtype but retain all other confirmed visible attributes. '
+    'For signs, record feature=visible rear face when the back surface is confirmed, and '
+    'feature=pole mounted when this panel is visibly attached to its own pole. '
+    'Color describes the visible panel surface, including a confirmed rear surface, never an unseen printed face. '
+    'Record a clear dominant panel color in attributes; do not substitute a narrow colored edge for the panel color. '
+    'Shape, visible rear face and mounting details belong in attributes, not only visibility_reason. '
     'A visible back surface still makes the sign visible; do not mark it occluded merely because '
     'its printed front face is facing away. '
     'Do not confuse an adjacent plastic barrier, pipe, caution tape or vehicle with that selected sign unit. '
@@ -392,7 +402,7 @@ def observation_messages(packet, evidence_root, manifest=None):
     return [{'role': 'system', 'content': OBSERVATION_SCOPE_GUIDE + visibility_instruction(packet) + 'Observe every anonymous object crop independently. No target or expression is supplied. '
              'Return JSON with one candidate record per supplied ID. Report only clearly visible color, subtype, shape, '
              'clothing or distinctive features using the schema. ' + uncertain + 'Never infer an attribute from another '
-             'candidate. Color means the object surface: body paint for vehicles or printed face/background for signs, '
+             'candidate. Color means the object surface: body paint for vehicles or the visible panel surface for signs, '
              'not lighting. Color values belong to color or clothing-color kinds, never feature. '
              'For every vehicle, report vehicle_colors with separate body and roof values (null if uncertain). '
              'When body paint is clear, also include that SAME body color in a/attributes as k/kind=color; '
@@ -915,7 +925,7 @@ def feedback_landmark_manifest(packet):
         return []
     import math
     from app.quality.joint_reference import feedback_relations
-    from app.quality.relations import vehicle_forward_region_match, vehicle_heading_match
+    from app.quality.relations import vehicle_forward_region_match, vehicle_heading_match, local_landmark_pair
     requests = [r for r in feedback_relations(packet.task) if not r['denied'] and r['attributes']
         and r['relation'] in {'vehicle_behind','vehicle_ahead','vehicle_directly_behind','vehicle_directly_ahead'}]
     if not requests:
@@ -927,6 +937,8 @@ def feedback_landmark_manifest(packet):
         anchor = native.get(item['object_id'])
         if anchor is None or anchor.object_id == packet.target_object_id:
             continue
+        if not local_landmark_pair(packet,packet.target,anchor):
+            continue  # Still a scene competitor; not a requested landmark recheck.
         source = next((m for m in [item,*item.get('alternatives',[])] if m.get('camera_name') == camera),None)
         if source is None:
             continue

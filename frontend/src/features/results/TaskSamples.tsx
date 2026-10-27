@@ -93,7 +93,7 @@ export default function TaskSamples() {
     const c=new AbortController();let timer:ReturnType<typeof setTimeout>
     function schedule(){timer=setTimeout(()=>{if(document.hidden)schedule();else void poll()},10000)}
     async function poll(){try{
-      const value=await fetch('/api/batches',{signal:c.signal}).then(readJson)
+      const value=await readPollingJson('/api/batches',c.signal)
       if(c.signal.aborted)return
       setJobs(value.jobs);setLoaded(true);setJobsError('')
       {
@@ -114,7 +114,7 @@ export default function TaskSamples() {
     async function poll(){try{
       setLoading(true)
       const generation=reviewGeneration.current
-      const value=await fetch(`/api/batches/${jobId}/samples`,{signal:c.signal,cache:'no-store'}).then(readJson) as Samples
+      const value=await readPollingJson(`/api/batches/${jobId}/samples`,c.signal,30000) as Samples
       if(c.signal.aborted)return
       // Relinking a retry removes its old result. Keep its submitting form
       // mounted until the request returns so its feedback cannot disappear.
@@ -376,7 +376,8 @@ export default function TaskSamples() {
           <div className="sample-actions"><button disabled={busy||!currentScene} onClick={toggleReview}>{review?'结束检查，查看标注目标':'开始人工定位检查'}</button><button className="danger" aria-label={`废弃样本 #${sample.ordinal}`} disabled={busy||!sample.can_review||sample.manual_review?.verdict==='discarded'} onClick={()=>void discardSample()}>{sample.manual_review?.verdict==='discarded'?'已废弃':'废弃该样本'}</button><span className="muted">{review?'请根据文本选择物体并确认。':'检查时会隐藏目标高亮，可在当前场景中选择物体。'}</span></div>
           {sampleActionError&&<p className="error" role="alert">{sampleActionError}</p>}
           {sample.manual_review?.verdict==='discarded'&&<p className="notice">此版本已从有效样本和后续导出中排除，原始数据、标注历史和费用记录保留。</p>}
-          {review&&<section ref={approvalArea} className={`sample-approval-flow${approved?' approved':''}`} aria-label="人工审批步骤" aria-busy={busy}>
+          {review&&!sample.can_review&&<p className="notice">当前只展示返工前的旧版本，可检查图像与点云；本轮生成新草稿后，才能确认定位并提交人工审批。</p>}
+          {review&&sample.can_review&&<section ref={approvalArea} className={`sample-approval-flow${approved?' approved':''}`} aria-label="人工审批步骤" aria-busy={busy}>
             <div className="approval-flow-heading"><strong>人工审批</strong><ol aria-label="审批步骤"><li className={selected?'done':'current'}>1 选择物体</li><li className={feedback?.correct?'done':selected?'current':''}>2 确认定位</li><li className={approved?'done':feedback?.correct?'current':''}>3 提交审批</li></ol></div>
             <div className="approval-flow-actions"><span>{approved?'审批已保存，当前版本已纳入可用集。':!currentScene?'正在加载定位场景…':feedback?.correct?'定位已确认正确，可以提交审批。':selected?`当前选择：${objectName(selected)}，请确认定位。`:'请在下方图像或点云中点击一个物体。'}</span>
               {!approved&&<>{!feedback?.correct?<button className="primary" disabled={busy||!selected||!currentScene?.can_confirm} onClick={()=>void confirm()}>{busy&&!approving?'正在确认定位…':'确认所选物体'}</button>:<button className="primary" disabled={busy||!sample.can_review} onClick={()=>void approveSample()}>{approving?'正在保存审批…':'审批通过并纳入可用集'}</button>}

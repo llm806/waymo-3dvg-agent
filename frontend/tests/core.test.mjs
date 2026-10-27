@@ -771,7 +771,7 @@ test('deletion and rework preserve user decisions when follow-up operations fail
   const mismatch=renderToStaticMarkup(require('react').createElement(rework.default,{
     items:[{...base,status:'needs_evidence',reason:'description_validation_failed',attempts:[{
       expression:'The sedan near the red car in the left-side view.',
-      errors:['text_claims_disagree_with_declared_predicates','unsupported_text_claim','image_visibility_scope_not_explicit',
+      errors:['unselected_image_position_in_text','unselected_visual_detail_in_text','mechanical_clothing_wording','telegraphic_camera_label','missing_reference_article','telegraphic_appearance_wording','camera_qualifier_without_image_relation','text_claims_disagree_with_declared_predicates','unsupported_text_claim','image_visibility_scope_not_explicit',
         'parsed_expression_not_symbolically_unique','image_expression_not_unique','image_order_scope_not_explicit',
         'failed_draft_text_repeated','scene_grounding_unsupported_claims','scene_grounding_ambiguous',
         'scene_grounding_not_unique_target','scene_grounding_invalid_candidate_ids','scene_grounding_identity_unverified'],

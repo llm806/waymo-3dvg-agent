@@ -44,7 +44,7 @@ def packet():
     catalog = predicate_catalog(candidates)
     return EvidencePacket(packet_id="a" * 24, context="example", frame_timestamp_micros=10,
                           target_object_id=candidates[0].object_id,
-                          task={k: v for k, v in TASK.items() if k not in {'attribute_repair_policy','scene_geometry_authority_policy','feedback_acquisition_policy', 'landmark_salience_policy', 'feedback_acceptance_policy', 'feedback_revision_policy', 'scene_input_policy', 'scene_binding_policy', 'manual_feedback_policy', 'scene_relation_reading_policy', 'spatial_relation_policy', 'vehicle_forward_region_policy', 'joint_reference_policy', 'claim_normalization_policy', 'vehicle_heading_policy', 'scene_grounding_policy', 'landmark_description_policy', 'reference_preference_policy', 'image_position_policy', 'reference_policy', 'observation_policy', 'description_detail_policy', 'execution_policy', 'requires_native_camera_link', 'natural_description', 'contrastive_appearance', 'image_first', 'admission_policy', 'annotation_search', 'image_reference_frame', 'image_identity_policy', 'visibility_policy', 'view_selection_policy'}}, policy=POLICY,
+                          task={k: v for k, v in TASK.items() if k not in {'ego_wording_policy','target_naming_policy','landmark_locality_policy','sentence_style_policy','attribute_repair_policy','scene_geometry_authority_policy','feedback_acquisition_policy', 'landmark_salience_policy', 'feedback_acceptance_policy', 'feedback_revision_policy', 'scene_input_policy', 'scene_binding_policy', 'manual_feedback_policy', 'scene_relation_reading_policy', 'spatial_relation_policy', 'vehicle_forward_region_policy', 'joint_reference_policy', 'claim_normalization_policy', 'vehicle_heading_policy', 'scene_grounding_policy', 'landmark_description_policy', 'reference_preference_policy', 'image_position_policy', 'reference_policy', 'observation_policy', 'description_detail_policy', 'execution_policy', 'requires_native_camera_link', 'natural_description', 'contrastive_appearance', 'image_first', 'admission_policy', 'annotation_search', 'image_reference_frame', 'image_identity_policy', 'visibility_policy', 'view_selection_policy'}}, policy=POLICY,
                           target=candidates[0], candidates=candidates, predicates=catalog,
                           contrast=contrast_plan(candidates, candidates[0].object_id, catalog),
                           views=[], track={}, provenance={}, ready_for_generation=True)
@@ -336,7 +336,7 @@ def exercise_manual_reviews(root, monkeypatch, scene_folder):
                 def index_only():
                     with original_connect() as db:
                         db.set_authorizer(lambda action, table, column, *_: sqlite3.SQLITE_DENY
-                            if action == sqlite3.SQLITE_READ and table == 'runs' and column == 'snapshot'
+                            if action == sqlite3.SQLITE_READ and ((table == 'runs' and column == 'snapshot') or table == 'events')
                             else sqlite3.SQLITE_OK)
                         yield db
                 index_patch.setattr(runner.store,'connect',index_only)
@@ -346,6 +346,13 @@ def exercise_manual_reviews(root, monkeypatch, scene_folder):
                 fresh = BatchStore.__new__(BatchStore);fresh.runs=runner.store
                 other_request=SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(batches=SimpleNamespace(store=fresh))))
                 assert routes.samples(job,other_request)==listed
+                # An executor-only update must not reload full scene snapshots.
+                from app.agent import agent_runtime
+                index_patch.setattr(agent_runtime,'VERSION','next-executor-for-cache-test')
+                changed=routes.samples(job,other_request)
+                assert len(changed['samples'])==len(listed['samples'])
+                assert all(row['legacy_rules'] for row in changed['samples'])
+                assert all('_run_version' not in row for row in changed['samples'])
             assert listed['review_summary']=={'unreviewed':4,'accepted':0,'rejected':0,'discarded':0,'usable':4}
             drawn=routes.random_samples(job,request,count=10)['ordinals']
             assert len(drawn)==len(set(drawn))==4
@@ -577,6 +584,51 @@ def exercise_manual_reviews(root, monkeypatch, scene_folder):
                 assert old_progress['feedback_check']['historical']
                 assert old_progress['feedback_check']['passed'] is False
                 assert db.execute('SELECT snapshot FROM runs WHERE run_id=?',(updated['run_id'],)).fetchone()[0]==encoded
+                historical['current_packet']['task'].pop('feedback_detail_policy',None)
+                historical['current_packet']['task']['manual_review_feedback']['reason']='说明与自车距离很近'
+                historical['feedback_check']={'requirements':[], 'passed':None, 'blocking_errors':[]}
+                encoded=json.dumps(historical)
+                db.execute('UPDATE runs SET snapshot=? WHERE run_id=?',(encoded,updated['run_id']))
+                detailed=BatchStore.review_retry_progress(db,job,1)[0]
+                assert detailed['feedback_check']['historical'] and detailed['automatic_passed']
+                assert detailed['feedback_check']['requirements'][0]['kind']=='ego_distance'
+                assert db.execute('SELECT snapshot FROM runs WHERE run_id=?',(updated['run_id'],)).fetchone()[0]==encoded
+                historical['current_packet']['task'].pop('feedback_relation_policy',None)
+                historical['current_packet']['task']['manual_review_feedback']['reason']='可以说明这个 silver sedan 在 silver SUV的 后方'
+                encoded=json.dumps(historical)
+                db.execute('UPDATE runs SET snapshot=? WHERE run_id=?',(encoded,updated['run_id']))
+                mixed=BatchStore.review_retry_progress(db,job,1)[0]
+                assert mixed['automatic_passed'] and mixed['feedback_check']['historical']
+                assert mixed['feedback_check']['requirements'][0]['status']=='missing'
+                assert mixed['feedback_check']['requirements'][0]['required'] is False
+                assert db.execute('SELECT snapshot FROM runs WHERE run_id=?',(updated['run_id'],)).fetchone()[0]==encoded
+                historical['current_packet']['task'].update(feedback_acceptance_policy='feedback-acceptance-v5-natural-concision',
+                    feedback_relation_policy='bilingual-landmark-feedback-v1')
+                historical['current_packet']['task']['manual_review_feedback']['reason']='不需要 有 in front of a sedan in the front view'
+                historical['attempts'][-1]['generated']['expression']='The pedestrian in front of a silver sedan in the front view.'
+                historical['feedback_check']={'requirements':[{'kind':'landmark_correction','label':'采用：in front of a sedan',
+                    'status':'covered','required':True}], 'passed':True,'blocking_errors':[]}
+                encoded=json.dumps(historical)
+                db.execute('UPDATE runs SET snapshot=? WHERE run_id=?',(encoded,updated['run_id']))
+                corrected=BatchStore.review_retry_progress(db,job,1)[0]
+                assert corrected['automatic_passed'] and corrected['feedback_check']['historical']
+                assert not corrected['feedback_check']['passed']
+                assert corrected['feedback_check']['requirements']==[r for r in corrected['feedback_check']['requirements'] if r['label'].startswith('排除：')]
+                assert corrected['feedback_check']['blocking_errors']==['manual_feedback_rejected_relation_repeated']
+                assert db.execute('SELECT snapshot FROM runs WHERE run_id=?',(updated['run_id'],)).fetchone()[0]==encoded
+                historical['current_packet']['task'].pop('feedback_feature_policy',None)
+                historical['current_packet']['task']['manual_review_feedback']['reason']='目标在拿着摄像机'
+                historical['attempts'][-1]['generated'].update(expression='The pedestrian holding a bag in the front view.',
+                    visual_attributes=[{'kind':'feature','value':'handheld bag'}])
+                historical['feedback_check']={'requirements':[],'passed':None,'blocking_errors':[]}
+                encoded=json.dumps(historical)
+                db.execute('UPDATE runs SET snapshot=? WHERE run_id=?',(encoded,updated['run_id']))
+                held=BatchStore.review_retry_progress(db,job,1)[0]
+                assert held['feedback_check']['historical'] and not held['feedback_check']['passed']
+                assert held['feedback_check']['requirements'][0]['kind']=='target_feature'
+                assert held['feedback_check']['requirements'][0]['status']=='missing'
+                assert held['feedback_check']['blocking_errors']==['manual_feedback_target_feature_missing']
+                assert db.execute('SELECT snapshot FROM runs WHERE run_id=?',(updated['run_id'],)).fetchone()[0]==encoded
                 db.rollback()
             assert updated['final_expression']!='The vehicle to the left of the ego vehicle.'
             assert len(updated['attempts'][-1]['ground_checks'])==2 and 'manual_review' not in updated
@@ -754,6 +806,30 @@ def scene(tmp_path):
 
 
 def test_native_geometry_keeps_ambiguous_and_unknown_competitors():
+    from app.quality.contrast import complete_ego_direction_ids, ego_wording_errors, EGO_WORDING_POLICY
+    direction_packet = packet()
+    direction_packet.task['ego_wording_policy'] = EGO_WORDING_POLICY
+    for x,y,longitudinal,lateral in [(15.2,17.6,'front','left'),(15.2,-17.6,'front','right'),
+            (-15.2,17.6,'behind','left'),(-15.2,-17.6,'behind','right')]:
+        direction_packet.target = obj('direction',x,y)
+        ids = ['longitudinal:'+longitudinal]
+        assert complete_ego_direction_ids(direction_packet,ids) == [*ids,'lateral:'+lateral]
+        assert ego_wording_errors(direction_packet,ids) == ['incomplete_ego_direction']
+        assert not ego_wording_errors(direction_packet,[*ids,'lateral:'+lateral])
+        assert not ego_wording_errors(direction_packet,[])  # Pure appearance needs no direction.
+    direction_packet.target = obj('direction',20,0)
+    assert not ego_wording_errors(direction_packet,['longitudinal:front'])
+    direction_packet.target = obj('direction',15.2,17.6,points=0)
+    assert 'ego_direction_not_supported' in ego_wording_errors(direction_packet,['longitudinal:front','lateral:left'])
+    direction_packet.task.pop('ego_wording_policy')
+    assert not ego_wording_errors(direction_packet,['longitudinal:front'])  # Frozen old semantics.
+    from app.quality.contrast import ego_near_match, ego_near_errors
+    for center, expected in [((3,4,0),True),((5.01,0,0),None),((7,0,0),None),((7.01,0,0),False),((0,0,8),False)]:
+        candidate = obj('near',1,1).model_copy(update={'center_m':center,'lidar_points':10})
+        assert ego_near_match(candidate) is expected
+        assert ego_near_match(candidate.model_copy(update={'lidar_points':0})) is None
+        assert ego_near_match(candidate.model_copy(update={'geometry_valid':False})) is None
+    assert 'ego_distance_claim_mismatch' in ego_near_errors(packet(),'The vehicle is not close to the ego vehicle.',['range:ego_near'])
     from app.quality.relations import vehicle_heading_match, vehicle_forward_region_match
     # Heading-relative front/rear rotates with the landmark, unlike ego axes.
     for angle in (0., math.pi/2, -1.565, math.pi):
@@ -829,6 +905,45 @@ def test_native_geometry_keeps_ambiguous_and_unknown_competitors():
 
 
 def test_partial_target_recheck_and_blind_checks_within_budget(tmp_path, monkeypatch):
+    from app.agent import agent_runtime as runtime
+    from app.schemas.contracts import SceneVisualObservation
+    camera_packet = strict_packet(tmp_path/'camera-feedback-evidence',monkeypatch)
+    camera_packet.candidates[0].category='pedestrian'
+    camera_packet.target=camera_packet.candidates[0]
+    camera_packet.predicates=predicate_catalog(camera_packet.candidates)
+    camera_packet.task.update(feedback_feature_policy='verified-target-feature-feedback-v1',
+        feedback_acceptance_policy='feedback-acceptance-v5-natural-concision',
+        manual_review_feedback={'reason':'目标在拿着摄像机'})
+    camera_packet.provenance['appearance_candidates']=[{'object_id':camera_packet.target_object_id,
+        'candidate_id':'person0','category':'pedestrian','camera_name':1,'artifact':'appearance.jpg'}]
+    camera_root=tmp_path/'camera-feedback-runs'
+    bag_observation=VisualObservation(target_visible=True,visibility='clear',
+        visibility_reason='The pedestrian is visible and has a bag.',
+        attributes=[VisualAttribute(kind='feature',value='handheld bag')])
+    camera_observation=bag_observation.model_copy(update={'visibility_reason':'The pedestrian is holding a camera.', 'attributes':[
+        VisualAttribute(kind='feature',value='handheld camera')]})
+    class CameraRecheckCalls(LocalCalls):
+        def call(self,messages,schema,folder,heartbeat=None):
+            assert schema is SceneVisualObservation
+            payload=json.loads(messages[-1]['content'][0]['text'])
+            assert payload['attribute_checks']==[{'candidate_id':'person0','kinds':['feature']}]
+            assert 'manual_review_feedback' not in payload and 'previous_observation' not in payload
+            self.count+=1
+            RunStore(camera_root/'runs.sqlite3').request_control(folder.parents[1].name,'pause')
+            return SceneVisualObservation.model_validate({'candidates':[{
+                **camera_observation.model_dump(),'candidate_id':'person0'}]})
+    camera_calls=CameraRecheckCalls()
+    camera_state=runtime.initial_run(camera_packet,camera_calls,1,12)
+    camera_state.update(phase='precheck_decision',target_precheck_observation=bag_observation.model_dump(),
+        candidate_appearance={camera_packet.target_object_id:{**bag_observation.model_dump(),'observed_camera_name':1}})
+    RunStore(camera_root/'runs.sqlite3').create(camera_state)
+    with monkeypatch.context() as focused:
+        focused.setattr(runtime,'EVIDENCE_ROOT',tmp_path/'camera-feedback-evidence')
+        checked=runtime.run_agent(camera_packet,camera_calls,1,camera_root,12,resume_run_id=camera_state['run_id'])
+    assert checked['status']=='paused' and camera_calls.count==checked['model_calls_used']==1
+    assert checked['feedback_target_rechecked']
+    assert checked['target_precheck_observation']['attributes']==[{'kind':'feature','value':'handheld camera'}]
+    assert checked['source_attribute_rechecks'][0]['previous_observation']==bag_observation.model_dump()
     # Symbolic ambiguity can request a complete-scene proof; every unit is
     # included, IDs permute, and two fresh successful answers are mandatory.
     from app.agent import scene_grounding
@@ -873,6 +988,17 @@ def test_partial_target_recheck_and_blind_checks_within_budget(tmp_path, monkeyp
             assert result['quality_gate']['scene_grounding_checks_passed'] and not result['quality_gate']['oracle_checks_passed']
             assert calls.payloads[0]['candidates']!=calls.payloads[1]['candidates']
             assert run_agent(p,calls,0,root,2,resume_run_id=initial['run_id'])==result and calls.count==2
+    proximity = p.model_copy(deep=True)
+    proximity.task['ego_proximity_policy'] = 'native-ego-proximity-v1'
+    near_text = 'The white vehicle in the front view is close to the ego vehicle.'
+    inputs, mapping, receipt = scene_grounding.messages(proximity,near_text,17)
+    table = json.loads(inputs[-1]['content'][0]['text'])['ego_proximity']['candidates']
+    assert len(table) == len(mapping)
+    assert all(row['close'] is None for row in table if mapping[row['candidate_id']]=='image:unmatched')
+    target_id = next(cid for cid,oid in mapping.items() if oid==proximity.target_object_id)
+    answer = scene_grounding.SceneGroundResult(expression_supported=True,candidate_ids=[target_id],ambiguous_candidate_ids=[],unsupported_claims=[],reason='selected')
+    near_generated = {'expression':near_text,'predicate_ids':['category:vehicle','range:ego_near']}
+    assert 'ego_distance_not_supported' in scene_grounding.verify(proximity,answer,mapping,receipt,generated=near_generated)['errors']
     from app.agent.appearance import (merge_observations, resolve_target_observation, filter_visual_candidates,
         source_attribute_conflicts, precheck_observation_batches)
     from app.quality.relations import vertical_rank_catalog
@@ -1735,6 +1861,16 @@ def test_partial_target_recheck_and_blind_checks_within_budget(tmp_path, monkeyp
     assert repair_camera_qualifier(ordered,ambiguous_scope)==(ambiguous_scope,None)
     implicit=old_draft.model_copy(update={'expression':'The green rectangular sign in the front view.'})
     assert 'image_visibility_not_explicit_in_text' in draft_reference_errors(reference,implicit,target_records)
+    explicit_reference = reference.model_copy(deep=True)
+    explicit_reference.task['feedback_detail_policy'] = 'explicit-feedback-details-v1'
+    explicit_reference.provenance['admission_plan']['passed'] = True
+    repaired, receipt = repair_camera_qualifier(explicit_reference, implicit)
+    assert receipt and receipt['requires_two_blind_checks']
+    assert 'visible in the front view' in repaired.expression
+    assert 'image_visibility_not_explicit_in_text' not in draft_reference_errors(explicit_reference,repaired,target_records)
+    assert repaired.predicate_ids == implicit.predicate_ids
+    negative = implicit.model_copy(update={'expression':'The sign is not in the front view.'})
+    assert repair_camera_qualifier(explicit_reference,negative) == (negative,None)
 
     # New scene references must change acquisition, planning AND both final
     # checks, while legacy camera-order records remain valid above.
@@ -2275,6 +2411,25 @@ def test_projected_inventory_preserves_unresolved_native_competitors(tmp_path, m
         {'candidate_id':f'C{i:03d}','image_boxes_xyxy':[[0,0,70,70]]} for i in range(25)],binding=True)
     assert len(guides)==4
     assert all(Image.open(io.BytesIO(data)).height<=960 for _,data in guides)
+    card_rows=[{'candidate_id':f'V{i:02d}','image_boxes_xyxy':[[0,0,70,70]]} for i in range(20)]
+    cards=scene_grounding.anonymous_image_guides(photo.getvalue(),card_rows,binding=True,cards=True)
+    assert len(cards)==21  # Overview plus one explicitly captioned image per region.
+    for row,(caption,data) in zip(card_rows,cards[1:]):
+        assert caption.startswith('Anonymous region card: '+row['candidate_id']+' region 1.')
+        assert Image.open(io.BytesIO(data)).size==(640,480)
+    dense_rows=card_rows+[{'candidate_id':f'V{i:02d}','image_boxes_xyxy':[[0,0,0,0]]} for i in range(20,25)]
+    dense=scene_grounding.anonymous_image_guides(photo.getvalue(),dense_rows,binding=True,cards=True)
+    assert len(dense)==8 and all(Image.open(io.BytesIO(data)).height<=720 for _,data in dense)
+    captions=' '.join(c for c,_ in dense[1:])
+    assert all(captions.count(row['candidate_id']+' region 1')==1 for row in dense_rows)
+    card_packet=binding.model_copy(deep=True)
+    card_packet.task['scene_region_card_policy']=scene_grounding.REGION_CARD_POLICY
+    card_messages,_,card_receipt=scene_grounding.messages(card_packet,joint_generated.expression,601)
+    card_packet.target_object_id='other-sedan';card_packet.target=card_packet.candidates[1]
+    assert scene_grounding.messages(card_packet,joint_generated.expression,601)[0]==card_messages
+    assert card_receipt['scene_region_card_policy']==scene_grounding.REGION_CARD_POLICY
+    # Rejection still cannot be turned into a retry/pass by new presentation.
+    assert not scene_grounding.binding_retry_allowed(card_packet,rejected,retries_used=0,remaining_calls=12,phase='scene_ground')
     class BindingCalls(LocalCalls):
         def call(self,messages,schema,folder,heartbeat=None):
             self.count+=1
@@ -2482,6 +2637,23 @@ def test_projected_inventory_preserves_unresolved_native_competitors(tmp_path, m
         for p in native_packet.predicates)
     assert not draft_reference_predicate(native_packet,left)
     assert not draft_reference_predicate(native_packet,below)
+    # Legacy axis proofs stay readable, but new writing must not confuse
+    # longitudinal order with distance or a landmark's own heading.
+    plain=native_packet.model_copy(deep=True)
+    plain.task['spatial_language_policy']=spatial.PLAIN_SPATIAL_POLICY
+    axis=left.model_copy(update={'predicate_id':'image_joint_spatial:1:native_behind:test'})
+    legacy_axis=native_packet.model_copy(deep=True)
+    legacy_axis.task.pop('spatial_language_policy',None)
+    assert draft_reference_predicate(legacy_axis,axis)
+    assert not draft_reference_predicate(plain,axis)
+    plain,_=expand_relations(plain,typed_records)
+    assert not any(p.predicate_id.startswith(tuple('image_joint_spatial:1:'+k+':'
+        for k in ('native_left','native_right','native_ahead','native_behind'))) for p in plain.predicates)
+    near=native[native_packet.target_object_id].model_copy(update={'center_m':(8.69,-3.74,0.95)})
+    far=near.model_copy(update={'object_id':'far-car','center_m':(60.82,-0.14,1.15)})
+    geometry={near.object_id:near,far.object_id:far}
+    assert spatial.pair_match(spatial.BY_KEY['native_behind'],near.object_id,far.object_id,{},geometry) is True
+    assert spatial.pair_match(spatial.BY_KEY['native_ahead'],near.object_id,far.object_id,{},geometry) is False
     assert spatial.pair_match(spatial.BY_KEY['native_below'],native_packet.target_object_id,'person-anchor',boxes,native) is None
     elevated={**native,'upper-car':native['upper-car'].model_copy(update={'center_m':(10,5,10)})}
     assert spatial.pair_match(spatial.BY_KEY['native_above'],'upper-car','person-anchor',boxes,elevated) is True
@@ -2492,6 +2664,7 @@ def test_projected_inventory_preserves_unresolved_native_competitors(tmp_path, m
     # Native and image axes differ. A target to ego-right of the landmark
     # remains there after moving every image box to the opposite side.
     native_heading=heading.model_copy(deep=True)
+    native_heading.task.pop('spatial_language_policy',None)  # Historical axis-proof coverage.
     native_heading.task.update(spatial_relation_policy=spatial.POLICY,joint_reference_policy=JOINT_POLICY,
         scene_grounding_policy=scene_grounding.POLICY,natural_description=True)
     native_heading,_=expand_relations(native_heading,heading_records)
@@ -2652,6 +2825,33 @@ def test_projected_inventory_preserves_unresolved_native_competitors(tmp_path, m
     assert feedback_plan['feedback_alignment']['requested_relation_selected']
     assert any('directly in front of a red' in p.phrase for p in facts)
     assert feedback_plan['requires_full_scene'] and not feedback_plan['unique_plan_found']
+    scoped_feedback=feedback_packet.model_copy(deep=True)
+    from app.schemas.contracts import Predicate
+    scoped_feedback.task.update(feedback_relation_policy='bilingual-landmark-feedback-v1',
+        feedback_acceptance_policy='feedback-acceptance-v5-natural-concision',
+        manual_review_feedback={'reason':'可以说明在 red sedan 的正前方'})
+    source_camera=next(v.camera_name for v in scoped_feedback.views if v.camera_label==scoped_feedback.source_view)
+    scoped_feedback.predicates.append(Predicate(predicate_id=f'image_visibility:{source_camera}:vehicle',
+        kind='image_relation', value=str(source_camera), phrase='visible in the front view',source='test',
+        matches={o.object_id:o.object_id==scoped_feedback.target_object_id for o in scoped_feedback.candidates}))
+    scoped_plan=writing_plan(scoped_feedback,heading_records)
+    assert scoped_plan['unique_plan_found'] and scoped_plan['feedback_alignment']['requested_relation_selected']
+    assert f'image_visibility:{source_camera}:vehicle' in scoped_plan['predicate_ids']
+    from app.quality.joint_reference import SIMPLE_SENTENCE_POLICY,simple_sentence_errors
+    simple_packet=scoped_feedback.model_copy(deep=True)
+    simple_packet.task.update(sentence_style_policy=SIMPLE_SENTENCE_POLICY,manual_review_feedback={})
+    simple_plan=writing_plan(simple_packet,heading_records)
+    assert simple_plan['unique_plan_found'] and not simple_plan['joint_reference']
+    assert not any(i.startswith(('longitudinal:','lateral:')) for i in simple_plan['predicate_ids'])
+    lengthy="In the front-left view, the pedestrian wearing a red top, black pants, and holding a handheld bag is farther behind than the pedestrian in the black jacket relative to the ego vehicle's orientation."
+    assert simple_sentence_errors(lengthy)==['description_too_long','technical_spatial_comparison']
+    assert not simple_sentence_errors('The pedestrian in a red top in the front-left view.')
+    assert not simple_sentence_errors('The red car behind the ego vehicle.')
+    assert not simple_sentence_errors('The red car ahead and to the left of the ego vehicle.')
+    from app.quality.description_search import draft_reference_predicate
+    for simple_rule in simple_packet.predicates:
+        if simple_rule.predicate_id.startswith('image_joint_spatial:'):
+            assert not draft_reference_predicate(simple_packet,simple_rule)
     payload=json.loads(writer_messages(feedback_packet,feedback_plan,None,heading_records)[-1]['content'][0]['text'])
     assert payload['human_feedback']==feedback_packet.task['manual_review_feedback']['reason']
     assert payload['reviewed_sentence']=='The white sedan behind a van.'
@@ -2661,6 +2861,25 @@ def test_projected_inventory_preserves_unresolved_native_competitors(tmp_path, m
     no_relation={'predicate_ids':['category:vehicle']}
     assert writer_contract_errors(feedback_packet,no_relation,'The white sedan behind a red car.')
     assert not writer_contract_errors(feedback_packet,no_relation,'The white sedan in the front view.')
+    # #1176: camera-scoped appearance must reach whole-scene checks even
+    # before symbolic uniqueness can yield an image_attribute predicate.
+    from app.agent.harness import draft_reference_errors
+    from app.agent.scene_grounding import available as scene_available
+    source_only = feedback_packet.model_copy(deep=True)
+    source_only.task['source_camera_scope_policy'] = 'appearance-source-scope-v1'
+    scoped_draft = GeneratedExpression(expression='The white sedan in the front view.',
+        predicate_ids=['category:vehicle'], visual_attributes=target_attrs)
+    assert scene_available(source_only)
+    assert 'camera_qualifier_without_image_relation' not in draft_reference_errors(source_only,scoped_draft,heading_records)
+    for invalid in ('legacy', 'wrong-camera', 'no-rgb', 'no-scene', 'no-attributes'):
+        checked = source_only.model_copy(deep=True)
+        draft = scoped_draft.model_copy(deep=True)
+        if invalid == 'legacy': checked.task.pop('source_camera_scope_policy')
+        if invalid == 'wrong-camera': draft.expression = 'The white sedan in the left-side view.'
+        if invalid == 'no-rgb': checked.task['training_input_capabilities'] = ['geometry']
+        if invalid == 'no-scene': checked.provenance['scene_image_candidates'] = []
+        if invalid == 'no-attributes': draft.visual_attributes = []
+        assert 'camera_qualifier_without_image_relation' in draft_reference_errors(checked,draft,heading_records)
     from app.quality.joint_reference import REVISION_POLICY,ego_requests
     ego_packet=native_heading.model_copy(deep=True)
     ego_packet.task.update(manual_feedback_policy=FEEDBACK_POLICY,feedback_revision_policy=REVISION_POLICY,
@@ -2689,9 +2908,51 @@ def test_projected_inventory_preserves_unresolved_native_competitors(tmp_path, m
     assert feedback_acceptance(correction, {'expression': 'The black vehicle is behind a red sedan in the front view.'})['passed']
     assert 'manual_feedback_landmark_missing' in feedback_acceptance(correction, {'expression': 'The black vehicle is behind an orange car.'})['blocking_errors']
     assert not feedback_relations({**correction,'feedback_acceptance_policy':CONCISION_POLICY})
+    # Mixed Chinese relation / English landmark must reach acquisition and
+    # acceptance, without turning a suggestion into an observed fact.
+    from app.quality.joint_reference import RELATION_FEEDBACK_POLICY
+    bilingual = {**correction, 'feedback_relation_policy':RELATION_FEEDBACK_POLICY,
+        'manual_review_feedback':{'reason':'可以说明 这个 silver sedan 在 silver SUV的 后方'}}
+    request = feedback_relations(bilingual)[0]
+    assert request['relation']=='vehicle_behind' and not request['required']
+    assert request['attributes']==[{'kind':'color','value':'silver'},{'kind':'subtype','value':'suv'}]
+    omitted = feedback_acceptance(bilingual, {'expression':'The silver sedan visible in the front-left view'})
+    assert omitted['passed'] is False and not omitted['blocking_errors']
+    assert omitted['requirements'][0]['status']=='missing'
+    assert feedback_acceptance(bilingual, {'expression':'The silver sedan behind a silver SUV.'})['passed']
+    assert not feedback_relations({k:v for k,v in bilingual.items() if k!='feedback_relation_policy'})
+    for reason, key, denied in [('必须说明在 silver SUV 的后方','vehicle_behind',False),
+            ('可以考虑，但必须说明在 silver SUV 的正前方','vehicle_directly_ahead',False),
+            ('不在 silver SUV 的后方','vehicle_behind',True),
+            ('在 silver SUV 的前面是错误的','vehicle_ahead',True)]:
+        task={**bilingual,'manual_review_feedback':{'reason':reason}}
+        parsed=feedback_relations(task)[0]
+        assert parsed['relation']==key and parsed['denied']==denied and parsed['required']
+        if not denied:
+            assert 'manual_feedback_landmark_missing' in feedback_acceptance(task,{'expression':'The silver sedan.'})['blocking_errors']
     for reason in ('not behind a white sedan but behind a red car', '不是behind a white sedan，而是behind a red car'):
         parsed = feedback_relations({**correction, 'manual_review_feedback': {'reason': reason}})
         assert parsed[0]['denied'] and not parsed[1]['denied']
+    for prefix in ('不需要 有 ', '无需使用 ', '不要写 ', '删除 ', '去掉 ',
+            'do not include ', 'no need to use ', 'remove '):
+        omission_task = {**bilingual,'manual_review_feedback':{'reason':prefix+'in front of a sedan in the front view'}}
+        parsed = feedback_relations(omission_task)
+        assert len(parsed)==1 and parsed[0]['denied'] and parsed[0]['required']
+        repeated = feedback_acceptance(omission_task,{'expression':
+            'The pedestrian in a black top is in front of a silver sedan in the front view.'})
+        assert repeated['blocking_errors']==['manual_feedback_rejected_relation_repeated']
+        assert feedback_acceptance(omission_task,{'expression':'The pedestrian in a black top in the front view.'})['passed']
+    omission_task['manual_review_feedback']['reason']='不需要 有 in front of a sedan in the front view'
+    frozen_omission = {**omission_task,'feedback_relation_policy':'bilingual-landmark-feedback-v1'}
+    assert not feedback_relations(frozen_omission)[0]['denied']
+    omission_plan_packet = scoped_feedback.model_copy(deep=True)
+    omission_plan_packet.task.update(omission_task)
+    omission_plan = writing_plan(omission_plan_packet,heading_records)
+    assert omission_plan and not feedback_acceptance(omission_task,{'expression':
+        ' and '.join(p.phrase for p in omission_plan_packet.predicates if p.predicate_id in omission_plan['predicate_ids'])})['blocking_errors']
+    for reason in ('不要删除 in front of a sedan', '不要省略 in front of a sedan', 'do not omit in front of a sedan'):
+        retained_task={**bilingual,'manual_review_feedback':{'reason':reason}}
+        assert not feedback_relations(retained_task)[0]['denied']
     # Ranking may prefer alignment without narrowing the weak behind predicate.
     salience = native_heading.model_copy(deep=True)
     salience.task['landmark_salience_policy'] = SALIENCE_POLICY
@@ -2704,6 +2965,21 @@ def test_projected_inventory_preserves_unresolved_native_competitors(tmp_path, m
             value=json.dumps({'direction':'rearward','confirmed_anchor_ids':[anchor]}),phrase='behind a vehicle',
             matches={},source='test',required_capability='rgb')
     assert landmark_salience(salience,[salience_rule('near-anchor')]) < landmark_salience(salience,[salience_rule('side-anchor')])
+    from app.quality.relations import LOCAL_LANDMARK_POLICY,local_landmark_predicate,local_landmark_pair
+    local=salience.model_copy(deep=True)
+    local.task['landmark_locality_policy']=LOCAL_LANDMARK_POLICY
+    nearby_rule=salience_rule('near-anchor');distant_rule=salience_rule('side-anchor')
+    before=distant_rule.model_dump()
+    assert local_landmark_predicate(local,nearby_rule)
+    assert not local_landmark_predicate(local,distant_rule)
+    assert distant_rule.model_dump()==before  # No rewriting truth/competitor tables.
+    mixed=nearby_rule.model_copy(update={'value':json.dumps({'direction':'rearward',
+        'confirmed_anchor_ids':['near-anchor','side-anchor']})})
+    assert not local_landmark_predicate(local,mixed)
+    assert local_landmark_predicate(salience,distant_rule)  # Frozen historical behavior.
+    assert local_landmark_pair(local,local.target,close)
+    assert not local_landmark_pair(local,local.target,remote)
+    assert not local_landmark_pair(local,local.target,close.model_copy(update={'lidar_points':0}))
     from app.agent.appearance import feedback_landmark_manifest, FEEDBACK_ACQUISITION_POLICY
     salience.task.update(correction, feedback_acquisition_policy=FEEDBACK_ACQUISITION_POLICY)
     source_camera = next(v.camera_name for v in salience.views if v.camera_label == salience.source_view)
@@ -2716,6 +2992,10 @@ def test_projected_inventory_preserves_unresolved_native_competitors(tmp_path, m
     assert all(m['attribute_recheck'] == ['color'] for m in manifest)
     assert 'red' not in json.dumps(manifest)  # No desired answer leaks into anonymous observation.
     assert 'attribute_recheck' not in salience.provenance['appearance_candidates'][0]
+    salience.task.update(bilingual)
+    mixed_manifest=feedback_landmark_manifest(salience)
+    assert mixed_manifest and all(m['attribute_recheck']==['color','subtype'] for m in mixed_manifest)
+    assert 'silver' not in json.dumps(mixed_manifest)
     frozen = salience.model_copy(deep=True)
     frozen.task.pop('feedback_acquisition_policy')
     assert not feedback_landmark_manifest(frozen)
@@ -2757,6 +3037,125 @@ def test_projected_inventory_preserves_unresolved_native_competitors(tmp_path, m
     assert brief_plan and brief_plan['unique_plan_found']
     brief_payload = json.loads(writer_messages(brief_packet, brief_plan, None, heading_records)[-1]['content'][0]['text'])
     assert 'at most 24' in brief_payload['concision_instruction']
+    # #1176: natural brevity must not reward dropping articles or adding ego
+    # clauses after a purely linguistic failure. Legacy percentage stays frozen.
+    from app.quality.joint_reference import NATURAL_CONCISION_POLICY
+    from app.agent.harness import expression_language_errors
+    assert 'technical_ego_axis_comparison' in expression_language_errors(
+        "The silver vehicle in the front view is farther behind than a silver vehicle relative to the ego vehicle's orientation.")
+    natural_task = {**concise_task, 'feedback_acceptance_policy': NATURAL_CONCISION_POLICY}
+    detail_task = {'feedback_acceptance_policy':NATURAL_CONCISION_POLICY,
+        'feedback_detail_policy':'explicit-feedback-details-v1', 'manual_review_feedback':{
+            'reason':'仅保留 The white vehicle in the left-side view 即可，然后说明与自车 距离很近'}}
+    detail = feedback_acceptance(detail_task)
+    assert detail['blocking_errors'] == ['manual_feedback_distance_unsupported']
+    enabled_detail = {**detail_task,'ego_proximity_policy':'native-ego-proximity-v1'}
+    assert not feedback_acceptance(enabled_detail)['blocking_errors']
+    assert feedback_acceptance(enabled_detail,{'expression':'The white vehicle in the left-side view is close to the ego vehicle.',
+        'predicate_ids':['category:vehicle','range:ego_near']})['passed']
+    assert 'manual_feedback_distance_missing' in feedback_acceptance(enabled_detail,{
+        'expression':'The white vehicle in the left-side view is to the left of the ego vehicle.',
+        'predicate_ids':['category:vehicle','lateral:left']})['blocking_errors']
+    assert {r['kind'] for r in detail['requirements']} == {'ego_distance','retained_phrase'}
+    assert 'manual_feedback_distance_unsupported' in feedback_acceptance(detail_task, {
+        'expression':'The white vehicle in the left-side view is to the left of the ego vehicle.',
+        'predicate_ids':['lateral:left']})['blocking_errors']
+    assert not feedback_acceptance({**detail_task,'feedback_detail_policy':None})['requirements']
+    for reason in ['可以说明与自车距离很近','不要说明与自车距离很近']:
+        optional = {**detail_task,'manual_review_feedback':{'reason':reason}}
+        assert not feedback_acceptance(optional)['blocking_errors']
+    keep = {**detail_task,'manual_review_feedback':{'reason':'仅保留 The white vehicle in the left-side view 即可'}}
+    assert feedback_acceptance(keep,{'expression':'The white vehicle in the left-side view.'})['passed']
+    assert feedback_acceptance(keep,{'expression':'The white vehicle in the left-side view is in front of a black vehicle.'})['blocking_errors'] == ['manual_feedback_retained_phrase_missing']
+    assert feedback_acceptance(keep,{'expression':'The vehicle on the left.'})['blocking_errors'] == ['manual_feedback_retained_phrase_missing']
+    assert concision_budget(natural_task) == len(concise_task['manual_review_feedback']['previous_expression'].split()) - 1
+    bad = 'Front view: a pedestrian with black helmet, red top, blue bottoms, backpack is in front of ego vehicle.'
+    assert set(expression_language_errors(bad)) >= {'telegraphic_camera_label','missing_reference_article','telegraphic_appearance_wording'}
+    assert feedback_acceptance(natural_task, {'expression':bad})['blocking_errors'] == ['manual_feedback_concision_missing']
+    for text in ('The pedestrian wearing a red top in the front view.',
+                 'The pedestrian with a backpack is in front of the ego vehicle.'):
+        assert not expression_language_errors(text)
+        assert feedback_acceptance(natural_task, {'expression':text})['passed']
+    assert expression_language_errors('In front view, a pedestrian with black helmet.')
+    for sentence in ('The white pickup truck in the front-left view is the target.',
+            'The white pickup truck is the selected object.',
+            'The object of interest is the white pickup truck.'):
+        assert 'annotation_meta_wording' in expression_language_errors(sentence)
+        assert 'annotation_meta_wording' in simple_sentence_errors(sentence)
+        assert 'annotation_meta_wording' in writer_contract_errors(simple_packet,simple_plan,sentence)
+    assert not expression_language_errors('The white pickup truck in the front-left view.')
+    from app.quality.joint_reference import feedback_target_features, TARGET_FEATURE_FEEDBACK_POLICY
+    camera_task={'feedback_feature_policy':TARGET_FEATURE_FEEDBACK_POLICY,
+        'manual_review_feedback':{'reason':'目标在拿着摄像机'}}
+    assert feedback_target_features(camera_task)==[{'kind':'feature','value':'handheld camera','required':True}]
+    bag_only={'expression':'The pedestrian holding a bag in the front view.',
+        'visual_attributes':[{'kind':'feature','value':'handheld bag'}]}
+    assert feedback_acceptance(camera_task,bag_only)['blocking_errors']==['manual_feedback_target_feature_missing']
+    camera_sentence={'expression':'The pedestrian holding a camera in the front view.',
+        'visual_attributes':[{'kind':'feature','value':'handheld camera'}]}
+    assert feedback_acceptance(camera_task,camera_sentence)['passed']
+    assert feedback_acceptance(camera_task,{**camera_sentence,'expression':bag_only['expression']})['blocking_errors']
+    assert feedback_acceptance(camera_task,{**camera_sentence,'visual_attributes':[]})['blocking_errors']
+    assert not feedback_target_features({'manual_review_feedback':camera_task['manual_review_feedback']})
+    assert not feedback_target_features({**camera_task,'manual_review_feedback':{'reason':'目标不是拿着相机'}})
+    from app.quality.description_search import appearance_phrase, descriptive_attributes
+    camera_attrs=[VisualAttribute(kind='feature',value='handheld camera'),VisualAttribute(kind='feature',value='handheld bag')]
+    assert appearance_phrase('pedestrian',camera_attrs)=='the pedestrian holding a camera and a bag'
+    assert appearance_phrase('pedestrian',[VisualAttribute(kind='feature',value='binoculars')])=='the pedestrian using binoculars'
+    camera_planning=simple_packet.model_copy(deep=True)
+    camera_planning.task.update(camera_task)
+    camera_planning.target.category='pedestrian'
+    selected=descriptive_attributes(camera_planning,{camera_planning.target_object_id:{'target_visible':True,
+        'visibility':'clear','visibility_reason':'The pedestrian holds a camera and has a bag.',
+        'attributes':[a.model_dump() for a in camera_attrs]}})
+    assert selected and selected[0].value=='handheld camera'
+    assert not simple_sentence_errors('The white pickup truck visible in the front-left view.')
+    from app.quality.joint_reference import ego_requests
+    from app.quality.spatial_relations import sentence_relation_keys
+    for first,axis in [('in front of','front'),('ahead','front'),('ahead of','front'),('behind','behind')]:
+        for side in ('left','right'):
+            sentence=f'The white pickup truck is {first} and to the {side} of the ego vehicle.'
+            ids,remainder=ego_requests(sentence)
+            assert ids == {'longitudinal:'+axis,'lateral:'+side}
+            assert not sentence_relation_keys(sentence)
+            assert not expression_language_errors(sentence)
+    assert sentence_relation_keys('The white pickup truck is in front of a bus and to the left of the ego vehicle.')
+    small = feedback_packet.model_copy(deep=True)
+    small.task.update(natural_task)
+    small.predicates = [p for p in small.predicates if p.kind == 'category']
+    unknown_records = {small.target_object_id:heading_records[small.target_object_id]}
+    smaller = writing_plan(small,unknown_records)
+    assert smaller and smaller['requires_full_scene'] and not smaller['unique_plan_found']
+    assert 0 < len(smaller['visual_attributes']) < len(unknown_records[small.target_object_id]['attributes'])
+    wording_failure = {'generated':{**smaller,'expression':bad}, 'ground_checks':[],
+        'verification':{'diagnostic_pass':False,'errors':['manual_review_rejected_text_repeated','missing_reference_article']}}
+    assert writing_plan(small,unknown_records,attempts=[wording_failure]) == smaller
+    semantic_failure = {**wording_failure, 'ground_checks':[{'unsupported_claims':['unresolved competitor']}],
+        'verification':{'diagnostic_pass':False,'errors':['scene_grounding_ambiguous']}}
+    assert writing_plan(small,unknown_records,attempts=[semantic_failure]) != smaller
+    natural_payload = json.loads(writer_messages(small,smaller,wording_failure,unknown_records)[-1]['content'][0]['text'])
+    assert 'no fixed percentage' in natural_payload['concision_instruction']
+    assert 'articles' in natural_payload['concision_instruction']
+    assert all(c['type']=='text' for c in writer_messages(small,smaller,wording_failure,unknown_records)[-1]['content'])
+    assert 'source_target_region' not in natural_payload and natural_payload['source_camera_phrase']=='in the front view'
+    assert 'mechanical_clothing_wording' in expression_language_errors('The pedestrian wearing blue lower clothing.')
+    assert 'unselected_image_position_in_text' in writer_contract_errors(small,smaller,'The pedestrian on the right is wearing a red top.')
+    assert 'unselected_image_position_in_text' in writer_contract_errors(small,smaller,'The pedestrian on the right side of the street.')
+    assert 'unselected_visual_detail_in_text' in writer_contract_errors(small,smaller,'The pedestrian wearing a red striped shirt.')
+    assert not writer_contract_errors(small,smaller,'The white sedan in the front view.')
+    style_feedback = {**natural_task, 'manual_review_feedback': {'reason':
+        '请使用规范通顺的英文。不要使用“Front view: a pedestrian with black helmet, red top, blue bottoms, backpack is in front of ego vehicle”这样的不规范、不通顺表达。'}}
+    assert not feedback_requirements(style_feedback)['ego']
+    assert not feedback_requirements(style_feedback)['required_spatial']
+    assert not feedback_relations(style_feedback)
+    style_only = small.model_copy(deep=True)
+    style_only.task.update(style_feedback)
+    style_plan = writing_plan(style_only,unknown_records)
+    style_failure = {**wording_failure,'generated':{**style_plan,'expression':bad}}
+    assert writing_plan(style_only,unknown_records,attempts=[style_failure]) == style_plan
+    # Explicit relational corrections remain actionable even when quoted.
+    still_correct = {**natural_task, 'manual_review_feedback': {'reason':'“behind a white sedan”是错误的，应采用 behind a red sedan。'}}
+    assert any(r['denied'] for r in feedback_relations(still_correct))
     strict_ego=ego_packet.model_copy(deep=True)
     strict_ego.task['feedback_acceptance_policy']=ACCEPTANCE_POLICY
     strict_plan=writing_plan(strict_ego,heading_records)
@@ -3652,6 +4051,35 @@ def test_projected_inventory_preserves_unresolved_native_competitors(tmp_path, m
     assert confirmed_attributes('vehicle',conflicting) == []
     assert appearance_phrase('vehicle',[VisualAttribute(kind='subtype',value='excavator body')],
         plural=True) == 'the excavator bodies'
+    sign_attrs = [VisualAttribute(kind='shape',value='rectangular'),
+        VisualAttribute(kind='feature',value='visible rear face'),
+        VisualAttribute(kind='feature',value='pole mounted')]
+    sign_phrase = appearance_phrase('sign',sign_attrs)
+    assert sign_phrase == 'the rectangular sign mounted on a pole with its rear surface visible'
+    from app.quality.spatial_relations import sentence_relation_keys
+    assert not sentence_relation_keys(sign_phrase)
+    sign_packet = p.model_copy(deep=True)
+    sign_packet.target.category = 'sign'
+    sign_packet.task.update(target_naming_policy='explicit-target-category-v1',manual_feedback_policy=FEEDBACK_POLICY)
+    sign_plan = {'predicate_ids':[], 'visual_attributes':[a.model_dump() for a in sign_attrs]}
+    assert 'target_category_omitted' in writer_contract_errors(sign_packet,sign_plan,'The rectangular object in the front-right view.')
+    assert 'target_category_omitted' in writer_contract_errors(sign_packet,sign_plan,'The object behind a sign.')
+    assert 'target_category_omitted' not in writer_contract_errors(sign_packet,sign_plan,sign_phrase)
+    for sentence in ('A yellow pole mounted sign is visible in the front-right view.',
+            'A small, yellow pole-mounted sign is visible in the front-right view.',
+            'The yellow pole-mounted sign in the front-right view.',
+            'The visible yellow sign in the front-right view.',
+            'In the front-right view, the yellow pole mounted sign.',
+            'From the front-right view, a yellow pole-mounted sign is visible.',
+            'There is a yellow pole-mounted sign in the front-right view.'):
+        assert 'target_category_omitted' not in writer_contract_errors(sign_packet,sign_plan,sentence)
+    for sentence in ('The object mounted on a sign.', 'The person holding a sign.',
+            'The yellow object beside a sign.', 'In the front-right view, the object behind a sign.'):
+        assert 'target_category_omitted' in writer_contract_errors(sign_packet,sign_plan,sentence)
+    from app.quality.joint_reference import writer_messages
+    message = writer_messages(sign_packet,sign_plan,None,{})[-1]
+    assert json.loads(message['content'][0]['text'])['target_category'] == 'sign'
+    assert confirmed_attributes('sign',{'target_visible':True,'attributes':[a.model_dump() for a in sign_attrs]})
     assert not scoped_image_orders(1,[group_record],{assembly_id:clear().model_dump()},
         native,native|{assembly_id},'test',allow_partial=True)
     unit_orders = visible_image_orders(1,[*scope_boxes[:2],group_record],scope_observations,
@@ -3757,6 +4185,31 @@ def test_audit_release_and_training_require_matching_annotation_configuration(sc
 
 
 def test_adaptive_loop_two_blind_orders_and_idempotent_completion(tmp_path, monkeypatch):
+    # A stale unspoken attribute cannot force a longer sentence. Preserve the
+    # failure, propose smaller claims, and run BOTH blind checks afresh.
+    from app.agent.harness import SENTENCE_CLAIM_REPAIR_POLICY, sentence_claim_repair
+    repair_packet=rich_packet(tmp_path/'sentence-claims',monkeypatch)
+    repair_packet.task['sentence_claim_repair_policy']=SENTENCE_CLAIM_REPAIR_POLICY
+    class StaleClaims(RichCalls):
+        def call(self,messages,schema,folder,heartbeat=None):
+            answer=super().call(messages,schema,folder,heartbeat)
+            if schema in {GeneratedExpression,VisualObservation}:
+                attrs=answer.visual_attributes if schema is GeneratedExpression else answer.attributes
+                attrs.append(VisualAttribute(kind='feature',value='roof rack'))
+            return answer
+    repaired=run_packet(repair_packet,StaleClaims(),output_root=tmp_path/'sentence-runs',max_model_calls=6)
+    assert repaired['diagnostic_pass'] and repaired['model_calls_used']==5
+    assert len(repaired['attempts'])==2 and len(repaired['attempts'][1]['ground_checks'])==2
+    first,last=repaired['attempts']
+    assert 'visual_claims_disagree_with_text' in first['verification']['errors']
+    assert first['generated']['expression']==last['generated']['expression']
+    assert {'kind':'feature','value':'roof rack'} not in last['generated']['visual_attributes']
+    parsed=GroundResult.model_validate(last['claim_repair']['source_parse'])
+    spoken=GeneratedExpression.model_validate(first['generated'])
+    spoken.expression+=' With a roof rack.'
+    assert sentence_claim_repair(repair_packet,spoken,parsed,first['verification'],{}) is None
+    conflict=parsed.model_copy(update={'parsed_visual_attributes':[VisualAttribute(kind='color',value='red')]})
+    assert sentence_claim_repair(repair_packet,GeneratedExpression.model_validate(first['generated']),conflict,first['verification'],{}) is None
     # A redundant visual alias costs no extra call, but never removes a spatial
     # claim or replaces either independent blind parse.
     from app.agent.harness import normalize_visual_predicate_aliases, draft_reference_errors
@@ -3969,6 +4422,16 @@ def test_adaptive_loop_two_blind_orders_and_idempotent_completion(tmp_path, monk
     assert not motion_result['diagnostic_pass'] and not motion_result['attempts']
     assert motion_result['model_calls_used']==motion_calls.count==0
     assert run_agent(motion_packet,motion_calls,2,motion_root,12)==motion_result
+    distance_packet = packet()
+    distance_packet.task.pop('ego_proximity_policy',None)
+    distance_packet.task.update(feedback_acceptance_policy=ACCEPTANCE_POLICY,
+        feedback_detail_policy='explicit-feedback-details-v1',
+        manual_review_feedback={'reason':'说明与自车距离很近'})
+    distance_calls = LocalCalls()
+    distance_result = run_agent(distance_packet,distance_calls,2,tmp_path/'distance-feedback',12)
+    assert distance_result['stop_reason'] == 'manual_feedback_distance_unsupported'
+    assert distance_result['model_calls_used'] == distance_calls.count == 0
+    assert not distance_result['attempts'] and not distance_result['diagnostic_pass']
     # A resumed candidate can pass both localization checks yet still fail the
     # distinct feedback gate at commit. Neither blind result is rewritten.
     incomplete=packet()

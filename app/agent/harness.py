@@ -18,6 +18,8 @@ RUN_ROOT = ROOT / "runtime" / "annotation"
 TASK_GUIDE = """Write one clear English referring expression for a person looking out from the ego vehicle.
 Help that person pick out exactly one real object using the point-cloud-derived spatial facts
 and the confirmed details in the source photograph. Sound like ordinary spoken English.
+Never write "relative to the ego" or "farther behind/ahead/left/right than".
+Axis order alone does not establish distance from the ego vehicle. Do not translate it into closer/farther.
 Use a short noun phrase or a short sentence. Start with a capital letter; preserve SUV casing.
 Aim for 10-25 words when possible, keeping whatever is truly needed to distinguish the object.
 
@@ -395,6 +397,20 @@ def repair_camera_qualifier(packet: EvidencePacket, generated: GeneratedExpressi
         return generated, None
     mentioned = [(number, match) for number, name in CAMERA_VIEWS.items()
         for match in re.finditer(r'\b' + re.escape(name).replace(r'\-', '[- ]') + r'\b', generated.expression, re.IGNORECASE)]
+    if (packet.task.get('feedback_detail_policy') == 'explicit-feedback-details-v1'
+            and len(mentioned) == 1 and mentioned[0][0] == camera
+            and any(p.predicate_id.startswith('image_visibility:') for p in selected)
+            and not re.search(r'\bvisible\b', generated.expression, re.I)):
+        # Only repair the literal source clause in a new proposal. Do not
+        # reinterpret negation, comparison scopes, or ambiguous camera wording.
+        clause = 'in the ' + CAMERA_VIEWS[camera]
+        if (generated.expression.count(clause) == 1
+                and not re.search(r'\b(?:not|never|invisible|hidden|unseen)\b', generated.expression, re.I)):
+            expression = generated.expression.replace(clause, 'visible ' + clause)
+            if len(expression) <= 400:
+                return generated.model_copy(update={'expression':expression}), {
+                    'kind':'missing_verified_visibility_word', 'before':generated.expression, 'after':expression,
+                    'predicate_ids':[p.predicate_id for p in selected], 'requires_two_blind_checks':True}
     if not mentioned and not re.search(r'\b(?:view|camera|image|frame|photo(?:graph)?)\b',generated.expression,re.IGNORECASE):
         # Complete a missing declared, verified scope in a NEW draft only. Do
         # not reinterpret ambiguous existing image wording or a second camera.
@@ -483,13 +499,34 @@ def expression_policy_errors(expression: str) -> list[str]:
         errors.append("sentence_initial_not_capitalized")
     return errors
 
+def annotation_meta_errors(expression: str) -> list[str]:
+    """Reject annotation bookkeeping as prose; a natural noun phrase suffices."""
+    pattern = (r"\b(?:is|are|was|were)\s+(?:the\s+)?(?:selected\s+|designated\s+)?target(?:\s+object)?\b"
+        r"|\b(?:target|selected)\s+object\b|\b(?:object|target)\s+of\s+interest\b")
+    return ['annotation_meta_wording'] if re.search(pattern, expression, re.I) else []
+
+
 def expression_language_errors(expression: str) -> list[str]:
     """Repair new drafts only; never retroactively change saved export eligibility."""
-    errors = []
+    errors = annotation_meta_errors(expression)
+    if re.search(r'\brelative to (?:the )?ego\b|\bfarther (?:ahead|behind|left|right) than\b', expression, re.I):
+        errors.append('technical_ego_axis_comparison')
+    # Bounded checks for telegraphic compression, not a general grammar parser.
+    camera = r'(?:front(?:[- ](?:left|right))?|(?:left|right)[- ]side)\s+(?:view|camera|image)'
+    if re.search(r'^\s*' + camera + r'\s*:', expression, re.I):
+        errors.append('telegraphic_camera_label')
+    if re.search(r'\b(?:in|from)\s+' + camera + r'\b', expression, re.I) or re.search(
+            r'\b(?:of|behind|ahead of|beside|near)\s+ego vehicle\b', expression, re.I):
+        errors.append('missing_reference_article')
+    colors = r'(?:black|white|red|blue|green|yellow|orange|gray|grey|brown|beige|purple|pink|silver)'
+    if re.search(r'\b(?:with|wearing|carrying)\s+(?:' + colors + r'\s+)?(?:helmet|cap|top|shirt|backpack|bag)\b', expression, re.I):
+        errors.append('telegraphic_appearance_wording')
     if re.search(r'\b(?:outline|silhouette|pixels?|bounding box)\b|\b(?:highest|lowest)[ -]positioned\b|\bvertical space\b|\b(?:extends?|extending|reaches) (?:lower|higher|lowest|highest)\b', expression, re.IGNORECASE):
         errors.append('abstract_spatial_wording')
     if re.search(r'\bwhose (?:visible )?outline (?:reaches|is)\b|\bsame garment colors\b', expression, re.IGNORECASE):
         errors.append('mechanical_referring_expression')
+    if re.search(r'\b(?:upper|lower)[ -]clothing(?:[ -]color)?\b', expression, re.I):
+        errors.append('mechanical_clothing_wording')
     if re.search(
             r'\b(?:bottom|top|lower|upper)[\s-]*most\b'
             r'|\b(?:highest|lowest)\b'
@@ -561,6 +598,38 @@ def repair_redundant_camera_qualifier(packet, generated, observations):
         'removed_predicate_ids':[p.predicate_id for p in chosen if p not in reduced],
         'reason':'camera-free expression uniquely identifies the target in the complete native/image inventory',
         'requires_two_blind_checks':True}
+
+
+SENTENCE_CLAIM_REPAIR_POLICY = 'sentence-claim-repair-v1'
+
+
+def sentence_claim_repair(packet, generated, parsed, feedback, observations):
+    """Propose a smaller declaration from an independent literal read.
+
+    This is NOT a passing verdict. The original failure stays in history and
+    the new proposal must pass appearance and two fresh blind checks.
+    """
+    if packet.task.get('sentence_claim_repair_policy') != SENTENCE_CLAIM_REPAIR_POLICY:
+        return None
+    errors = set(feedback.get('errors', []))
+    if ('visual_claims_disagree_with_text' not in errors or errors - {
+            'visual_claims_disagree_with_text', 'image_expression_not_unique',
+            'parsed_expression_not_symbolically_unique'} or parsed.unsupported_claims):
+        return None
+    declared = {(a.kind,a.value) for a in generated.visual_attributes}
+    stated = {(a.kind,a.value) for a in parsed.parsed_visual_attributes}
+    if not stated or not stated < declared:
+        return None  # No added/conflicting facts, or empty-reader shortcut.
+    # An obviously spoken attribute is a reader omission, not a stale claim.
+    text = re.sub(r'[-_\s]+', ' ', generated.expression.lower())
+    if any(re.search(r'\b'+re.escape(re.sub(r'[-_\s]+',' ',value.lower()))+r'\b',text)
+            for _,value in declared-stated):
+        return None
+    proposal = generated.model_copy(update={'visual_attributes':list(parsed.parsed_visual_attributes)})
+    proof = verify_tool_grounding(packet, proposal, parsed, {}, observations, True)
+    if not proof['diagnostic_pass']:
+        return None  # Recompute the COMPLETE pool with only the spoken claims.
+    return proposal
 
 
 def normalize_visual_predicate_aliases(packet, generated):
@@ -672,6 +741,7 @@ def image_scope_errors(packet, expression, predicates, *, check_order=False):
 
 
 def draft_reference_errors(packet, generated, observations=None):
+    from app.quality.contrast import ego_near_errors
     """New drafts cannot smuggle a retired cue through a fluent paraphrase."""
     if not packet.task.get('natural_description'):
         return []
@@ -679,6 +749,12 @@ def draft_reference_errors(packet, generated, observations=None):
     chosen = set(generated.predicate_ids)
     predicates = [p for p in packet.predicates if p.predicate_id in chosen]
     errors = (['non_scene_reference_cue'] if any(not draft_reference_predicate(packet,p) for p in predicates) else [])
+    if packet.task.get('sentence_style_policy') == 'simple-sufficient-sentence-v1':
+        from app.quality.joint_reference import simple_sentence_errors
+        errors.extend(simple_sentence_errors(generated.expression))
+    errors.extend(ego_near_errors(packet,generated.expression,generated.predicate_ids))
+    from app.quality.contrast import ego_wording_errors
+    errors.extend(ego_wording_errors(packet,generated.predicate_ids))
     if not chosen or chosen - {p.predicate_id for p in packet.predicates}:
         errors.append('invalid_predicate_reference')
     from app.quality.description_search import traffic_scene_policy
@@ -696,7 +772,23 @@ def draft_reference_errors(packet, generated, observations=None):
     if not any(p.kind == 'image_relation' for p in predicates) and re.search(
             r'\b(?:front(?:[- ](?:left|right))?|(?:left|right)[- ]side)\s+(?:view|camera|image)\b',
             generated.expression,re.IGNORECASE):
-        errors.append('camera_qualifier_without_image_relation')
+        # Appearance-only plans may need whole-scene disambiguation before an
+        # image_attribute predicate can be proved. A verified source qualifier
+        # is not a spatial claim and must not block those two blind rounds.
+        from app.agent.scene_grounding import available
+        from app.quality.description_search import CAMERA_VIEWS, confirmed_image_camera
+        from app.datasets.waymo import CAMERAS
+        text = ' '.join(generated.expression.lower().replace('-', ' ').split())
+        cameras = {number for number, name in CAMERA_VIEWS.items()
+            if re.search(r'\b' + re.escape(name.replace('-', ' ')) + r'\b', text)
+            or re.search(r'\b' + re.escape(CAMERAS[number].lower().replace('_', ' '))
+                         + r'\s+(?:camera|image)\b', text)}
+        source = next((v.camera_name for v in packet.views if v.camera_label == packet.source_view), None)
+        if not (packet.task.get('source_camera_scope_policy') == 'appearance-source-scope-v1'
+                and minimal_reference_policy(packet) and generated.visual_attributes
+                and 'rgb' in packet.task.get('training_input_capabilities', [])
+                and cameras == {source} and confirmed_image_camera(packet, source) and available(packet)):
+            errors.append('camera_qualifier_without_image_relation')
     if len(without_redundant_camera_visibility(packet,predicates,generated.visual_attributes,observations or {})) < len(predicates):
         errors.append('redundant_camera_qualifier')
     return errors
@@ -789,6 +881,13 @@ def verify_tool_grounding(packet: EvidencePacket, generated: GeneratedExpression
         errors.append('image_framing_not_traffic_description')
     from app.quality.description_search import confirmed_image_camera
     expressed = set(generated.predicate_ids) | set(parsed.parsed_predicate_ids)
+    from app.quality.contrast import ego_near_errors, ego_near_catalog, EGO_NEAR_ID
+    errors.extend(ego_near_errors(packet,generated.expression,expressed))
+    if EGO_NEAR_ID in expressed:
+        rebuilt = ego_near_catalog(packet)
+        saved = next((p for p in packet.predicates if p.predicate_id == EGO_NEAR_ID),None)
+        if not rebuilt or saved is None or saved.matches != rebuilt[0].matches:
+            errors.append('ego_distance_not_supported')
     from app.quality.description_search import scene_reference_policy, draft_reference_predicate
     if scene_reference_policy(packet) and any(p.predicate_id in expressed
             and not draft_reference_predicate(packet,p) for p in packet.predicates):
@@ -840,7 +939,8 @@ def verify_tool_grounding(packet: EvidencePacket, generated: GeneratedExpression
             if c['category'] in {packet.target.category, 'unknown'} and c['object_id'] not in native_ids]
         image_remaining, _ = filter_visual_candidates(image_ids, parsed.parsed_visual_attributes if target_appearance_verified else [],
             appearance_observations or {})
-        if image_remaining:
+        if image_remaining and (declared_visual == parsed_visual
+                or packet.task.get('sentence_claim_repair_policy') != SENTENCE_CLAIM_REPAIR_POLICY):
             errors.append('image_expression_not_unique')
     if declared_visual and ("rgb" not in packet.task.get("training_input_capabilities", [])
                             or not appearance_views(packet)):
@@ -943,13 +1043,24 @@ def blind_payload(packet: EvidencePacket, expression: str, seed: int = 17) -> tu
 def verify(packet: EvidencePacket, generated: GeneratedExpression, grounded: GroundResult,
            mapping: dict[str, str]) -> dict:
     errors = expression_policy_errors(generated.expression)
+    if packet.task.get('sentence_style_policy') == 'simple-sufficient-sentence-v1':
+        from app.quality.joint_reference import simple_sentence_errors
+        errors.extend(simple_sentence_errors(generated.expression))
     by_id = {p.predicate_id: p for p in packet.predicates}
     declared = set(generated.predicate_ids)
     parsed = set(grounded.parsed_predicate_ids)
+    from app.quality.relations import local_landmark_predicate
+    if any(not local_landmark_predicate(packet,by_id[i]) for i in declared | parsed if i in by_id):
+        errors.append('landmark_not_suitable')
     from app.quality.contrast import unsupported_ego_directions
     if unsupported_ego_directions(packet.target, declared | parsed):
         errors.append('ego_direction_not_spatially_supported')
-    if any(by_id[p].kind in {"range", "nearest", "farthest", "nearest_to_anchor"} for p in declared | parsed if p in by_id):
+    from app.quality.contrast import EGO_NEAR_ID, EGO_PROXIMITY_POLICY, ego_near_errors
+    errors.extend(ego_near_errors(packet,generated.expression,declared | parsed))
+    from app.quality.contrast import ego_wording_errors
+    errors.extend(ego_wording_errors(packet,declared))
+    errors.extend(ego_wording_errors(packet,parsed))
+    if any(by_id[p].kind in {"range", "nearest", "farthest", "nearest_to_anchor"} and not (p == EGO_NEAR_ID and packet.task.get('ego_proximity_policy') == EGO_PROXIMITY_POLICY) for p in declared | parsed if p in by_id):
         errors.append("prohibited_distance_predicate")
     if not declared or not declared <= by_id.keys() or not parsed <= by_id.keys():
         errors.append("invalid_predicate_reference")
@@ -1031,12 +1142,19 @@ def appearance_messages(packet: EvidencePacket) -> list[dict]:
     from app.agent.observation_wire import RGBVisualObservation, VehicleVisualObservation
     from app.agent.appearance import OBSERVATION_SCOPE_GUIDE
     schema = VehicleVisualObservation if packet.target.category == 'vehicle' else RGBVisualObservation
+    from app.quality.joint_reference import feedback_target_features
     content = [{"type": "text", "text": json.dumps({"output_schema": schema.model_json_schema(),
         'expected_category': packet.target.category,
         'identity_instruction': 'Observe the target of this category inside the final tight crop. '
             'The full scene and wider crop are context only. If the tight crop shows an occluder or a different '
             'category, report target_visible=false; never describe that other object as the target. '
             'For a padded image, only its indicated original RGB region belongs to the evidence.'})}]
+    if feedback_target_features(packet.task):
+        payload = json.loads(content[0]['text'])
+        payload['attribute_focus'] = ['feature']
+        payload['attribute_focus_instruction'] = ('Inspect the target hands, held items and carried accessories separately. '
+            'Report confirmed device types in attributes and omit uncertain types. No expected value is supplied.')
+        content[0]['text'] = json.dumps(payload)
     for view in appearance_views(packet):
         strict = checks_rgb_visibility(packet)
         kinds = ['scene', 'appearance_context', 'appearance'] if strict else ['appearance']
@@ -1061,7 +1179,7 @@ def appearance_messages(packet: EvidencePacket) -> list[dict]:
              "For a vehicle, report vehicle_colors with separate dominant body paint and roof paint; use null for an uncertain part. "
              "When body paint is clear, also include that SAME body color in attributes as kind=color; "
              "both fields are required to confirm it. Never put only the roof color in attributes. "
-             "Generic color attributes describe body paint only, never roof paint, windows, lights or reflections. "
+             "For vehicles, generic color attributes describe body paint only, never roof paint, windows, lights or reflections. "
              "If roof paint differs from body paint, keep the roof value only under vehicle_colors.roof. "
              "Do not force a dominant body color when none is clear. Clothing colors are not vehicle paint. Omit ambiguous colors/subtypes "
              "and attributes that disagree across views. For visibility, clear means the actual object is recognizable, unoccluded and not cut off; partial means partly hidden or cut off, occluded means fully hidden, uncertain means unclear. Give a short visibility_reason from original RGB surfaces and occluders. Never infer a visible surface from a rectangle or LiDAR dot pattern. Return JSON; do not reason about position or motion."},
@@ -1227,6 +1345,8 @@ def generation_messages(packet: EvidencePacket, previous: dict | None, observati
         'Human feedback reports a problem; it is not verified visual evidence. '
         'Use only confirmed observations and geometry, and never invent attributes to satisfy feedback.'
         if packet.task.get('manual_review_feedback') else '')
+    guide += (' A concise grammatical noun phrase is sufficient. Describe the object directly; '
+        'never append "is the target", "is the selected object" or other annotation bookkeeping.')
     if (checks_rgb_visibility(packet)
             and packet.provenance.get('admission_plan', {}).get('passed')
             and usable_rgb_observation(observed, allow_partial=allows_partial(packet))):

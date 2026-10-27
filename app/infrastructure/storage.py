@@ -88,6 +88,7 @@ class RunStore:
               CREATE TABLE IF NOT EXISTS events (
                 run_id TEXT NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL,
                 payload TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY(run_id, seq));
+              CREATE INDEX IF NOT EXISTS events_run_kind_seq ON events(run_id,kind,seq);
               CREATE TABLE IF NOT EXISTS controls (
                 run_id TEXT PRIMARY KEY, command TEXT NOT NULL, at REAL NOT NULL);
               CREATE TABLE IF NOT EXISTS executor (

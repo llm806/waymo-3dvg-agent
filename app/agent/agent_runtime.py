@@ -20,7 +20,7 @@ from app.infrastructure.artifacts import atomic_json_text
 from app.agent.appearance import resolve_target_observation, target_visibility_error, effective_observations, required_body_color
 from app.quality.visibility_policy import SUPPORTED_POLICIES, allows_partial, source_camera_inventory
 
-VERSION = "adaptive-evidence-harness-v88-attribute-dispute-repair"
+VERSION = "adaptive-evidence-harness-v96-explicit-region-cards"
 FORMAT_RETRY_LIMIT = 2
 CONNECTION_RETRY_DELAYS = (1.0, 2.0)
 TERMINAL = {"calibration_hold", "auto_pass", "abstained", "blocked", "needs_evidence"}
@@ -407,6 +407,12 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
                 attempt['verification'] = {**attempt.get('verification', {}), 'diagnostic_pass': False,
                     'errors': list(dict.fromkeys([*attempt.get('verification', {}).get('errors', []),
                         *state['feedback_check']['blocking_errors']]))}
+        if diagnostic_pass and task.get('sentence_style_policy') == 'simple-sufficient-sentence-v1':
+            from app.quality.joint_reference import simple_sentence_errors
+            style_errors = simple_sentence_errors(state['attempts'][-1]['generated']['expression'])
+            if style_errors:
+                diagnostic_pass, reason = False, style_errors[0]
+                state['attempts'][-1]['verification'] = {'diagnostic_pass':False,'errors':style_errors}
         if diagnostic_pass and not check_sample_identity('before_success_commit'):
             diagnostic_pass, reason = False, 'sample_identity_binding_failed'
         if state["attempts"] and "counterfactual_plan" in state["attempts"][-1] and "counterfactual" not in state["attempts"][-1]:
@@ -489,7 +495,7 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
         if current.task.get('manual_review_feedback'):
             updated = updated.model_copy(deep=True)
             updated.task['manual_review_feedback'] = current.task['manual_review_feedback']
-        for policy in ('attribute_repair_policy','scene_geometry_authority_policy','feedback_acquisition_policy','landmark_salience_policy','manual_feedback_policy','scene_relation_reading_policy','scene_binding_policy','scene_input_policy','feedback_revision_policy','feedback_acceptance_policy'):
+        for policy in ('feedback_feature_policy','ego_wording_policy','target_naming_policy','landmark_locality_policy','sentence_style_policy','spatial_language_policy','sentence_claim_repair_policy','feedback_relation_policy','scene_region_card_policy','ego_proximity_policy','feedback_detail_policy','source_camera_scope_policy','attribute_repair_policy','scene_geometry_authority_policy','feedback_acquisition_policy','landmark_salience_policy','manual_feedback_policy','scene_relation_reading_policy','scene_binding_policy','scene_input_policy','feedback_revision_policy','feedback_acceptance_policy'):
             updated.task.pop(policy,None)
             if policy in current.task:
                 updated.task[policy]=current.task[policy]
@@ -500,7 +506,7 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
         for key in ('target_precheck_observation', 'resolved_target_observation', 'candidate_appearance',
                     'admission', 'precheck_batch_index', 'precheck_batch_limit', 'relook_completed',
                     'relook_manifest', 'relook_kind', 'source_identity_rechecked', 'distinguishing_cue_bound',
-                    'source_attributes_rechecked', 'source_attribute_recheck_manifest', 'precheck_identity_focus'):
+                    'feedback_target_rechecked', 'source_attributes_rechecked', 'source_attribute_recheck_manifest', 'precheck_identity_focus'):
             state.pop(key, None)
         state.pop('reused_scene_observation_ids',None)
         state.pop('precheck_reused_batch_ids',None)
@@ -737,6 +743,17 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
                 save('blocking_objects_reobserved', {'objects': list(records), 'reason': 'resolve missing or conflicting visual evidence before giving up'})
             elif phase == 'precheck_decision':
                 from app.quality.admission import admission_plan, observation_plan_sufficient
+                from app.quality.joint_reference import feedback_target_features
+                if (feedback_target_features(current.task) and not state.get('feedback_target_rechecked')
+                        and max_model_calls-state['model_calls_used'] >= 4):
+                    from app.agent.appearance import source_identity_candidate
+                    selected = source_identity_candidate(current)
+                    if selected is not None:
+                        state.update(phase='recheck_source_attributes', feedback_target_rechecked=True,
+                            source_attribute_recheck_manifest=[{**selected,'attribute_recheck':['feature']}], inflight=None)
+                        save('feedback_target_recheck_planned', {'attribute_kinds':['feature'],
+                            'source_view':current.source_view, 'scope':'fresh target pixels; no requested value or prior answer sent'})
+                        continue
                 observed = VisualObservation.model_validate(state['target_precheck_observation'])
                 current, result = expand_relations(current, state.get('candidate_appearance'), target_observation=observed)
                 # Keep the exact predicate/landmark catalog behind a failed
@@ -1082,9 +1099,13 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
                 from app.quality.description_search import descriptive_attributes
                 recognition = descriptive_attributes(current, appearance_observations)
                 recognition = [a for a in recognition if a.kind not in (contract or {}).get('omitted_disputed_attribute_kinds', [])]
-                from app.quality.joint_reference import feedback_requirements
-                if contract and contract.get('unique_plan_found') and feedback_requirements(current.task)['concise']:
-                    # The shorter selected bundle has its own full candidate proof.
+                from app.quality.joint_reference import feedback_requirements, NATURAL_CONCISION_POLICY
+                if (contract and (feedback_requirements(current.task)['concise']
+                        or current.task.get('sentence_style_policy') == 'simple-sufficient-sentence-v1')
+                        and (contract.get('unique_plan_found') or contract.get('requires_full_scene')
+                            and current.task.get('feedback_acceptance_policy') == NATURAL_CONCISION_POLICY)):
+                    # A smaller bundle is either tool-proved or a proposal for
+                    # BOTH blind whole-scene checks. No competitor is removed.
                     recognition = [a for a in recognition if a.model_dump() in contract['visual_attributes']]
                 if not set((a.kind,a.value) for a in recognition) <= set((a.kind,a.value) for a in generated.visual_attributes):
                     policy_errors.append('confirmed_recognition_details_missing')
@@ -1162,6 +1183,10 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
                     body_color = required_body_color(current, {current.target_object_id: observed.model_dump()})
                     if 'color' in attempt.get('writing_contract',{}).get('omitted_disputed_attribute_kinds', []):
                         body_color = None  # Omit an explicitly disputed optional claim; recheck the entire new sentence.
+                    if (current.task.get('sentence_style_policy') == 'simple-sufficient-sentence-v1'
+                            and attempt.get('writing_contract',{}).get('unique_plan_found')
+                            and not any(a['kind']=='color' for a in attempt['writing_contract']['visual_attributes'])):
+                        body_color = None  # The complete smaller plan already proves uniqueness.
                     missing_color = body_color is not None and ('color', body_color) not in claimed
                     passed = (target_visibility_error(current, observed, state.get('candidate_appearance')) is None
                         and claimed <= confirmed and not missing_color)
@@ -1214,6 +1239,13 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
                 from app.quality.description_search import minimal_reference_policy
                 from app.agent.harness import MINIMAL_CLAIM_PARSE_GUIDE
                 parse_guide = MINIMAL_CLAIM_PARSE_GUIDE if minimal_reference_policy(current) else CLAIM_PARSE_GUIDE
+                if current.task.get('sentence_claim_repair_policy') == 'sentence-claim-repair-v1':
+                    parse_guide += ('\nVisual attributes have their own schema; they do not need a matching spatial predicate. '
+                        'For example, with a roof rack means feature:roof rack even when an image_attribute ID only names color and subtype. '
+                        'Only include roof rack when the sentence says it. A source camera is not a landmark relation. '
+                        'Do not mark a schema-supported visual attribute unsupported merely because it is absent from a compound predicate.')
+                if current.task.get('ego_proximity_policy') == 'native-ego-proximity-v1':
+                    parse_guide += '\nOnly when the sentence explicitly says close/very close/near the ego vehicle, parse range:ego_near. This is native 3D proximity, not a nearest rank, motion or camera-size claim. Do not infer it from left/right or appearance.'
                 grounded = invoke(phase, [{"role": "system", "content": parse_guide},
                                          {"role": "user", "content": json.dumps({**payload, "output_schema": GroundResult.model_json_schema()})}], GroundResult)
                 feedback = verify_tool_grounding(current, generated, grounded, mapping,
@@ -1241,6 +1273,22 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
                         save("counterfactual_plan_created", plan.model_dump())
                 else:
                     state["phase"] = "decide"
+                    if (phase == 'ground' and not state.get('sentence_claim_repair_used')
+                            and len(state['attempts']) <= max_repairs
+                            and max_model_calls-state['model_calls_used'] >= 2
+                            and state['attempts'][-1].get('appearance_check',{}).get('passed')):
+                        from app.agent.harness import sentence_claim_repair
+                        proposal = sentence_claim_repair(current, generated, grounded, feedback, appearance_observations)
+                        if proposal is not None:
+                            source_index = len(state['attempts'])-1
+                            state['sentence_claim_repair_used'] = True
+                            state['attempts'].append({'attempt':len(state['attempts']),
+                                'generated':proposal.model_dump(), 'ground_checks':[],
+                                'claim_repair':{'source_attempt':source_index,
+                                    'policy':'sentence-claim-repair-v1',
+                                    'source_parse':grounded.model_dump(),
+                                    'requires_two_fresh_blind_checks':True}})
+                            state['phase']='appearance'
                 save("validation_completed", feedback)
             elif phase in {'scene_ground','scene_ground_permuted'}:
                 from app.agent.scene_grounding import messages, verify as verify_scene, SceneGroundResult, binding_retry_allowed

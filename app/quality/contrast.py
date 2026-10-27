@@ -12,6 +12,94 @@ POLICY = {"axis_guard_m": 1.0, "rank_range_gap_m": 2.0,
           "max_views": 3, "min_crop_area_px": 256,
           "calibration_status": "prototype defaults; not calibrated on independent gold"}
 
+EGO_PROXIMITY_POLICY = 'native-ego-proximity-v1'
+EGO_NEAR_ID = 'range:ego_near'
+EGO_WORDING_POLICY = 'complete-ego-direction-v1'
+
+
+def expand_coordinated_ego_clause(text):
+    """Parse shared complements without changing the saved sentence or facts."""
+    import re
+    def expand(match):
+        first = 'behind' if match[1].lower() == 'behind' else 'ahead of'
+        return first + ' the ego vehicle and to the ' + match[2].lower() + ' of the ego vehicle'
+    return re.sub(r'\b(ahead(?: of)?|in front of|behind)\s+and\s+(?:to the\s+)?(left|right)\s+of\s+(?:the\s+)?ego vehicle\b',
+        expand, text, flags=re.I)
+
+
+def complete_ego_direction_ids(packet, ids):
+    """Keep a conspicuous cross-axis offset in new wording, not in old truth tables.
+
+    A 22.5 degree center bearing is the conservative wording boundary between
+    cardinal and diagonal language. Every added component still needs the full
+    rotated-footprint proof. This never filters competitors or infers from RGB.
+    """
+    ids = list(dict.fromkeys(ids))
+    if packet.task.get('ego_wording_policy') != EGO_WORDING_POLICY:
+        return ids
+    axes = {'longitudinal:front':0, 'longitudinal:behind':0, 'lateral:left':1, 'lateral:right':1}
+    x, y, _ = packet.target.center_m
+    for pid in list(ids):
+        if pid not in axes:
+            continue
+        axis = axes[pid]
+        along, across = (x,y) if axis == 0 else (y,x)
+        if abs(across) > abs(along) * math.tan(math.pi/8):
+            companion = ('lateral:left' if y > 0 else 'lateral:right') if axis == 0 else (
+                'longitudinal:front' if x > 0 else 'longitudinal:behind')
+            if companion not in ids:
+                ids.append(companion)
+    return ids
+
+
+def ego_wording_errors(packet, ids):
+    if packet.task.get('ego_wording_policy') != EGO_WORDING_POLICY:
+        return []
+    complete = complete_ego_direction_ids(packet, ids)
+    errors = ['incomplete_ego_direction'] if set(complete) - set(ids) else []
+    if any(i.startswith(('longitudinal:', 'lateral:')) for i in ids) and (
+            not packet.target.lidar_points or unsupported_ego_directions(packet.target, complete)):
+        errors.append('ego_direction_not_supported')
+    return errors
+
+
+def ego_near_match(obj):
+    """Fixed conservative 3D center radius about the native vehicle origin.
+
+    <=5m supports close; 5..7m is deliberately unknown; >7m excludes close.
+    These development thresholds apply to every native candidate, not a target.
+    No camera size, ego body dimensions, or bumper clearance is inferred.
+    """
+    if not obj.geometry_valid or not obj.lidar_points or min(obj.size_m) <= 0:
+        return None
+    distance = math.dist(obj.center_m, (0,0,0))
+    return True if distance <= 5 else False if distance > 7 else None
+
+
+def ego_near_catalog(packet):
+    if packet.task.get('ego_proximity_policy') != EGO_PROXIMITY_POLICY:
+        return []
+    return [Predicate(predicate_id=EGO_NEAR_ID,kind='range',value='ego_near',
+        phrase='close to the ego vehicle', source=EGO_PROXIMITY_POLICY + ': native 3D center radius <=5m; 5..7m unknown; >7m false',
+        matches={o.object_id:ego_near_match(o) for o in packet.candidates})]
+
+
+def states_ego_near(text):
+    import re
+    return bool(re.search(r'\b(?:very\s+)?(?:close to|near)\s+(?:the\s+)?ego vehicle\b',text,re.I)
+        and not re.search(r'\b(?:not|never|no longer)\s+(?:very\s+)?(?:close to|near)\b',text,re.I))
+
+
+def ego_near_errors(packet, expression, ids):
+    stated, selected = states_ego_near(expression), EGO_NEAR_ID in ids
+    errors = []
+    if stated != selected:
+        errors.append('ego_distance_claim_mismatch')
+    if (stated or selected) and (packet.task.get('ego_proximity_policy') != EGO_PROXIMITY_POLICY
+            or ego_near_match(packet.target) is not True):
+        errors.append('ego_distance_not_supported')
+    return errors
+
 
 def ego_direction_match(obj: ObjectFact, axis: int, positive: bool) -> bool | None:
     """A marginally offset center cannot put a straddling object on one side.

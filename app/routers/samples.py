@@ -159,6 +159,7 @@ def presentation_row(job_id, item, state, changes):
     packet = state.get('current_packet', {})
     return {'ordinal': item['ordinal'], 'category': item['target']['category'],
         'source_view': packet.get('source_view') or item['target'].get('source_view'),
+        '_run_version': state.get('version'),
         'legacy_rules': (packet.get('task', {}).get('admission_policy') != 'visible-distinct-v1'
             or state.get('version') not in {None, VERSION}),
         'expression': item['expression'], 'run_id': item['run_id'], 'packet_id': item['packet_id'],
@@ -172,7 +173,10 @@ def samples(job_id: Id, request: Request):
     try:
         from app.agent.agent_runtime import VERSION
         store = request.app.state.batches.store
-        cache_format = f'{SAMPLE_PRESENTATION_VERSION}:{VERSION}'
+        # Executor changes affect the legacy badge, not the identity binding.
+        # Only a presentation-contract change requires rebuilding every row.
+        cache_format = SAMPLE_PRESENTATION_VERSION
+        legacy_format = cache_format + ':%'
         result, pending = [], []
         # One consistent read. A hit never selects the snapshot column; misses
         # stream individually so cold reads do not retain hundreds of MB.
@@ -187,9 +191,18 @@ def samples(job_id: Id, request: Request):
             if json.loads(header['spec']).get('desired_count') is not None:
                 items.sort(key=lambda i: json.loads(i['target'])['queue_position'])
             changes = {}
-            for r in db.execute('''SELECT e.run_id,e.payload FROM events e WHERE e.kind='source_view_reselected'
-                AND e.run_id IN (SELECT run_id FROM batch_items WHERE job_id=?) ORDER BY e.seq''', (job_id,)):
-                changes.setdefault(r['run_id'], []).append({'kind': 'source_view_reselected', 'payload': json.loads(r['payload'])})
+            # Warm presentations already include their source-binding check.
+            # Read event payloads only for invalidated rows, never every run.
+            def compatible(item):
+                return item['format'] == cache_format or (item['format'] or '').startswith(cache_format + ':')
+            needs_build = any(i['run_id'] and (not compatible(i) or i['presentation'] is None) for i in items)
+            if needs_build:
+                for r in db.execute('''SELECT e.run_id,e.payload FROM batch_items i
+                    JOIN sample_presentations c ON c.job_id=i.job_id AND c.ordinal=i.ordinal
+                    JOIN events e ON e.run_id=i.run_id AND e.kind='source_view_reselected'
+                    WHERE i.job_id=? AND (c.format IS NULL OR (c.format<>? AND c.format NOT LIKE ?) OR c.presentation IS NULL)
+                    ORDER BY e.seq''', (job_id, cache_format, legacy_format)):
+                    changes.setdefault(r['run_id'], []).append({'kind': 'source_view_reselected', 'payload': json.loads(r['payload'])})
             preparations = {}
             for r in db.execute("SELECT payload FROM batch_events WHERE job_id=? AND kind='preparation_source_reselected' ORDER BY seq",(job_id,)):
                 receipt = json.loads(r['payload'])
@@ -203,8 +216,8 @@ def samples(job_id: Id, request: Request):
             misses = db.execute('''SELECT i.ordinal,r.snapshot FROM batch_items i
                 JOIN sample_presentations c ON c.job_id=i.job_id AND c.ordinal=i.ordinal
                 LEFT JOIN runs r ON r.run_id=i.run_id WHERE i.job_id=? AND i.run_id IS NOT NULL
-                AND (c.format IS NULL OR c.format<>? OR c.presentation IS NULL) ORDER BY i.ordinal''', (job_id, cache_format)) if any(
-                    i['run_id'] and (i['format'] != cache_format or i['presentation'] is None) for i in items) else ()
+                AND (c.format IS NULL OR (c.format<>? AND c.format NOT LIKE ?) OR c.presentation IS NULL)
+                ORDER BY i.ordinal''', (job_id, cache_format, legacy_format)) if needs_build else ()
             for raw in misses:
                 if raw['snapshot'] is None:
                     raise ValueError('Run not found')
@@ -233,6 +246,12 @@ def samples(job_id: Id, request: Request):
                                 except (ValueError,KeyError):
                                     pass
                 if row is not None:
+                    row = dict(row)
+                    if '_run_version' in row:
+                        run_version = row.pop('_run_version')
+                        row['legacy_rules'] = row['legacy_rules'] or run_version not in {None, VERSION}
+                    elif not row.get('legacy_rules') and (item['format'] or '').startswith(cache_format + ':'):
+                        row['legacy_rules'] = item['format'] != f'{cache_format}:{VERSION}'
                     result.append({**row, 'reviewed': (row['ordinal'], row['revision']) in confirmations})
         if pending:
             # Never upgrade a read transaction or overwrite a newer generation.

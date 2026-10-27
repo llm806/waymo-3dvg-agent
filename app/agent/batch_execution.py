@@ -373,15 +373,27 @@ class BatchExecution:
                 packet = packet.model_copy(deep=True)
                 packet.task['scene_grounding_policy']=POLICY
                 packet.task['scene_claim_policy']=CLAIM_POLICY
+                packet.task['source_camera_scope_policy']='appearance-source-scope-v1'
                 packet.task['attribute_repair_policy']='disputed-attribute-omission-v1'
                 packet.task['scene_geometry_authority_policy']='native-table-authority-v1'
                 packet.task['scene_relation_reading_policy']='explicit-subject-landmark-v2-bidirectional'
                 packet.task['scene_binding_policy']='anonymous-region-binding-v1'
+                packet.task['scene_region_card_policy']='explicit-anonymous-region-cards-v1'
                 packet.task['scene_input_policy']='sentence-scoped-scene-input-v1'
                 packet.task['feedback_revision_policy']='feedback-evidence-revision-v1'
                 packet.task['feedback_acquisition_policy']='feedback-landmark-recheck-v1'
                 packet.task['landmark_salience_policy']='aligned-landmark-preference-v1'
-                packet.task['feedback_acceptance_policy']='feedback-acceptance-v4-relation-corrections'
+                packet.task['feedback_acceptance_policy']='feedback-acceptance-v5-natural-concision'
+                packet.task['feedback_relation_policy']='bilingual-landmark-feedback-v2-omissions'
+                packet.task['feedback_feature_policy']='verified-target-feature-feedback-v1'
+                packet.task['sentence_claim_repair_policy']='sentence-claim-repair-v1'
+                packet.task['sentence_style_policy']='simple-sufficient-sentence-v1'
+                packet.task['target_naming_policy']='explicit-target-category-v1'
+                packet.task['ego_wording_policy']='complete-ego-direction-v1'
+                packet.task['landmark_locality_policy']='local-landmark-selection-v1'
+                packet.task['feedback_detail_policy']='explicit-feedback-details-v1'
+                packet.task['ego_proximity_policy']='native-ego-proximity-v1'
+                packet.task['spatial_language_policy']='plain-spatial-language-v1'
                 packet.task['manual_feedback_policy']='verified-feedback-planning-v1'
                 from app.quality.description_search import TRAFFIC_SCENE_POLICY
                 packet.task['reference_preference_policy']=TRAFFIC_SCENE_POLICY

@@ -38,7 +38,20 @@ def scene_reference_policy(packet):
 
 def draft_reference_predicate(packet, predicate):
     """New writing vocabulary; historical predicates/proofs remain readable."""
-    from app.quality.spatial_relations import native_only, NATIVE_RELATIONS
+    from app.quality.relations import local_landmark_predicate
+    if not local_landmark_predicate(packet,predicate):
+        return False
+    if packet.task.get('sentence_style_policy') == 'simple-sufficient-sentence-v1':
+        if predicate.predicate_id.startswith('image_joint_spatial:'):
+            return False  # No axis comparisons, elevation comparisons or chained frames.
+    from app.quality.contrast import EGO_NEAR_ID, EGO_PROXIMITY_POLICY
+    if predicate.predicate_id == EGO_NEAR_ID:
+        return packet.task.get('ego_proximity_policy') == EGO_PROXIMITY_POLICY
+    from app.quality.spatial_relations import native_only, NATIVE_RELATIONS, PLAIN_SPATIAL_POLICY
+    if (packet.task.get('spatial_language_policy') == PLAIN_SPATIAL_POLICY
+            and predicate.predicate_id.startswith('image_joint_spatial:')
+            and predicate.predicate_id.split(':')[2] in {'native_left','native_right','native_ahead','native_behind'}):
+        return False
     if native_only(packet):
         if predicate.predicate_id.startswith(('image_order:','image_boundary:','image_anchor:','image_vehicle_heading:')):
             return False
@@ -124,11 +137,19 @@ def appearance_phrase(category, attributes, *, plural=False):
         clothing.append('a ' + values['helmet_color'] + ' helmet')
     if clothing:
         phrase += ' wearing ' + (', '.join(clothing[:-1]) + ', and ' + clothing[-1] if len(clothing)>2 else ' and '.join(clothing))
-    features = [a.value for a in attributes if a.kind == 'feature' and a.value != 'handheld bag']
+    features = [a.value for a in attributes if a.kind == 'feature' and a.value not in {'handheld bag', 'handheld camera', 'binoculars', 'visible rear face', 'pole mounted'}]
     if features:
         phrase += ' with ' + ' and '.join(f if f.endswith('stripes') or f.startswith('illuminated ') else ('an ' if f == 'umbrella' else 'a ') + f for f in features)
-    if any(a.kind == 'feature' and a.value == 'handheld bag' for a in attributes):
-        phrase += (' and' if clothing else '') + ' holding a bag'
+    held = [noun for value,noun in [('handheld camera','a camera'),('handheld bag','a bag')]
+        if any(a.kind=='feature' and a.value==value for a in attributes)]
+    if held:
+        phrase += (' and' if clothing else '') + ' holding ' + ' and '.join(held)
+    if any(a.kind=='feature' and a.value=='binoculars' for a in attributes):
+        phrase += ' using binoculars'
+    if any(a.kind == 'feature' and a.value == 'pole mounted' for a in attributes):
+        phrase += ' mounted on a pole'
+    if any(a.kind == 'feature' and a.value == 'visible rear face' for a in attributes):
+        phrase += ' with its rear surface visible'
     return phrase
 
 
@@ -186,8 +207,10 @@ def descriptive_attributes(packet, observations):
         {'subtype':0, 'feature':1, 'color':2, 'shape':3} if packet.target.category=='sign' and road_scene else
         {'color':0, 'shape':1, 'subtype':2, 'feature':3} if packet.target.category=='sign' else
         {'helmet_color':0, 'upper_clothing_color':1, 'feature':2, 'lower_clothing_color':3, 'subtype':4})
+    from app.quality.joint_reference import feedback_target_features
+    requested = {(a['kind'],a['value']) for a in feedback_target_features(packet.task)}
     attrs = sorted(confirmed_attributes(packet.target.category, record),
-        key=lambda a:(priorities.get(a.kind,9),a.kind,a.value))
+        key=lambda a:((a.kind,a.value) not in requested,priorities.get(a.kind,9),a.kind,a.value))
     # One value per kind, plus at most one feature: a rack/bag/vest can help,
     # but listing every accessory makes a referring expression harder to read.
     if road_scene:

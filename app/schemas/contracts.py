@@ -107,7 +107,7 @@ VISUAL_ATTRIBUTE_VALUES = {
     "helmet_color": VISUAL_COLORS,
     "subtype": ("sedan", "suv", "van", "pickup truck", "truck", "bus", "bus section", "excavator", "excavator boom", "excavator body", "motorcycle", "bicycle", "a-frame sign", "construction barricade"),
     "shape": ("round", "rectangular", "triangular", "diamond shaped", "octagonal"),
-    "feature": ("roof rack", "roof cargo box", "trailer", "stripes", "orange and white stripes", "red and white stripes", "black and yellow stripes", "warning light", "illuminated headlights", "illuminated taillights", "backpack", "handheld bag", "umbrella", "high visibility vest"),
+    "feature": ("handheld camera", "binoculars", "visible rear face", "pole mounted", "roof rack", "roof cargo box", "trailer", "stripes", "orange and white stripes", "red and white stripes", "black and yellow stripes", "warning light", "illuminated headlights", "illuminated taillights", "backpack", "handheld bag", "umbrella", "high visibility vest"),
 }
 
 
@@ -127,7 +127,7 @@ class VisualAttribute(Contract):
     value: Literal["white", "black", "gray", "silver", "red", "blue", "green", "yellow", "orange", "brown", "beige", "purple", "pink",
                    "sedan", "suv", "van", "pickup truck", "truck", "bus", "bus section", "excavator", "excavator boom", "excavator body", "motorcycle", "bicycle", "a-frame sign", "construction barricade",
                    "round", "rectangular", "triangular", "diamond shaped", "octagonal",
-                   "roof rack", "roof cargo box", "trailer", "stripes", "orange and white stripes", "red and white stripes", "black and yellow stripes", "warning light", "illuminated headlights", "illuminated taillights", "backpack", "handheld bag", "umbrella", "high visibility vest"]
+                   "handheld camera", "binoculars", "visible rear face", "pole mounted", "roof rack", "roof cargo box", "trailer", "stripes", "orange and white stripes", "red and white stripes", "black and yellow stripes", "warning light", "illuminated headlights", "illuminated taillights", "backpack", "handheld bag", "umbrella", "high visibility vest"]
 
     @model_validator(mode="after")
     def supported_value(self):
@@ -165,7 +165,7 @@ class VisualObservation(Contract):
 
 class CandidateVisualObservation(VisualObservation):
     candidate_id: str
-    absent_features: list[Literal["roof rack", "roof cargo box", "trailer", "stripes", "orange and white stripes", "red and white stripes", "black and yellow stripes", "warning light", "backpack", "handheld bag", "umbrella", "high visibility vest"]] = Field(default_factory=list, max_length=6)
+    absent_features: list[Literal["handheld camera", "binoculars", "visible rear face", "pole mounted", "roof rack", "roof cargo box", "trailer", "stripes", "orange and white stripes", "red and white stripes", "black and yellow stripes", "warning light", "backpack", "handheld bag", "umbrella", "high visibility vest"]] = Field(default_factory=list, max_length=6)
 
 
 class SceneVisualObservation(Contract):
