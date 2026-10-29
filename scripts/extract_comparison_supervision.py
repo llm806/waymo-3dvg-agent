@@ -38,7 +38,7 @@ def attrs_in(text):
     found = set()
     text = text.lower()
     for kind, values in VISUAL_ATTRIBUTE_VALUES.items():
-        if kind in {'color', 'upper_clothing_color', 'lower_clothing_color', 'helmet_color'}:
+        if kind in {'color', 'upper_clothing_color', 'lower_clothing_color', 'helmet_color', 'backpack_color'}:
             continue
         for value in values:
             words = {'handheld bag': r'(?:holding|carrying) (?:a )?bag'}.get(value, re.escape(value))
@@ -59,7 +59,9 @@ def attrs_in(text):
         helmet = re.search(r'\b' + color + r' helmet\b', text)
         if helmet:
             found.add(('helmet_color', color))
-        if not upper and not lower and not helmet and re.search(r'\b' + color + r'\b', text):
+        backpack=re.search(r'\b'+color+r' backpack\b',text)
+        if backpack:found.add(('backpack_color',color))
+        if not upper and not lower and not helmet and not backpack and re.search(r'\b' + color + r'\b', text):
             found.add(('color', color))
     return found
 

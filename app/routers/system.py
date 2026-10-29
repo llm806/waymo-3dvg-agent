@@ -22,7 +22,7 @@ def status(request: Request):
     catalog=None
     try:
         catalog=load_catalog(compact=True)
-        checks.append({'name':'目标目录','ready':True,'detail':f"{catalog['summary']['selected']} 条可用轨迹"})
+        checks.append({'name':'标注物体','ready':True,'detail':f"{catalog['summary']['selected']} 个可标注物体"})
     except (FileNotFoundError,ValueError,KeyError):
         checks.append({'name':'目标目录','ready':False,'detail':'先运行 python -m scripts.build_catalog，扫描不调用模型。'})
     model=os.getenv('DASHSCOPE_MODEL','qwen3.8-flash')

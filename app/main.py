@@ -43,6 +43,8 @@ async def lifespan(app: FastAPI):
     app.state.batches.loaded_method_sha256 = LOADED_METHOD_SHA256
     app.state.batches.recover_deletions()
     app.state.research = ResearchStore(app.state.console.store)
+    from app.quality.paper_study import PaperStudyStore
+    app.state.paper_studies = PaperStudyStore(app.state.console.store,Path(__file__).resolve().parents[1])
     app.state.exports = ExportJobs(app.state.batches, Path(__file__).resolve().parents[1])
     app.state.deletions = DeletionOperations(app.state.batches)
     diagnostic_event(LOG_ROOT, "service_started", pid=os.getpid())

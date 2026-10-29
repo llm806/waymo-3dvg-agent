@@ -1,6 +1,7 @@
 export const pages = [
   { id: 'annotate', title: '自动标注' },
-  { id: 'results', title: '结果与质量' },
+  { id: 'results', title: '结果审核' },
+  { id: 'research', title: '科研评估' },
 ] as const
 export type WorkspaceView = typeof pages[number]['id']
 export function currentView(): WorkspaceView {

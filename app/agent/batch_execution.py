@@ -350,6 +350,11 @@ class BatchExecution:
             job_id=self.job, ordinal=ordinal, scope='target')
         performance.phase('dispatch_checks')
         try:
+            from app.quality.paper_study import reserved_for_other
+            if reserved_for_other(self.worker.store,self.job,item['target'],claim=True):
+                self.store.update(self.job,'research_target_reserved',{'ordinal':ordinal},ordinal=ordinal,
+                    item_status='not_needed',reason='reserved_for_paired_research')
+                return None
             # Read at dispatch, including for queues created before a deletion.
             # Existing linked runs still settle in their original task/budget.
             if not item['run_id'] and (item['target']['context'], item['target']['object_id']) in self.worker.store.excluded_target_keys():
@@ -378,20 +383,39 @@ class BatchExecution:
                 packet.task['scene_geometry_authority_policy']='native-table-authority-v1'
                 packet.task['scene_relation_reading_policy']='explicit-subject-landmark-v2-bidirectional'
                 packet.task['scene_binding_policy']='anonymous-region-binding-v1'
-                packet.task['scene_region_card_policy']='explicit-anonymous-region-cards-v1'
+                packet.task['scene_region_card_policy']='legible-anonymous-region-cards-v2'
                 packet.task['scene_input_policy']='sentence-scoped-scene-input-v1'
                 packet.task['feedback_revision_policy']='feedback-evidence-revision-v1'
-                packet.task['feedback_acquisition_policy']='feedback-landmark-recheck-v1'
+                packet.task['feedback_acquisition_policy']='feedback-landmark-recheck-v2-diagnostics'
                 packet.task['landmark_salience_policy']='aligned-landmark-preference-v1'
                 packet.task['feedback_acceptance_policy']='feedback-acceptance-v5-natural-concision'
-                packet.task['feedback_relation_policy']='bilingual-landmark-feedback-v2-omissions'
+                packet.task['feedback_relation_policy']='bilingual-landmark-feedback-v3-spatial-details'
+                packet.task['feedback_intent_policy']='purpose-bound-feedback-v1'
                 packet.task['feedback_feature_policy']='verified-target-feature-feedback-v1'
                 packet.task['sentence_claim_repair_policy']='sentence-claim-repair-v1'
                 packet.task['sentence_style_policy']='simple-sufficient-sentence-v1'
+                packet.task['sentence_composition_policy']='subject-scoped-composition-v1'
                 packet.task['target_naming_policy']='explicit-target-category-v1'
-                packet.task['ego_wording_policy']='complete-ego-direction-v1'
+                packet.task['ego_wording_policy']='proven-ego-components-v2'
                 packet.task['landmark_locality_policy']='local-landmark-selection-v1'
                 packet.task['feedback_detail_policy']='explicit-feedback-details-v1'
+                packet.task['feedback_appearance_policy']='explicit-appearance-feedback-v1'
+                packet.task['sign_shape_policy']='whole-sign-shape-v1'
+                packet.task['sign_ambiguity_policy']='ambiguity-driven-sign-recheck-v1'
+                packet.task['native_sign_stack_policy']='contained-native-sign-stack-v1'
+                packet.task['scene_candidate_logic_policy']='candidate-conjunction-v1'
+                packet.task['distinctiveness_search_policy']='distinctiveness-evidence-search-v1'
+                packet.task['vehicle_detail_policy']='visible-vehicle-parts-v1'
+                packet.task['chinese_landmark_policy']='literal-chinese-landmarks-v1'
+                packet.task['blind_parse_scope_policy']='literal-text-parse-v1'
+                packet.task['scene_camera_scope_policy']='named-camera-scope-v1'
+                packet.task['person_feedback_policy']='observable-only-person-feedback-v1'
+                packet.task['disputed_attribute_policy']='literal-disputed-attribute-v1'
+                packet.task['backpack_color_policy']='worn-backpack-color-v1'
+                packet.task['appearance_equivalence_policy']='appearance-claim-equivalence-v1'
+                packet.task['feedback_group_position_policy']='explicit-group-position-feedback-v1'
+                packet.task['sign_detail_policy']='sign-identity-detail-v1'
+                packet.task['sign_inscription_policy']='literal-sign-inscription-v1'
                 packet.task['ego_proximity_policy']='native-ego-proximity-v1'
                 packet.task['spatial_language_policy']='plain-spatial-language-v1'
                 packet.task['manual_feedback_policy']='verified-feedback-planning-v1'
@@ -400,6 +424,11 @@ class BatchExecution:
                 from app.quality.relations import VEHICLE_HEADING_POLICY
                 packet.task['vehicle_heading_policy']=VEHICLE_HEADING_POLICY
                 packet.task['claim_normalization_policy']='compound-claim-entailment-v1'
+                packet.task['writer_claim_policy']='selected-scope-attributes-v1'
+                packet.task['identity_point_guidance_policy']='box-point-owner-guide-v1'
+                packet.task['scene_ego_direction_policy']='explicit-unary-ego-table-v1'
+                packet.task['recognition_preference_policy']='salient-confirmed-details-v1'
+                packet.task['scene_source_retry_policy']='native-owner-source-retry-v2'
                 packet.task['joint_reference_policy']='joint-target-landmark-v1'
                 packet.task['vehicle_forward_region_policy']='vehicle-forward-region-v1'
                 packet.task['spatial_relation_policy']='native-3d-spatial-relations-v1'
@@ -416,6 +445,10 @@ class BatchExecution:
                 packet.task['manual_review_feedback'] = {
                     **reference.model_dump(), 'previous_expression': expression(source),
                     'reason': receipt['notes']}
+                if packet.task.get('distinctiveness_search_policy')=='distinctiveness-evidence-search-v1':
+                    previous=next((a['generated'] for a in reversed(source.get('attempts',[])) if a.get('generated')),None)
+                    if previous:
+                        packet.task['manual_review_feedback']['rejected_appearance_bundle']=previous.get('visual_attributes',[])
             if self.spec.prepare_only:
                 return None
             performance.phase('annotation')
@@ -528,6 +561,9 @@ class BatchExecution:
 
     def annotate_item(self, item, packet):
         ordinal = item['ordinal']
+        from app.quality.paper_study import study_for_job,PaperStudyStore
+        study_id=study_for_job(self.worker.store,self.job)
+        study=PaperStudyStore(self.worker.store,api.ROOT) if study_id else None
         try:
             calls, close_after_target = self.target_calls()
         except ValueError as exc:
@@ -544,7 +580,7 @@ class BatchExecution:
             else:
                 remaining = (12 if item['target'].get('manual_review_retry') else
                     self.spec.call_allowance(self.store.execution_progress(self.job)['calls']))
-                cumulative_limit = item['target'].get('retry_authorization',{}).get('call_limit',12)
+                cumulative_limit = item['target'].get('retry_authorization',{}).get('call_limit',13 if study else 12)
                 budget = min(remaining, cumulative_limit - self.worker.store.target_usage(packet, getattr(calls, 'scope', 'real-model')))
                 minimum = 4 if packet.ready_for_generation else 5 if api.expand_relations(packet)[0].ready_for_generation else 1
                 if budget < minimum:
@@ -575,8 +611,17 @@ class BatchExecution:
                 self.store.attach_child(self.job, ordinal, initial)
             self.store.update(self.job, 'target_started_or_resumed', {'ordinal': ordinal, 'run_id': run_id},
                 ordinal=ordinal, item_status='running', run_id=run_id)
+            if study:
+                study.ensure_method(self.job)
+                study.bind(study_id,ordinal,packet,run_id)
             if self.cancelled():
                 self.worker.store.request_control(run_id, self.store.command(self.job) or 'pause')
+            if study:
+                # Complete the fixed branch before Agent. A pause cannot leave
+                # an accepted Agent item hiding unfinished baseline work.
+                baseline=study.baseline(self,study_id,ordinal,calls)
+                if baseline['status'] in {'paused','stopped'}:
+                    return (baseline['status'],None)
             result = api.run_agent(packet, calls, self.spec.max_repairs, self.worker.root, budget, cumulative_limit,
                 resume_run_id=run_id, executor_owner=self.owner, alternate_frame=self.alternate_frame(ordinal),
                 model_slots=self.worker.model_slots,observation_cache=self.observation_cache)

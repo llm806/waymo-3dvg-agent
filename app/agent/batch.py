@@ -512,7 +512,7 @@ class BatchStore:
                     original = item['feedback_check'] or {}
                     item['feedback_check'] = {**original, 'historical':True,
                         'requirements':[*original.get('requirements',[]),*details]}
-            if request and relation_policy != 'bilingual-landmark-feedback-v2-omissions' and item['status'] not in {'pending','preparing','running','paused','stopped'}:
+            if request and relation_policy != 'bilingual-landmark-feedback-v3-spatial-details' and item['status'] not in {'pending','preparing','running','paused','stopped'}:
                 from app.quality.joint_reference import feedback_acceptance, NATURAL_CONCISION_POLICY, RELATION_FEEDBACK_POLICY
                 supplement = feedback_acceptance({'manual_review_feedback':json.loads(request),
                     'feedback_acceptance_policy':NATURAL_CONCISION_POLICY,
@@ -909,6 +909,9 @@ class BatchService:
     def retry_review(self, job, ordinal, reference, revision, *, retry_failed_run_id=None):
         """Requeue one settled item in place; keep every original run and bill."""
         self.ensure_loaded_code()
+        from app.quality.paper_study import study_for_job
+        if study_for_job(self.runner.store,job):
+            raise ValueError('科研对照任务已冻结；不能通过日常反馈返工改变实验结果。')
         source, review = retry_source(self.runner.store, reference, require_current=True)
         with self.runner.store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -1033,6 +1036,9 @@ class BatchService:
             return receipt
 
     def start(self, job, *, automatic=False, queued_dispatch=False):
+        from app.quality.paper_study import study_for_job,PaperStudyStore
+        if study_for_job(self.runner.store,job):
+            PaperStudyStore(self.runner.store,ROOT).ensure_method(job)
         worker = self.runner
         with worker.store.maintenance(), worker.lock:
             self.ensure_loaded_code()

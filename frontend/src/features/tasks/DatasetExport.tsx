@@ -37,9 +37,11 @@ export default function DatasetExport({ jobs, current }: { jobs: Task[]; current
   const submitLock = useRef(false)
   const downloadLink = useRef<HTMLAnchorElement>(null)
   const downloaded = useRef('')
+  const disclosure = useRef<HTMLDetailsElement>(null)
   const active = !!exportJob && activeStates.includes(exportJob.status)
   const busy = loading || submitting || active
   const exportId = exportJob?.export_id
+  useEffect(() => { if (active && disclosure.current) disclosure.current.open = true }, [active])
 
   useEffect(() => {
     let disposed = false
@@ -120,11 +122,8 @@ export default function DatasetExport({ jobs, current }: { jobs: Task[]; current
     : !taskCount ? '请选择要打包的任务。' : taskCount > 1000 && scope === 'selected' ? '每包最多选择 1000 个任务。' : ''
   const blockedReason = loading ? '正在读取导出状态…' : submitting ? '正在提交导出请求…' : active ? '本次导出正在处理，请查看下方进度。' : selection.error || unavailable || (!validName ? '压缩包名称无效，请先修改名称。' : '')
   function chooseTasks(ids: string[]) { setChecked(ids); setFeedback('') }
-  return <section className="panel dataset-export" aria-labelledby="dataset-export-heading">
-    <div className="dataset-export-heading">
-      <div><h2 id="dataset-export-heading">导出 Waymo-3DRef 数据集</h2><p>按任务分包上传，使用包内工具统一合并到 trainset / valset。</p></div>
-      <span className="dataset-export-format">ZIP 压缩包</span>
-    </div>
+  return <details ref={disclosure} className="panel dataset-export export-disclosure" aria-labelledby="dataset-export-heading">
+    <summary className="dataset-export-heading"><h2 id="dataset-export-heading">导出数据集</h2><span className="dataset-export-format">Waymo-3DRef · ZIP</span></summary>
     <form onChange={() => setFeedback('')} onSubmit={e => {
       e.preventDefault()
       if (!ready) { setFeedback(blockedReason); return }
@@ -207,11 +206,11 @@ export default function DatasetExport({ jobs, current }: { jobs: Task[]; current
     <iframe name="dataset-export-download" title="数据集下载" hidden />
     <details className="dataset-export-help">
       <summary title="点击展开或收起数据内容与合并命令">包含哪些数据，如何合并分包？<span className="dataset-help-open" aria-hidden="true">点击展开</span><span className="dataset-help-close" aria-hidden="true">点击收起</span></summary>
-      <ul><li>包含通过自动校验的最终文本、完整点云、文本来源视角的原图及标定、原生框与独立加载脚本；每条样本只读取对应的一路图像，失败和无文本记录不导出。</li>
+      <ul><li>包含自动核验通过或当前版本已人工审批的描述、完整点云、来源原图、标定、三维标注框及加载脚本；拒绝、废弃或无文本的记录不导出。</li>
         <li>压缩包使用统一精简格式，只保留训练数据和必要身份信息。从任一分包取出 merge.py 和 loader.py 放在同一目录；合并工具可直接读取 ZIP，无需逐包解压。</li>
         <li>合并训练分包：<code>python merge.py --output trainset trainset1.zip trainset2.zip</code>；合并验证分包：<code>python merge.py --output valset valset1.zip valset2.zip</code>。以后追加新包仍使用同一命令，已有数据会保留。</li>
-        <li>合并时去重并合并场景资源；不同版本冲突或 trainset / valset 存在同一驾驶片段时停止并提示。</li>
+        <li>同一样本在多个包中出现时，只保留一份；共用的图像和点云也会合并保存。如果同一样本的内容不一致，或训练集与验证集包含同一段驾驶记录，合并会停止并提示原因。</li>
         <li>保留原始数据的官方训练 / 验证集标识，不自动划分数据；自动校验通过不代表独立人工审核通过。</li></ul>
     </details>
-  </section>
+  </details>
 }

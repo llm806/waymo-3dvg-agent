@@ -131,9 +131,9 @@ export default function TaskManager({ jobs, loading = false, loadError = '', onR
       <label><input type="checkbox" checked={review.return_to_pool} disabled={busy || pending} onChange={e => {
         const returnToPool = e.target.checked
         setReview({ ...review, return_to_pool: returnToPool, token: review.candidate_tokens[returnToPool ? 'return' : 'exclude'] })
-      }} />将已处理物体重新加入候选池</label>
+      }} />允许新任务再次标注这些已处理的物体</label>
       <p className="muted">{review.return_to_pool
-        ? '允许重新选择这些物体；仍被其他任务或记录排除、或累计额度不足的物体不会重新开放。'
+        ? '新任务可再次选择这些物体。但如果其他任务仍在处理它们、其他记录禁止再次选择，或剩余模型调用次数不够，仍不能选择。'
         : `保留 ${review.processed_tracks} 个已处理物体的排除记录，后续新任务不会重新选择它们。`}
         未处理的候选物体不受此选项影响。{review.return_to_pool ? '如果这些样本已导出，重新标注可能导致跨包版本冲突。' : ''}</p>
       {!!review.summary.retained_tasks && <p className="notice">另有 {review.summary.retained_tasks} 个关联任务会保留，其继承样本、必要过程记录和累计调用额度不受影响。</p>}

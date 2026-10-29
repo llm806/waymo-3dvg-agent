@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { categoryLabel, errorMessage, phases, providerDiagnosisLabel, readJson, readPollingJson, reasonLabel, isAnnotationResult, isProcessingRecord } from '../../shared/annotationDisplay'
+import { categoryLabel, errorMessage, recordStatus, phases, providerDiagnosisLabel, readJson, readPollingJson, reasonLabel, isAnnotationResult, isProcessingRecord } from '../../shared/annotationDisplay'
 import AlignmentInspection from '../scene/AlignmentInspection'
 import TaskManager from './TaskManager'
 import TaskMetrics from './TaskMetrics'
@@ -11,6 +11,7 @@ import type { TaskContinuation } from '../../shared/taskName'
 import { cameraViewLabel } from '../../shared/cameraViews'
 import type { ManualReview } from '../results/SampleReview'
 import { taskLocation } from '../../navigation'
+import { TermHelp } from '../../components/Help'
 
 type Target = { official_split?: 'training' | 'validation'; target_id: string; ordinal: number; context: string; object_id: string; category: string; status: string; timestamp: number | null; frame_exclusion_counts: Record<string, number>; recommendation_rank?: number }
 type Catalog = { catalog_id: string | null; summary: { tracks?: number; selected?: number; excluded?: number; contexts?: number; pending_pairing?: number }; targets: Target[]; total: number }
@@ -18,7 +19,7 @@ type Item = { manual_approved?:boolean; manual_review?: ManualReview | null; dis
 type Job = { queue_position?: number | null; queue_paused?: boolean; continuation?: TaskContinuation | null; job_id: string; status: string; created_at: number; reason: string | null; executor_active: boolean; control: string | null; spec: { dataset_split?: 'train' | 'validation'; prepare_only: boolean; max_model_calls: number | null; catalog_id: string; desired_count?: number | null }; counts: Record<string, number>; selection_progress?: { requested: number | null } }
 type JobDetail = Job & { resume?: { mode: 'resume' | 'recover' | 'unavailable'; message: string }; model_calls_reserved: number; selection_progress?: { requested: number | null; diagnostic_passed: number; attempted: number; candidate_pool: number }; timing?: TaskTiming; measured_at?: number; items: Item[]; events: { seq: number; kind: string; at: number; payload: Record<string, unknown> }[] }
 type Progress = Pick<JobDetail, 'job_id' | 'status' | 'control' | 'reason' | 'executor_active' | 'counts' | 'model_calls_reserved' | 'selection_progress' | 'timing' | 'measured_at'> & { active_item_timings: Record<string, ItemTiming> }
-const labels: Record<string, string> = { discarded: '已删除', rejected: '人工不通过', ready: '待启动', pending: '待处理', selected: '有可用帧', excluded: '证据不足 · 已跳过', preparing: '准备数据', prepared: '数据已准备', running: '执行中', paused: '已暂停', stopped: '已停止', completed: '处理结束', blocked: '执行受阻', calibration_hold: '原句定位通过 · 待评估', abstained: '未采纳', needs_evidence: '待补证据 · 保留候选', failed: '执行失败', budget_skipped: '预算不足', reused: '复用结果' }
+const labels: Record<string, string> = { discarded: '已删除', rejected: '人工不通过', ready: '待启动', pending: '待处理', selected: '有可用帧', excluded: '不符合标注条件', preparing: '准备数据', prepared: '数据已准备', running: '执行中', paused: '已暂停', stopped: '已停止', completed: '处理结束', blocked: '执行受阻', calibration_hold: '自动核验通过', abstained: '未采纳', needs_evidence: '未通过核验', failed: '执行失败', budget_skipped: '预算不足', reused: '复用结果' }
 labels.manual_approved = '人工审批通过'
 labels.not_needed = '未尝试 · 保留候选'
 labels.queued = '排队中'
@@ -52,7 +53,7 @@ const preparationStage = (stage: unknown) => {
   if (stage === 'checking_converter_environment') return '检查本地点云转换环境'
   const lidar = /^converting_lidar:([1-5]):([12])$/.exec(stage)
   if (lidar) return `转换点云：雷达 ${lidar[1]} / 5，第 ${lidar[2]} 次回波`
-  return ({ checking_sources: '校验原始数据', checking_distinguishability: '检查图像与点云候选', finding_alternate_frame: '查找同轨迹的其它候选帧', starting_converter: '首次启动点云转换环境', reusing_converter: '复用已加载的转换环境', retrying_converter: '转换进程中断，重新启动后重试一次', loading_converter: '加载数据读取组件', loading_sdk: '首次加载官方 Waymo SDK', reusing_sdk: '复用官方 Waymo SDK', checking_scene_sources: '校验当前帧来源', reading_lidar: '读取当前帧雷达数据', reading_lidar_pose: '读取当前帧雷达运动补偿数据', reading_lidar_projections: '读取当前帧雷达相机投影', saving_points: '保存完整点云', reading_images: '读取同帧图片', saving_scene: '保存当前帧', scene_ready: '点云与图片转换完成', validating_scene: '校验点云与图片', building_evidence: '准备目标框与标注依据' } as Record<string,string>)[stage] ?? '准备当前物体数据'
+  return ({ checking_sources: '校验原始数据', checking_distinguishability: '检查图像与点云候选', finding_alternate_frame: '查看同一物体的其他帧', starting_converter: '首次启动点云转换环境', reusing_converter: '复用已加载的转换环境', retrying_converter: '转换进程中断，重新启动后重试一次', loading_converter: '加载数据读取组件', loading_sdk: '首次加载官方 Waymo SDK', reusing_sdk: '复用官方 Waymo SDK', checking_scene_sources: '校验当前帧来源', reading_lidar: '读取当前帧雷达数据', reading_lidar_pose: '读取当前帧雷达运动补偿数据', reading_lidar_projections: '读取当前帧雷达相机投影', saving_points: '保存完整点云', reading_images: '读取同帧图片', saving_scene: '保存当前帧', scene_ready: '点云与图片转换完成', validating_scene: '校验点云与图片', building_evidence: '准备目标框与标注依据' } as Record<string,string>)[stage] ?? '准备当前物体数据'
 }
 const maxTargets = 2000
 const settledStatuses = new Set(['prepared', 'calibration_hold', 'abstained', 'needs_evidence', 'failed', 'excluded', 'budget_skipped', 'reused'])
@@ -390,17 +391,16 @@ export default function BatchWorkspace({ onOpenPacket, active = true }: { onOpen
     {progressError && <p className="notice" role="status">进度同步暂时中断：{progressError}<button className="text-button" onClick={() => setPollVersion(v => v + 1)}>立即重试</button></p>}
     {readinessError && <p className="error" role="alert">系统状态读取失败：{readinessError}。已有任务仍可查看。</p>}
     <form className="panel setup-panel" aria-labelledby="setup-heading" noValidate onSubmit={e => { e.preventDefault(); setCountTouched(true); if (!busy && !syncError && !readinessError && readiness?.annotation_ready && readiness.supports_candidate_replacement && readiness.supports_unlimited_batches && readiness.supports_vision_model_checks && catalog?.catalog_id && !scopeError && selected.length) void create() }}>
-      <div className="setup-intro"><h2 id="setup-heading">新建标注任务</h2><p className="section-caption">以通过自动检查的描述计数，未通过的物体会自动补选。</p></div>
+      <div className="setup-intro"><h2 id="setup-heading">新建任务</h2><span className="section-caption">按通过核验的描述计数</span></div>
       <label className="dataset-task-choice">标注数据集 <select aria-label="标注数据集" value={datasetSplit} disabled={busy} onChange={e => { setDatasetSplit(e.target.value as 'train' | 'validation'); setCountTouched(false); setError('') }}><option value="train">训练集（官方 training）</option><option value="validation">验证集（官方 validation）</option></select></label>
-      <p className="section-caption">按原始数据官方划分选择候选，不会将训练数据改标为验证集。</p>
       <dl className="setup-stats" aria-label="数据与候选范围">
-        <div className="available-stat"><dt>本次可用候选</dt><dd>{readiness && catalog ? available.length : '—'}<small>个物体</small></dd></div>
-        <div><dt>目录候选总数</dt><dd>{catalog ? splitTargets.filter(t => t.status === 'selected').length : '—'}<small>个物体</small></dd></div>
-        <div><dt>物体轨迹总数</dt><dd>{catalog ? splitTargets.length : '—'}<small>条轨迹</small></dd></div>
-        <div><dt>驾驶片段</dt><dd>{catalog ? new Set(splitTargets.map(t => t.context)).size : '—'}<small>个</small></dd></div>
+        <div className="available-stat"><dt><TermHelp term="availableObjects" /></dt><dd>{readiness && catalog ? available.length : '—'}<small>个</small></dd></div>
+        <div><dt><TermHelp term="eligibleObjects" /></dt><dd>{catalog ? splitTargets.filter(t => t.status === 'selected').length : '—'}<small>个</small></dd></div>
+        <div><dt><TermHelp term="datasetObjects" /></dt><dd>{catalog ? splitTargets.length : '—'}<small>个</small></dd></div>
+        <div><dt><TermHelp term="context" label="驾驶片段" /></dt><dd>{catalog ? new Set(splitTargets.map(t => t.context)).size : '—'}<small>个</small></dd></div>
       </dl>
       <div className="setup-action">
-        <div className="count-field"><label className="target-count" htmlFor="annotation-count">期望标注条数<span className="number-input"><input id="annotation-count" aria-label="期望标注条数" aria-describedby={`target-count-help${countTouched && scopeError ? ' target-count-error' : ''}`} aria-invalid={countTouched && !!scopeError} type="text" inputMode="numeric" autoComplete="off" placeholder="填写数量" value={countText} onChange={e => { setCountText(e.target.value); setCountTouched(false) }} onBlur={() => { setCountTouched(true); if (count !== null) setCountText(String(count)) }} /><span>条描述</span></span></label><small id="target-count-help">{readiness && catalog ? available.length ? `可填写 1–${Math.min(maxTargets, available.length)}，从本次可用候选中自动补选。` : '暂无可用候选，请查看已有任务的处理结果。' : '正在读取可用候选…'}</small></div>
+        <div className="count-field"><label className="target-count" htmlFor="annotation-count">期望标注条数<span className="number-input"><input id="annotation-count" aria-label="期望标注条数" aria-describedby={`target-count-help${countTouched && scopeError ? ' target-count-error' : ''}`} aria-invalid={countTouched && !!scopeError} type="text" inputMode="numeric" autoComplete="off" placeholder="填写数量" value={countText} onChange={e => { setCountText(e.target.value); setCountTouched(false) }} onBlur={() => { setCountTouched(true); if (count !== null) setCountText(String(count)) }} /><span>条描述</span></span></label><small id="target-count-help">{readiness && catalog ? available.length ? `可填写 1–${Math.min(maxTargets, available.length)}，未通过时自动补选其他物体。` : '暂无可用候选，请查看已有任务的处理结果。' : '正在读取可选物体…'}</small></div>
         <div className="setup-submit"><button className="primary" type="submit" disabled={busy || !!syncError || !!readinessError || !readiness?.annotation_ready || !readiness.supports_candidate_replacement || !readiness.supports_unlimited_batches || !readiness.supports_vision_model_checks || !catalog?.catalog_id || !!scopeError || !selected.length}>{busy ? '处理中…' : '创建任务'}</button></div>
       </div>
       {countTouched && scopeError && <p id="target-count-error" className="error" role="alert">{scopeError}</p>}
@@ -408,21 +408,26 @@ export default function BatchWorkspace({ onOpenPacket, active = true }: { onOpen
       {readiness?.supports_candidate_replacement && !readiness.supports_unlimited_batches && <p className="notice" role="status">后端尚未加载取消任务总调用上限的修改，请由你重启服务后再创建任务。</p>}
       {readiness?.supports_unlimited_batches && !readiness.supports_vision_model_checks && <p className="notice" role="status">后端尚未加载模型图像能力检查，请由你重启服务后再创建任务。</p>}
       {readiness && !readiness.annotation_ready && <p className="error" role="alert">暂无法创建任务：{readiness.checks.filter(c => !c.ready).map(c => `${c.name}缺失，${c.detail}`).join('；')}</p>}
-      <div className="setup-bottom"><p>本次可用候选已排除未重新入池的已尝试物体（含准备失败），以及被占用或额度不足的物体。{catalog?.summary.pending_pairing ? `另有 ${catalog.summary.pending_pairing} 个目标待关联确认。` : ''}</p><p>达到期望条数、候选用尽或手动停止时结束。描述通过自动检查后仍需独立评估。</p></div>
+      <details className="inline-help setup-bottom"><summary>物体数量怎么算，任务何时结束？</summary><ul>
+        <li>同一段驾驶记录中，同一辆车即使在多张图像中出现，也只算一个物体。不同驾驶记录分别统计。</li>
+        <li>有对应的图像、三维标注框和雷达点，才可尝试标注。开始后还会检查：能否看清物体，以及能否只凭描述找到它、不会认成其他物体。{catalog?.summary.pending_pairing ? `另有 ${catalog.summary.pending_pairing} 个物体尚未找到对应图像，暂不能标注。` : ''}</li>
+        <li>已经尝试标注、正在由其他任务处理、已被排除，或剩余模型调用次数不够的物体，不计入“当前可选物体”。</li>
+        <li>一条描述未通过检查，系统会换一个物体继续尝试。通过的描述达到你填写的数量，或没有其他物体可选时，任务结束；也可手动停止。模型服务或存储等发生故障时，任务可能暂停。</li>
+      </ul><p>训练集和验证集由 Waymo 官方划分，本系统不重新分配。</p></details>
     </form>
 
     <div className={`workspace-grid${!detail ? ' workspace-grid-empty' : ''}`}>
-      <aside className="task-sidebar" aria-label="任务选择与管理">
+      {(jobs.length>0||jobsError)&&<aside className="task-sidebar" aria-label="任务选择与管理">
         <TaskManager jobs={jobs} loading={!jobsLoaded && !jobsError} loadError={jobsError} onReload={() => setPollVersion(v => v + 1)} onBusyChange={setMaintenanceBusy} current={chosen || detail?.job_id} activeJobId={activeJob ?? undefined} labels={labels}
           onOpen={id => { if (id === (chosen || detail?.job_id)) return; setChosen(id); setDetail(null); setMetricsResult(null); setResultPage(0); setResultFilter(''); setResultScope('results'); setFeedback('') }}
           onDeleted={ids => { setJobs(previous => previous.filter(j => !ids.includes(j.job_id))); if ((detail && ids.includes(detail.job_id)) || ids.includes(chosen)) { setChosen(''); setDetail(null); setMetricsResult(null); setResultPage(0); setResultFilter(''); setResultScope('results'); setFeedback('') } setPollVersion(v => v + 1) }} />
-      </aside>
+      </aside>}
       <div className="task-workspace">
         {feedback && <p role="status" className="operation-feedback">{feedback}</p>}
         {!detail ? <section className="panel workspace-empty"><span className="empty-symbol" aria-hidden="true">↗</span><h2>{jobsError ? '任务列表读取失败' : !jobsLoaded || jobs.length ? '正在读取任务' : '等待开始标注'}</h2><p>{jobsError ? '请重试读取任务列表；读取失败不代表已保存的标注被删除。' : !jobsLoaded || jobs.length ? '正在加载已有任务的进度与结果。' : '在上方选择物体数量并创建任务，点云、图像和结果会显示在这里。'}</p></section> : <>
           <section className="panel progress-panel" aria-labelledby="progress-heading">
             <div className="section-heading"><div><h2 id="progress-heading">标注进度</h2><p className="section-caption">{taskName(detail)}</p></div><span role="status" className={`status-badge status-${detail.status}`}>{labels[detail.status] ?? detail.status}</span></div>
-            <div className="progress-numbers"><div><strong>{progressValue}</strong><span> / {progressTotal} {goal ? '条通过自动检查 · 待评估' : '个已处理'}</span></div><span>{progressPercent}%</span></div>
+            <div className="progress-numbers"><div><strong>{progressValue}</strong><span> / {progressTotal} {goal ? '条可用描述' : '个已处理'}</span></div><span>{progressPercent}%</span></div>
             <progress className="batch-progress" aria-label={goal ? '描述数量进度' : '目标处理进度'} value={progressValue} max={progressTotal} />
             <LiveTiming item={itemTiming} task={detail.timing} observedAt={live ? progressObservedAt : observedAt} active={pollActive && !progressError} />
             {goal && <p className="muted">已尝试 {detail.selection_progress?.attempted ?? 0} 个物体 · 未通过的物体会自动补选</p>}
@@ -450,7 +455,8 @@ export default function BatchWorkspace({ onOpenPacket, active = true }: { onOpen
           </section>
 
           {viewingItem && <section className={`panel live-sample${sampleExecuting ? ' is-executing' : ''}`} aria-label="标注物体记录" aria-busy={!!syncError}>
-            <div className="section-heading"><div><h2>{sampleExecuting ? (viewingItem.phase?.startsWith('precheck_') ? '正在预检查' : '正在标注') : '标注物体记录'}</h2><p className="section-caption">第 {viewingIndex + 1} 个处理目标<span aria-hidden="true"> · </span>{categoryLabel(viewingItem.target.category)} · #{viewingItem.ordinal}</p></div><span className="sample-stage" role="status">{sampleExecuting ? phases[viewingItem.phase ?? ''] ?? labels[viewingItem.status] : viewingItem.result_label ?? labels[viewingItem.status] ?? viewingItem.status}</span></div>
+            <div className="section-heading"><div><h2>{sampleExecuting ? (viewingItem.phase?.startsWith('precheck_') ? '正在预检查' : '正在标注') : '标注物体记录'}</h2><p className="section-caption">第 {viewingIndex + 1} 个处理目标<span aria-hidden="true"> · </span>{categoryLabel(viewingItem.target.category)} · #{viewingItem.ordinal}</p></div><span className={`record-state record-state-${recordStatus(viewingItem,detail).tone}`} role="status">{recordStatus(viewingItem,detail).label}</span></div>
+            {sampleExecuting && viewingItem.phase && <p className="section-caption">当前步骤：{phases[viewingItem.phase] ?? '正在处理'}</p>}
             {viewingItem.source_view&&<p className="source-view-label">来源视角：{cameraViewLabel(viewingItem.source_view)}</p>}
             {viewingItem.legacy_rules&&<p className="notice">此记录保留其完成时的标注规则与校验结果。</p>}
             <nav className="record-navigation" aria-label="切换标注物体记录">
@@ -460,7 +466,7 @@ export default function BatchWorkspace({ onOpenPacket, active = true }: { onOpen
               {detail.status === 'running' && <button className="text-button" aria-pressed={!manualItem} disabled={!manualItem} onClick={() => setRecordSelection(null)}>{manualItem ? '跟随标注进度' : '正在跟随进度'}</button>}
             </nav>
             <ol className="sample-steps" aria-label="当前物体处理步骤">{['准备与预检查','生成描述','检查描述','保存结果'].map((step,index) => <li key={step} aria-current={index === sampleStage ? 'step' : undefined} className={sampleFinished || index < sampleStage ? 'done' : index === sampleStage ? sampleFailed ? 'failed' : 'current' : ''}><span aria-hidden="true">{sampleFinished || index < sampleStage ? '✓' : index + 1}</span>{step}</li>)}</ol>
-            {viewingItem.reason && <p className="notice" role="status">{reason(viewingItem.display_reason ?? viewingItem.reason, viewingItem.provider_diagnosis)}</p>}
+            {viewingItem.reason && <p className={isAnnotationResult(viewingItem) ? 'record-reason-passed' : 'notice'} role="status">{reason(viewingItem.display_reason ?? viewingItem.reason, viewingItem.provider_diagnosis)}</p>}
             {viewingItem.failure_diagnostic?.http_status && <p className="notice">HTTP {viewingItem.failure_diagnostic.http_status}{viewingItem.failure_diagnostic.provider_error_code && ` · ${viewingItem.failure_diagnostic.provider_error_code}`}</p>}
             {viewingItem.reason === 'precheck_target_occluded_or_uncertain' && viewingItem.visibility_observation?.visibility_reason && <p className="muted">来源视角的模型判断：<span lang="en">{viewingItem.visibility_observation.visibility_reason}</span></p>}
             {syncError ? <p className="notice" role="status">进度同步中断，已暂停场景展示；恢复后自动跟随当前物体。</p> : viewingItem.packet_id && (viewingItem.admission_status === 'passed' || viewingItem.expression || manualItem)
@@ -473,7 +479,7 @@ export default function BatchWorkspace({ onOpenPacket, active = true }: { onOpen
           <section className="panel results-panel" aria-labelledby="results-heading">
             <div className="section-heading"><div><h2 id="results-heading">标注结果 <span className="count-badge">{results.length}</span></h2><p className="section-caption">{detail.spec.prepare_only ? '仅显示已准备的数据。' : `当前保留 ${results.length} 条自动检查通过的描述${goal ? ` / 目标 ${goal} 条` : ''}，仍待独立评估。`}</p></div></div>
             <div className="filter-row"><label><span className="sr-only">记录范围</span><select aria-label="记录范围" value={resultScope} onChange={e => { setResultScope(e.target.value); setResultFilter(''); setResultPage(0) }}><option value="results">{detail.spec.prepare_only ? '已准备数据' : '通过自动检查的描述'}</option><option value="history">处理记录（含待处理候选）</option></select></label><label><span className="sr-only">处理状态</span><select aria-label="处理状态" value={resultFilter} onChange={e => { setResultFilter(e.target.value); setResultPage(0) }}><option value="">全部状态</option>{Array.from(new Set(displayedRecords.map(i => i.status))).map(s => <option key={s} value={s}>{labels[s] ?? s}</option>)}</select></label><span>共 {items.length} 条</span></div>
-            <div className="table-wrap"><table className="result-table"><thead><tr><th>物体</th><th>候选描述</th><th>来源视角</th><th>状态</th><th><span className="sr-only">操作</span></th></tr></thead><tbody>{items.slice(visiblePage * 25,(visiblePage + 1) * 25).map(i => <tr key={i.ordinal}><td><strong>{categoryLabel(i.target.category)}</strong><small className="object-number">#{i.ordinal}</small></td><td lang={i.expression ? 'en' : 'zh'}>{i.expression ?? <span className="placeholder-text">{i.status === 'pending' || i.status === 'ready' ? '待生成' : '未生成描述'}</span>}</td><td>{cameraViewLabel(i.source_view)}{i.source_view_status === 'candidate' && '（候选）'}</td><td><span title={i.reason ? reason(i.reason, i.provider_diagnosis) : undefined} className={`status-badge status-${i.status}`}>{i.manual_review?.verdict === 'discarded' ? '已删除' : i.manual_review?.verdict === 'rejected' ? '人工不通过' : i.status === 'running' && detail.status === 'running' && detail.executor_active ? phases[i.phase ?? ''] ?? labels[i.status] : i.result_label ?? labels[i.status] ?? i.status}</span>{i.legacy_rules&&<small className="legacy-rule-label">旧规则记录</small>}</td><td><div className="record-actions">{i.packet_id && <button className="row-action" onClick={() => openProcess(i)}>查看过程 →</button>}{i.expression && i.run_id && i.packet_id && <button className="row-action delete-record" aria-label={`删除标注 #${i.ordinal}`} disabled={busy || ['running','paused','stopped'].includes(i.run_status ?? i.status) || i.manual_review?.verdict === 'discarded'} onClick={() => void deleteSample(i)}>{i.manual_review?.verdict === 'discarded' ? '已删除' : '删除'}</button>}</div></td></tr>)}</tbody></table></div>
+            <div className="table-wrap"><table className="result-table"><thead><tr><th>物体</th><th>候选描述</th><th>来源视角</th><th>状态</th><th><span className="sr-only">操作</span></th></tr></thead><tbody>{items.slice(visiblePage * 25,(visiblePage + 1) * 25).map(i => <tr key={i.ordinal}><td><strong>{categoryLabel(i.target.category)}</strong><small className="object-number">#{i.ordinal}</small></td><td lang={i.expression ? 'en' : 'zh'}>{i.expression ?? <span className="placeholder-text">{i.status === 'pending' || i.status === 'ready' ? '待生成' : '未生成描述'}</span>}</td><td>{cameraViewLabel(i.source_view)}{i.source_view_status === 'candidate' && '（候选）'}</td><td><span title={i.reason ? reason(i.reason, i.provider_diagnosis) : undefined} className={`record-state record-state-${recordStatus(i,detail).tone}`}>{recordStatus(i,detail).label}</span>{i.legacy_rules&&<small className="legacy-rule-label">旧规则记录</small>}</td><td><div className="record-actions">{i.packet_id && <button className="row-action" onClick={() => openProcess(i)}>查看过程 →</button>}{i.expression && i.run_id && i.packet_id && <button className="row-action delete-record" aria-label={`删除标注 #${i.ordinal}`} disabled={busy || ['running','paused','stopped'].includes(i.run_status ?? i.status) || i.manual_review?.verdict === 'discarded'} onClick={() => void deleteSample(i)}>{i.manual_review?.verdict === 'discarded' ? '已删除' : '删除'}</button>}</div></td></tr>)}</tbody></table></div>
             {!items.length && <p className="empty">{!snapshot ? '正在加载处理记录，进度已实时同步…' : resultScope === 'history' ? '当前状态下没有处理记录。' : detail.spec.prepare_only ? '暂无已准备数据。' : '暂无符合当前筛选条件的通过描述；失败和待处理候选可在“处理记录”中查看。'}</p>}
             {items.length > 25 && <div className="pagination"><button disabled={!visiblePage} onClick={() => setResultPage(visiblePage - 1)}>上一页</button><span>{visiblePage + 1} / {Math.ceil(items.length / 25)}</span><button disabled={(visiblePage + 1) * 25 >= items.length} onClick={() => setResultPage(visiblePage + 1)}>下一页</button></div>}
           </section>
@@ -483,6 +489,6 @@ export default function BatchWorkspace({ onOpenPacket, active = true }: { onOpen
         </>}
       </div>
     </div>
-    <DatasetExport jobs={jobs} current={chosen || detail?.job_id} />
+    {!!jobs.length&&<DatasetExport jobs={jobs} current={chosen || detail?.job_id} />}
   </div>
 }

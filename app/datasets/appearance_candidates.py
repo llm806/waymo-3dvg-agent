@@ -23,7 +23,8 @@ def scene_image_inventory(boxes, projected_boxes=None):
     """
     native = [{'object_id': image_object_id(camera, box), 'category': box['category'],
              'camera_name': camera, 'camera_object_id': box['camera_object_id'], 'xyxy': box['xyxy'],
-             'identity_source': box.get('identity_source', 'official_camera_lidar_association'),
+             'identity_source': (box.get('identity_source', 'official_camera_lidar_association')
+                 if not image_object_id(camera, box).startswith('image:') else 'unlinked_native_box'),
              **({k:box[k] for k in ('native_unit_object_ids','native_unit_point_support')}
                 if box.get('identity_source') == 'native_camera_box_group_point_correspondence' else {})}
             for camera in sorted(boxes) for box in boxes[camera]]

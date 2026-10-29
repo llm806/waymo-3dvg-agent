@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { setImmediate } from 'node:timers/promises'
-import { readJson, readPollingJson, errorMessage, isAnnotationResult, isProcessingRecord, providerDiagnosisLabel, categoryLabel, reasonLabel, phases, automaticCheckState, automaticCheckLabels, sampleFilterLabels, matchesSampleFilter } from '../src/shared/annotationDisplay.ts'
+import { readJson, readPollingJson, errorMessage, isAnnotationResult, isProcessingRecord, providerDiagnosisLabel, categoryLabel, reasonLabel, recordStatus, phases, automaticCheckState, automaticCheckLabels, sampleFilterLabels, matchesSampleFilter } from '../src/shared/annotationDisplay.ts'
 import { taskName, taskDetails, parseAnnotationCount, exportTaskSelection } from '../src/shared/taskName.ts'
 import { formatDuration, formatTiming, hasIncompleteTiming } from '../src/shared/duration.ts'
 import { taskLocation, taskUrl, openTask, sampleUrl } from '../src/navigation.ts'
@@ -67,6 +67,7 @@ function manager(outcome, taskCount = 2, activeSecond = false) {
     if (name === 'react') return hooks
     if (name === 'react/jsx-runtime') return require(name)
     if (name.endsWith('/annotationDisplay')) return { readJson, errorMessage }
+    if (name.endsWith('/Help')) return {TermHelp:()=>null}
     if (name.endsWith('/taskName')) return { taskName, taskDetails, exportTaskSelection }
     throw new Error(`Unexpected import: ${name}`)
   }, exports)
@@ -113,6 +114,7 @@ test('task quantities accept editable integers and count only passed description
   const taskManager = {}
   new Function('require', 'exports', compiled)(name => {
     if (name.endsWith('/annotationDisplay')) return { readJson, errorMessage }
+    if (name.endsWith('/Help')) return {TermHelp:()=>null}
     if (name.endsWith('/taskName')) return { taskName, taskDetails, exportTaskSelection }
     return require(name)
   }, taskManager)
@@ -166,6 +168,13 @@ test('task quantities accept editable integers and count only passed description
   assert.equal(automaticCheckLabels.failed,'自动核验未通过')
   assert.match(providerDiagnosisLabel('vision_model_text_only'), /模型仅支持文本/)
   assert.match(reasonLabel('precheck_visible_but_ambiguous'), /已确认可见.*未能完成消歧/)
+  assert.match(reasonLabel('two_round_blind_scene_grounding_passed'), /两轮定位检查均通过.*计入/)
+  assert.doesNotMatch(reasonLabel('new_reason'), /遇到问题|失败/)
+  assert.equal(recordStatus({status:'calibration_hold'}, {status:'paused'}).label, '自动核验通过')
+  assert.equal(recordStatus({status:'running'}, {status:'paused'}).label, '已暂停')
+  assert.equal(recordStatus({status:'running'}, {status:'running',control:'stop'}).label, '正在停止')
+  assert.equal(recordStatus({status:'needs_evidence',provider_diagnosis:'remote_outcome_unknown'}).tone, 'error')
+  assert.equal(recordStatus({status:'needs_evidence'}).label, '未通过核验')
   const metricCode = ts.transpileModule(readFileSync(new URL('../src/features/tasks/TaskMetrics.tsx', import.meta.url), 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },
   }).outputText
@@ -187,7 +196,7 @@ test('task quantities accept editable integers and count only passed description
   assert.match(html, /任务候选利用率/)
   assert.match(html, /处理耗时 P50/)
   assert.match(html, /122|2 分 2 秒/)
-  assert.match(html, /尚未进行独立盲评/)
+  assert.match(html, /尚未进行独立质量评估/)
   assert.match(html, /已知用量，尚不完整/)
   assert.match(html, /report\?download=true/)
   assert.equal(formatDuration(null), '未测量')
@@ -223,6 +232,7 @@ test('task quantities accept editable integers and count only passed description
       }
     } }
     if (name.endsWith('/annotationDisplay')) return {readJson,errorMessage}
+    if (name.endsWith('/Help')) return {TermHelp:()=>null}
     if (name.endsWith('/taskName')) return { taskName, taskDetails, exportTaskSelection }
     return require(name)
   }, exportComponent)
@@ -400,7 +410,7 @@ test('deletion and rework preserve user decisions when follow-up operations fail
           effects[key]?.cleanup?.();effects[key]={deps,cleanup:fn()}
         })},
       }
-      if(name.endsWith('/annotationDisplay'))return {readJson,readPollingJson,errorMessage,isAnnotationResult,isProcessingRecord,categoryLabel,reasonLabel,providerDiagnosisLabel,phases:{}}
+      if(name.endsWith('/annotationDisplay'))return {readJson,readPollingJson,errorMessage,isAnnotationResult,isProcessingRecord,categoryLabel,reasonLabel,recordStatus,providerDiagnosisLabel,phases:{}}
       if(name.endsWith('/taskName'))return {taskName,parseAnnotationCount}
       if(name.endsWith('/duration'))return {formatDuration,formatTiming,hasIncompleteTiming}
       if(name.endsWith('/navigation'))return {taskLocation,taskUrl,openTask,sampleUrl}
@@ -496,8 +506,9 @@ test('deletion and rework preserve user decisions when follow-up operations fail
         if (!(key in states)) states[key]=key===7?paused:typeof initial==='function'?initial():initial
         return [states[key],value=>{states[key]=typeof value==='function'?value(states[key]):value}]
       }}
-      if (name.endsWith('/annotationDisplay')) return {readJson,readPollingJson,errorMessage,isAnnotationResult,isProcessingRecord,categoryLabel,reasonLabel,providerDiagnosisLabel,phases:{}}
-      if (name.endsWith('/taskName')) return {taskName,parseAnnotationCount}
+      if (name.endsWith('/annotationDisplay')) return {readJson,readPollingJson,errorMessage,isAnnotationResult,isProcessingRecord,categoryLabel,reasonLabel,recordStatus,providerDiagnosisLabel,phases:{}}
+      if (name.endsWith('/Help')) return {TermHelp:()=>null}
+    if (name.endsWith('/taskName')) return {taskName,parseAnnotationCount}
       if (name.endsWith('/duration')) return {formatDuration,formatTiming,hasIncompleteTiming}
       if (name.endsWith('/navigation')) return {taskLocation,taskUrl,openTask,sampleUrl}
       if (name.endsWith('/cameraViews')) return {cameraViewLabel:()=>''}
@@ -661,14 +672,14 @@ test('deletion and rework preserve user decisions when follow-up operations fail
       assert.equal(button('审核通过'),undefined)
       assert.equal(button('仅保存不通过'),undefined)
       assert.equal(button('废弃该样本'),undefined)
-      if (!props.decision) assert.ok(button('保存反馈并让 Agent 返工').props.disabled)
+      if (!props.decision) assert.ok(button('提交反馈并修改').props.disabled)
       nodes().find(n=>n.type==='textarea').props.onChange({target:{value:`  ${feedback.notes}  `}})
-      assert.equal(button('保存反馈并让 Agent 返工').props.disabled,outcome==='goal_reached')
+      assert.equal(button('提交反馈并修改').props.disabled,outcome==='goal_reached')
       if (outcome==='goal_reached') {
         assert.ok(nodes().some(n=>n.props?.className==='notice' && /先手动删除/.test(n.props.children)))
         assert.equal(calls.length,0); assert.equal(props.decision,null); continue
       }
-      button('保存反馈并让 Agent 返工').props.onClick()
+      button('提交反馈并修改').props.onClick()
       assert.ok(props.busy)
       assert.ok(button('正在提交返工…').props.disabled)
       assert.ok(nodes().some(n=>n.props?.role==='status' && /正在保存反馈/.test(n.props.children)))
@@ -684,7 +695,7 @@ test('deletion and rework preserve user decisions when follow-up operations fail
       } else {
         assert.deepEqual(calls.at(-1).body,{revision:feedback.revision,notes:feedback.notes,
           ...(outcome==='empty_failed_round'?{retry_failed_run_id:'failed-round'}:{})})
-        assert.ok(button('保存反馈并让 Agent 返工').props.disabled)
+        assert.ok(button('提交反馈并修改').props.disabled)
         button('查看样本返工').props.onClick()
         assert.equal(opened,'source-job')
       }
@@ -756,8 +767,8 @@ test('deletion and rework preserve user decisions when follow-up operations fail
     task:{status:'running',executor_active:true,control:null,reason:null},
   }))
   assert.match(unmet,/文本核验通过 · 反馈未满足/)
-  assert.match(unmet,/当前证据能力不支持/)
-  assert.match(unmet,/原自动核验结论、样本状态和调用记录未改写/)
+  assert.match(unmet,/暂不支持核验/)
+  assert.match(unmet,/原核验结论、状态和调用记录保留/)
   assert.doesNotMatch(unmet,/返工完成|失败草稿保留供人工判断/)
   const suggestion=renderToStaticMarkup(require('react').createElement(rework.default,{
     items:[{...base,status:'calibration_hold',automatic_passed:true,
@@ -766,7 +777,7 @@ test('deletion and rework preserve user decisions when follow-up operations fail
     task:{status:'running',executor_active:true,control:null,reason:null},
   }))
   assert.match(suggestion,/部分建议未采用/)
-  assert.match(suggestion,/建议／示例/)
+  assert.match(suggestion,/建议/)
   assert.doesNotMatch(suggestion,/返工未通过|反馈未满足|class="error"/)
   const mismatch=renderToStaticMarkup(require('react').createElement(rework.default,{
     items:[{...base,status:'needs_evidence',reason:'description_validation_failed',attempts:[{
@@ -876,7 +887,7 @@ test('sample discard is available outside localization and protects the displaye
       assert.ok(nodes.some(n=>n.type==='p'&&n.props.className==='notice'&&n.props.children?.includes('”列表中，详情仍保留；左侧筛选未改变。')))
       globalThis.window.location.hash=sampleUrl(job.job_id,145);ui.listeners.get('hashchange')()
       nodes=await ui.settle()
-      nodes.find(n=>n.type==='button'&&n.props.children==='填写反馈／Agent 返工').props.onClick()
+      nodes.find(n=>n.type==='button'&&n.props.children==='反馈修改').props.onClick()
       nodes=ui.render()
       nodes.find(n=>n.props?.onRetry).props.onRetry({job_id:job.job_id,ordinal:145,started:true})
       // Once queued, 145 moves from failed to pending. Detail remains pinned;
@@ -932,7 +943,8 @@ test('sample discard is available outside localization and protects the displaye
       }
       if (name.endsWith('/annotationDisplay')) return {readJson,errorMessage,automaticCheckState,automaticCheckLabels,sampleFilterLabels,matchesSampleFilter,categoryLabel,
         objectName:value=>value,manualReviewLabels:{discarded:'已废弃'}}
-      if (name.endsWith('/taskName')) return {taskName:()=> '原任务'}
+      if (name.endsWith('/Help')) return {TermHelp:()=>null}
+    if (name.endsWith('/taskName')) return {taskName:()=> '原任务'}
       if (name.endsWith('/cameraViews')) return {cameraViewLabel:()=> '前方'}
       if (name.endsWith('/navigation')) return {taskLocation,taskUrl,openTask,sampleUrl}
       if(name==='./resultViewState')return resultViewState
@@ -958,7 +970,7 @@ test('sample discard is available outside localization and protects the displaye
           assert.equal(states[5],4104) // Invalid IDs never become list indexes.
           assert.ok(nodes().some(n=>n.props?.className==='error'&&/样本|编号/.test(n.props.children)))
         }
-        nodes().find(n=>n.type==='button'&&n.props.children==='填写反馈／Agent 返工').props.onClick()
+        nodes().find(n=>n.type==='button'&&n.props.children==='反馈修改').props.onClick()
         nodes().find(n=>n.props?.onRetry).props.onRetry({job_id:job.job_id,ordinal:4104,started:true})
         // Selection can change without changing the existing hash. Clicking
         // the SAME receipt URL must still select the intended object.
@@ -980,7 +992,7 @@ test('sample discard is available outside localization and protects the displaye
       assert.equal(discard().props.disabled,['unfinished','discarded'].includes(mode))
       assert.equal(nodes().some(n=>n.type==='button'&&n.props.children==='仅保存不通过'),false)
       if (mode==='ordinary'||mode==='review') {
-        const entry=nodes().find(n=>n.type==='button'&&n.props.children==='填写反馈／Agent 返工')
+        const entry=nodes().find(n=>n.type==='button'&&n.props.children==='反馈修改')
         assert.ok(entry && !entry.props.disabled)
         assert.equal(nodes().some(n=>n.type==='button'&&n.props.children==='开始人工审批'),false)
         entry.props.onClick()
@@ -995,13 +1007,13 @@ test('sample discard is available outside localization and protects the displaye
         assert.equal(nodes().some(n=>n.props?.repairMode),false)
       }
       if(mode==='failed_check'){
-        nodes().find(n=>n.type==='button'&&n.props.children==='开始人工审批').props.onClick()
+        nodes().find(n=>n.type==='button'&&n.props.children==='检查物体定位').props.onClick()
         assert.equal(states[0],true)
         assert.ok(nodes().some(n=>n.props?.role==='status'&&/尚未保存审批/.test(n.props.children)))
         assert.ok(nodes().find(n=>n.type==='button'&&n.props.children==='确认所选物体').props.disabled)
         assert.equal(calls.length,0) // Entering the flow does not silently approve.
         states[0]=false
-        nodes().find(n=>n.type==='button'&&n.props.children==='填写反馈／Agent 返工').props.onClick()
+        nodes().find(n=>n.type==='button'&&n.props.children==='反馈修改').props.onClick()
         const review=nodes().find(n=>n.props?.onRetry)
         review.props.onRetry({job_id:job.job_id,ordinal:12,started:true})
         assert.equal(globalThis.window.location.hash,sampleUrl(job.job_id,12))

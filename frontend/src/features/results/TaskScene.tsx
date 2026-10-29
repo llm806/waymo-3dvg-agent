@@ -17,7 +17,7 @@ const cameraNames: Record<number,string> = {1:'前方',2:'左前方',3:'右前�
 
 export default function TaskScene({ data, selected, onSelect }: { data: TaskSceneData; selected: string; onSelect?: (id: string) => void }) {
   const projectedMode = data.image_box_source === 'official_lidar_box_projection'
-  const imageBoxLabel = projectedMode ? '3D 真值官方投影' : '原生 2D 框'
+  const imageBoxLabel = projectedMode ? '三维标注在图像中的投影' : '图像二维标注框'
   const cameras = data.cameras.map(c=>({...c,native_boxes:projectedMode?(c.projected_boxes??[]):c.native_boxes}))
   const [camera, setCamera] = useState(() => onSelect ? 1 : cameras.find(c=>c.camera_name===data.image_evidence?.recommended_camera&&c.native_boxes.some(b=>b.candidate_id===selected))?.camera_name ?? cameras.find(c=>c.native_boxes.some(b=>b.candidate_id===selected))?.camera_name ?? 1)
   const [loaded, setLoaded] = useState(''), [failed, setFailed] = useState(''), [unlinked, setUnlinked] = useState('')
@@ -32,10 +32,10 @@ export default function TaskScene({ data, selected, onSelect }: { data: TaskScen
     }
   }
   return <div className="task-scene">
-    <div className="scene-legend"><span><i className="box-green" />原生真值框</span><span><i className="box-purple" />{onSelect?'当前选择':'文本对应物体'}</span><span className="muted">点云：原生 3D 框 · 图像：{imageBoxLabel}</span></div>
+    <div className="scene-legend"><span><i className="box-green" />数据标注框</span><span><i className="box-purple" />{onSelect?'当前选择':'描述目标'}</span><details className="inline-help"><summary>图层说明</summary><p>点云中的框为数据集三维标注；图像中的框为{imageBoxLabel}。紫框表示{onSelect?'你选择的物体':'当前描述对应的物体'}。</p></details></div>
     <div className="task-scene-grid">
-      <section className="scene-pane"><h3>点云场景</h3><PointCloudView key={image?.camera_name} cameraView={image?.view_axes} cameraObjectIds={image?.projected_boxes?.map(b=>b.candidate_id).filter((id): id is string => !!id)} preview={data.preview} blind simple initialFocus={!onSelect} selectedObjectId={selected || undefined} onSelectObject={onSelect ? choose : undefined} /><p className="scene-pane-help">{onSelect?'点击框选择物体；':'紫框对应当前文本；'}拖动旋转，滑动缩放条调整大小。</p></section>
-      <section className="scene-pane"><div className="scene-camera-heading"><h3>图像场景</h3><label><span className="sr-only">图像相机</span><select aria-label="图像相机" value={image?.camera_name ?? 1} onChange={e=>{setCamera(Number(e.target.value));setUnlinked('')}}>{cameras.map(c=><option key={c.camera_name} value={c.camera_name}>{cameraNames[c.camera_name]??`相机 ${c.camera_name}`}</option>)}</select></label></div>
+      <section className="scene-pane"><h3>三维点云</h3><PointCloudView key={image?.camera_name} cameraView={image?.view_axes} cameraObjectIds={image?.projected_boxes?.map(b=>b.candidate_id).filter((id): id is string => !!id)} preview={data.preview} blind simple initialFocus={!onSelect} selectedObjectId={selected || undefined} onSelectObject={onSelect ? choose : undefined} /><p className="scene-pane-help">拖动旋转 · 滑条缩放{onSelect?' · 点击框选择物体':''}</p></section>
+      <section className="scene-pane"><div className="scene-camera-heading"><h3>相机图像</h3><label><span className="sr-only">图像相机</span><select aria-label="图像相机" value={image?.camera_name ?? 1} onChange={e=>{setCamera(Number(e.target.value));setUnlinked('')}}>{cameras.map(c=><option key={c.camera_name} value={c.camera_name}>{cameraNames[c.camera_name]??`相机 ${c.camera_name}`}</option>)}</select></label></div>
         {image ? <><div className="native-image">
           <OriginalImagePreview key={image.image} src={image.image} label={cameraNames[image.camera_name]??`相机 ${image.camera_name}`}><img src={image.image} alt="与点云对应的同帧原始相机图像" onLoad={()=>setLoaded(image.image)} onError={()=>setFailed(image.image)} /></OriginalImagePreview>
           {loaded===image.image && <svg viewBox={`0 0 ${image.width} ${image.height}`} aria-label={imageBoxLabel} className={`native-image-boxes${onSelect ? ' selectable' : ''}`}>

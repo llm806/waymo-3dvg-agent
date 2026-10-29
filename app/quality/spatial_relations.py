@@ -10,6 +10,32 @@ POLICY = 'native-3d-spatial-relations-v1'
 LEGACY_READING_POLICY = 'explicit-subject-landmark-v1'
 READING_POLICY = 'explicit-subject-landmark-v2-bidirectional'
 PLAIN_SPATIAL_POLICY = 'plain-spatial-language-v1'
+SIGN_STACK_POLICY = 'contained-native-sign-stack-v1'
+
+
+def contained_sign_stack(first,second,sign):
+    """A separate native proof for vertically separated, contained sign panels.
+
+    The smaller oriented BEV rectangle must be wholly inside the other, both
+    thin panel headings agree, and native Z extents have a positive 2cm gap.
+    Pixel positions, apparent size and pole membership supply no evidence.
+    """
+    if (first.category!='sign' or second.category!='sign'
+            or not first.geometry_valid or not second.geometry_valid or not first.lidar_points or not second.lidar_points
+            or min(*first.size_m,*second.size_m)<=0
+            or min(first.size_m[:2])>.3 or min(second.size_m[:2])>.3):return None
+    angle=abs((first.heading_rad-second.heading_rad+math.pi/2)%math.pi-math.pi/2)
+    if angle>math.radians(15):return None
+    small,large=sorted((first,second),key=lambda o:o.size_m[0]*o.size_m[1])
+    c,s=math.cos(small.heading_rad),math.sin(small.heading_rad)
+    lc,ls=math.cos(large.heading_rad),math.sin(large.heading_rad)
+    for x,y in ((-1,-1),(-1,1),(1,-1),(1,1)):
+        dx=small.center_m[0]+c*x*small.size_m[0]/2-s*y*small.size_m[1]/2-large.center_m[0]
+        dy=small.center_m[1]+s*x*small.size_m[0]/2+c*y*small.size_m[1]/2-large.center_m[1]
+        if abs(dx*lc+dy*ls)>large.size_m[0]/2+1e-8 or abs(-dx*ls+dy*lc)>large.size_m[1]/2+1e-8:return None
+    gap=sign*(first.center_m[2]-second.center_m[2])
+    extents=(first.size_m[2]+second.size_m[2])/2+.02
+    return True if gap>extents else False if gap < -extents else None
 
 
 def native_only(packet):
@@ -133,7 +159,7 @@ def sentence_relation_index(graph, expression, *, policy=READING_POLICY):
             'This index includes every source landmark for these relation keys; no appearance or target filtering.'}
 
 
-def pair_match(relation, subject, landmark, boxes, native):
+def pair_match(relation, subject, landmark, boxes, native, *, sign_stack=False):
     """Three-valued result; unknown identity/geometry is never an exclusion."""
     if subject == landmark:
         return False
@@ -158,6 +184,9 @@ def pair_match(relation, subject, landmark, boxes, native):
         guard=radius(first)+radius(second)+GEOMETRY['axis_guard_m']
         return True if gap>guard else False if gap < -guard else None
     gap=relation.sign*(first.center_m[2]-second.center_m[2])
+    if sign_stack and relation.frame=='native_vertical_aligned':
+        stacked=contained_sign_stack(first,second,relation.sign)
+        if stacked is not None:return stacked
     guard=(first.size_m[2]+second.size_m[2])/2+GEOMETRY['axis_guard_m']
     if relation.frame=='native_vertical_aligned':
         # Overhead/underneath needs a common horizontal footprint, not merely
@@ -169,15 +198,17 @@ def pair_match(relation, subject, landmark, boxes, native):
     return True if gap>guard else False if gap < -guard else None
 
 
-def identifiable_anchor(category, oid, box, record, native):
+def identifiable_anchor(category, oid, box, record, native, *, projected_sign=False):
     from app.quality.visibility_policy import usable_rgb_observation
     if (category=='unknown' or box['category']!=category or record.get('visibility_conflict')
             or not usable_rgb_observation(record,allow_partial=True)):
         return False
     # A projected box may include a different foreground object. Image-only
     # native camera boxes can be 2D landmarks, but never acquire guessed 3D IDs.
-    return oid not in native or box.get('identity_source') in {
+    return (oid not in native or box.get('identity_source') in {
         'native_box_point_correspondence','official_camera_lidar_association'}
+        or projected_sign and category=='sign' and native[oid].geometry_valid and native[oid].lidar_points>0
+        and box.get('identity_source')=='official_lidar_box_projection')
 
 
 def catalog(packet,camera,items,observed,all_ids):
@@ -188,10 +219,11 @@ def catalog(packet,camera,items,observed,all_ids):
     from app.schemas.contracts import Predicate,VisualAttribute
     native={o.object_id:o for o in packet.candidates}
     boxes={b['object_id']:b for b in items}
+    sign_stack=native_only(packet) and packet.task.get('native_sign_stack_policy')==SIGN_STACK_POLICY
     descriptors={}
     for oid,box in boxes.items():
         category=box['category'];record=observed.get(oid,{})
-        if not identifiable_anchor(category,oid,box,record,native) or native_only(packet) and oid not in native:
+        if not identifiable_anchor(category,oid,box,record,native,projected_sign=sign_stack) or native_only(packet) and oid not in native:
             continue
         attributes=landmark_attributes(category,record)
         # Full salient descriptor, each individually confirmed cue, or category
@@ -206,7 +238,7 @@ def catalog(packet,camera,items,observed,all_ids):
     for (category,key),attrs in sorted(descriptors.items()):
         pool=[oid for oid,b in boxes.items() if b['category'] in {category,'unknown'}]
         possible=filter_visual_candidates(pool,attrs,observed)[0]
-        confirmed={oid for oid in possible if identifiable_anchor(category,oid,boxes[oid],observed.get(oid,{}),native)
+        confirmed={oid for oid in possible if identifiable_anchor(category,oid,boxes[oid],observed.get(oid,{}),native,projected_sign=sign_stack)
             and set(key)<={(a.kind,a.value) for a in confirmed_attributes(category,observed[oid])}}
         noun=appearance_phrase(category,attrs).removeprefix('the ')
         descriptor=('an ' if noun[0] in 'aeiou' else 'a ')+noun
@@ -224,11 +256,12 @@ def catalog(packet,camera,items,observed,all_ids):
                 if subject not in boxes:
                     matches[subject]=False if complete else None
                     continue
-                values=[False if subject==anchor else pair_match(relation,subject,anchor,boxes,native)
+                values=[False if subject==anchor else pair_match(relation,subject,anchor,boxes,native,sign_stack=sign_stack)
                     if anchor in supported else None for anchor in possible]
                 matches[subject]=True if True in values else None if None in values else False
             proof={'relation':relation.key,'reference_frame':relation.frame,'camera':camera,'category':category,
                 'attributes':[a.model_dump() for a in attrs],'possible_anchor_ids':sorted(possible),'confirmed_anchor_ids':sorted(supported)}
+            if sign_stack and category=='sign' and relation.frame=='native_vertical_aligned':proof['native_stack_policy']=SIGN_STACK_POLICY
             frame_words=" relative to the ego vehicle's orientation" if relation.frame=='ego_native' else ''
             result.append(Predicate(predicate_id=f'image_joint_spatial:{camera}:{relation.key}:{code}',kind='image_relation',
                 value=json.dumps(proof,sort_keys=True),phrase=f'{relation.words} {descriptor}{frame_words} in the {CAMERA_VIEWS[camera]}',
@@ -244,7 +277,8 @@ def verified_pair(packet,proof,subject,landmark):
     boxes={b['object_id']:b for b in packet.provenance.get('scene_image_candidates',[]) if b['camera_name']==proof['camera']}
     native={o.object_id:o for o in packet.candidates}
     return (subject in native and landmark in proof['confirmed_anchor_ids']
-        and pair_match(BY_KEY[proof['relation']],subject,landmark,boxes,native) is True)
+        and pair_match(BY_KEY[proof['relation']],subject,landmark,boxes,native,
+            sign_stack=packet.task.get('native_sign_stack_policy')==SIGN_STACK_POLICY) is True)
 
 
 def scene_graph(packet,camera,mapping):
@@ -255,6 +289,7 @@ def scene_graph(packet,camera,mapping):
     reverse={oid:cid for cid,oid in mapping.items()}
     ids=sorted(boxes)
     relations=NATIVE_RELATIONS if native_only(packet) else RELATIONS
+    sign_stack=packet.task.get('native_sign_stack_policy')==SIGN_STACK_POLICY
     definitions=[{'key':r.key,'reference_frame':r.frame,'meaning':r.words} for r in relations]
     heading=[]
     if packet.task.get('vehicle_heading_policy')==VEHICLE_HEADING_POLICY:
@@ -267,7 +302,7 @@ def scene_graph(packet,camera,mapping):
         'requires_lateral_alignment':key.startswith('vehicle_directly_')} for key,_,_,words in heading)
     rows=[]
     for anchor in ids:
-        values={r.key:{oid:pair_match(r,oid,anchor,boxes,native) for oid in ids} for r in relations}
+        values={r.key:{oid:pair_match(r,oid,anchor,boxes,native,sign_stack=sign_stack) for oid in ids} for r in relations}
         if anchor in native and native[anchor].category=='vehicle':
             values.update({key:{oid:matcher(native[oid],native[anchor],sign) if oid in native else None for oid in ids}
                 for key,sign,matcher,_ in heading})
@@ -275,6 +310,8 @@ def scene_graph(packet,camera,mapping):
             'true_subject_ids':[reverse[oid] for oid,v in pairs.items() if v is True],
             'unknown_subject_ids':[reverse[oid] for oid,v in pairs.items() if v is None]} for key,pairs in values.items())
     return {'definitions':definitions,'checked_subject_ids':[reverse[oid] for oid in ids],'rows':rows,
+        **({'native_sign_stack_policy':SIGN_STACK_POLICY,
+            'sign_stack_rule':'For thin native sign panels only: parallel headings, complete containment of the smaller oriented horizontal footprint, and separated native vertical extents with >2cm clearance. Both native IDs need nonzero LiDAR evidence. This does not assert a shared pole.'} if sign_stack else {}),
         'semantics':'Each row asserts SUBJECT relation_key LANDMARK, never the reverse. '
         'Within checked_subject_ids, unlisted subjects in an existing row are false; missing rows or IDs are unknown. '
         'Use each definition reference_frame; never substitute image layout for a native relation. '

@@ -1,6 +1,7 @@
 """Versioned evidence contracts, independent of HTTP and model providers."""
 
 from typing import Literal
+import re
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -101,14 +102,23 @@ class EvidencePacket(Contract):
 VisualColor = Literal["white", "black", "gray", "silver", "red", "blue", "green", "yellow", "orange", "brown", "beige", "purple", "pink"]
 VISUAL_COLORS = ("white", "black", "gray", "silver", "red", "blue", "green", "yellow", "orange", "brown", "beige", "purple", "pink")
 VISUAL_ATTRIBUTE_VALUES = {
+    "inscription": (),
     "color": VISUAL_COLORS,
     "upper_clothing_color": VISUAL_COLORS,
     "lower_clothing_color": VISUAL_COLORS,
     "helmet_color": VISUAL_COLORS,
-    "subtype": ("sedan", "suv", "van", "pickup truck", "truck", "bus", "bus section", "excavator", "excavator boom", "excavator body", "motorcycle", "bicycle", "a-frame sign", "construction barricade"),
-    "shape": ("round", "rectangular", "triangular", "diamond shaped", "octagonal"),
-    "feature": ("handheld camera", "binoculars", "visible rear face", "pole mounted", "roof rack", "roof cargo box", "trailer", "stripes", "orange and white stripes", "red and white stripes", "black and yellow stripes", "warning light", "illuminated headlights", "illuminated taillights", "backpack", "handheld bag", "umbrella", "high visibility vest"),
+    "backpack_color": VISUAL_COLORS,
+    "subtype": ("sedan", "suv", "van", "pickup truck", "truck", "bus", "bus section", "excavator", "excavator boom", "excavator body", "motorcycle", "bicycle", "a-frame sign", "construction barricade", "one-way sign", "stop sign", "parking sign"),
+    "shape": ("round", "rectangular", "triangular", "diamond shaped", "octagonal", "x shaped"),
+    "feature": ("handheld camera", "binoculars", "visible rear face", "pole mounted", "roof rack", "roof cargo box", "rear spoiler", "round taillight lenses", "split grille", "trailer", "stripes", "orange and white stripes", "red and white stripes", "black and yellow stripes", "warning light", "illuminated headlights", "illuminated taillights", "backpack", "handheld bag", "umbrella", "high visibility vest"),
 }
+
+
+def valid_inscription(value):
+    text = " ".join(value.split()).upper()
+    return bool(re.fullmatch(r"[A-Z0-9][A-Z0-9 .,\'’&:/()+-]{0,39}",text)
+        and len(text.split()) <= 6 and text not in {"UNKNOWN","UNREADABLE","NONE","N/A"}
+        and "\n" not in value and "\r" not in value)
 
 
 def visual_attribute_schema(schema):
@@ -117,20 +127,23 @@ def visual_attribute_schema(schema):
     kind = "kind" if "kind" in properties else "k"
     value = "value" if "value" in properties else "v"
     schema["oneOf"] = [
-        {"properties": {kind: {"const": name}, value: {"enum": list(values)}}}
+        {"properties": {kind: {"const": name}, value: ({"type":"string","minLength":1,"maxLength":40} if name=="inscription" else {"enum":list(values)})}}
         for name, values in VISUAL_ATTRIBUTE_VALUES.items()]
 
 
 class VisualAttribute(Contract):
     model_config = ConfigDict(json_schema_extra=visual_attribute_schema)
-    kind: Literal["color", "subtype", "shape", "upper_clothing_color", "lower_clothing_color", "helmet_color", "feature"]
-    value: Literal["white", "black", "gray", "silver", "red", "blue", "green", "yellow", "orange", "brown", "beige", "purple", "pink",
-                   "sedan", "suv", "van", "pickup truck", "truck", "bus", "bus section", "excavator", "excavator boom", "excavator body", "motorcycle", "bicycle", "a-frame sign", "construction barricade",
-                   "round", "rectangular", "triangular", "diamond shaped", "octagonal",
-                   "handheld camera", "binoculars", "visible rear face", "pole mounted", "roof rack", "roof cargo box", "trailer", "stripes", "orange and white stripes", "red and white stripes", "black and yellow stripes", "warning light", "illuminated headlights", "illuminated taillights", "backpack", "handheld bag", "umbrella", "high visibility vest"]
+    kind: Literal["inscription", "color", "subtype", "shape", "upper_clothing_color", "lower_clothing_color", "helmet_color", "backpack_color", "feature"]
+    value: str
+
 
     @model_validator(mode="after")
     def supported_value(self):
+        if self.kind == "inscription":
+            if not valid_inscription(self.value):
+                raise ValueError("Inscription must be a readable, literal short phrase (1-40 characters, at most six words); omit unreadable text.")
+            self.value = " ".join(self.value.split()).upper()
+            return self
         allowed = VISUAL_ATTRIBUTE_VALUES[self.kind]
         if self.value not in allowed:
             raise ValueError(f"Attribute kind {self.kind!r} does not allow value {self.value!r}. "

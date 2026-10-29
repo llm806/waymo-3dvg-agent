@@ -15,27 +15,36 @@ POLICY = {"axis_guard_m": 1.0, "rank_range_gap_m": 2.0,
 EGO_PROXIMITY_POLICY = 'native-ego-proximity-v1'
 EGO_NEAR_ID = 'range:ego_near'
 EGO_WORDING_POLICY = 'complete-ego-direction-v1'
+PROVEN_EGO_WORDING_POLICY = 'proven-ego-components-v2'
 
 
 def expand_coordinated_ego_clause(text):
     """Parse shared complements without changing the saved sentence or facts."""
     import re
+    longitudinal = r'(?P<longitudinal>ahead(?:\s+of)?|in\s+front\s+of|behind|to\s+the\s+rear\s+of)'
+    lateral = r'(?:to\s+the\s+)?(?P<lateral>left|right)\s+of'
+    ego = r'\s+(?:the\s+)?ego\s+vehicle\b'
     def expand(match):
-        first = 'behind' if match[1].lower() == 'behind' else 'ahead of'
-        return first + ' the ego vehicle and to the ' + match[2].lower() + ' of the ego vehicle'
-    return re.sub(r'\b(ahead(?: of)?|in front of|behind)\s+and\s+(?:to the\s+)?(left|right)\s+of\s+(?:the\s+)?ego vehicle\b',
-        expand, text, flags=re.I)
+        direction = re.sub(r'\s+', ' ', match['longitudinal'].lower())
+        first = 'behind' if direction in {'behind', 'to the rear of'} else 'ahead of'
+        return first + ' the ego vehicle and to the ' + match['lateral'].lower() + ' of the ego vehicle'
+    # Only share an explicit ego complement across adjacent direction phrases.
+    # A named object between the directions must remain a separate landmark.
+    for first, second in ((longitudinal, lateral), (lateral, longitudinal)):
+        text = re.sub(r'\b' + first + r'\s+and\s+' + second + ego, expand, text, flags=re.I)
+    return text
 
 
 def complete_ego_direction_ids(packet, ids):
-    """Keep a conspicuous cross-axis offset in new wording, not in old truth tables.
+    """Keep both proved ego components without changing geometric truth tables.
 
-    A 22.5 degree center bearing is the conservative wording boundary between
-    cardinal and diagonal language. Every added component still needs the full
-    rotated-footprint proof. This never filters competitors or infers from RGB.
+    V2 retains a companion direction only when the native rotated footprint
+    clears the existing axis guard. Frozen V1 keeps its 22.5 degree wording
+    boundary. This never filters competitors or infers direction from RGB.
     """
     ids = list(dict.fromkeys(ids))
-    if packet.task.get('ego_wording_policy') != EGO_WORDING_POLICY:
+    policy = packet.task.get('ego_wording_policy')
+    if policy not in {EGO_WORDING_POLICY, PROVEN_EGO_WORDING_POLICY}:
         return ids
     axes = {'longitudinal:front':0, 'longitudinal:behind':0, 'lateral:left':1, 'lateral:right':1}
     x, y, _ = packet.target.center_m
@@ -44,16 +53,17 @@ def complete_ego_direction_ids(packet, ids):
             continue
         axis = axes[pid]
         along, across = (x,y) if axis == 0 else (y,x)
-        if abs(across) > abs(along) * math.tan(math.pi/8):
-            companion = ('lateral:left' if y > 0 else 'lateral:right') if axis == 0 else (
-                'longitudinal:front' if x > 0 else 'longitudinal:behind')
+        companion = ('lateral:left' if y > 0 else 'lateral:right') if axis == 0 else (
+            'longitudinal:front' if x > 0 else 'longitudinal:behind')
+        supported = ego_direction_match(packet.target, 1-axis, (y if axis == 0 else x) > 0) is True
+        if (supported if policy == PROVEN_EGO_WORDING_POLICY else abs(across) > abs(along) * math.tan(math.pi/8)):
             if companion not in ids:
                 ids.append(companion)
     return ids
 
 
 def ego_wording_errors(packet, ids):
-    if packet.task.get('ego_wording_policy') != EGO_WORDING_POLICY:
+    if packet.task.get('ego_wording_policy') not in {EGO_WORDING_POLICY, PROVEN_EGO_WORDING_POLICY}:
         return []
     complete = complete_ego_direction_ids(packet, ids)
     errors = ['incomplete_ego_direction'] if set(complete) - set(ids) else []

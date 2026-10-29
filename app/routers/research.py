@@ -18,6 +18,137 @@ from app.datasets.training import read_scene
 router = APIRouter(prefix='/api/research',tags=['independent research audit'])
 
 
+from app.quality.paper_study import StudySpec,Judgment
+
+
+@router.get('/studies')
+def studies(request: Request):
+    return {'studies':request.app.state.paper_studies.list(request.app.state.batches)}
+
+
+@router.post('/studies',status_code=201)
+def create_study(body:StudySpec,request:Request):
+    mutation_origin(request)
+    try:return request.app.state.paper_studies.create(body,request.app.state.batches)
+    except (ValueError,OSError) as exc:raise HTTPException(409,str(exc)) from exc
+
+
+@router.get('/studies/{study_id}')
+def study_detail(study_id:Id,request:Request):
+    try:return request.app.state.paper_studies.detail(study_id,request.app.state.batches)
+    except ValueError as exc:raise HTTPException(409,str(exc)) from exc
+
+
+class StudyControl(Contract):
+    action:Literal['start','pause','freeze','seal']
+
+
+@router.post('/studies/{study_id}/control')
+def study_control(study_id:Id,body:StudyControl,request:Request):
+    mutation_origin(request);store=request.app.state.paper_studies;batch=request.app.state.batches
+    try:
+        s=store.private(study_id)
+        if body.action=='freeze':return store.freeze(study_id,batch)
+        if body.action=='seal':return store.seal(study_id,batch)
+        if s['status'] in {'review','sealed'}:raise ValueError('已进入盲审的实验不能重新执行。')
+        if body.action=='start':
+            store.ensure_method(s['job_id']);batch.control(s['job_id'],'resume')
+        else:batch.control(s['job_id'],'pause')
+        return store.detail(study_id,batch)
+    except (ValueError,OSError) as exc:raise HTTPException(409,str(exc)) from exc
+
+
+@router.get('/studies/{study_id}/report.{format}')
+def study_export(study_id:Id,format:Literal['json','csv'],request:Request):
+    store=request.app.state.paper_studies
+    try:
+        if format=='csv':data=store.export_csv(study_id)
+        else:
+            s=store.private(study_id)
+            if s['status']!='sealed':raise ValueError('报告尚未封存。')
+            data=json.dumps(s['report'],ensure_ascii=False,indent=2)
+        return Response(data,media_type='text/csv' if format=='csv' else 'application/json',
+            headers={'Content-Disposition':f'attachment; filename="paired-study-{study_id}.{format}"'})
+    except ValueError as exc:raise HTTPException(409,str(exc)) from exc
+
+
+@router.get('/review/{token}')
+def study_inbox(token:str,request:Request):
+    try:return request.app.state.paper_studies.inbox(token)
+    except ValueError as exc:raise HTTPException(404,str(exc)) from exc
+
+
+def paper_assets(token,cid,request):
+    store=request.app.state.paper_studies
+    case,review,revealed=store.case(token,cid)
+    packet=EvidencePacket.model_validate(case['payload']['packet'])
+    path=checked_asset(store.root,packet.scene.manifest_path,packet.scene.manifest_sha256)
+    scene,arrays=read_scene(path.parent)
+    if (scene.context,scene.frame_timestamp_micros)!=(packet.context,packet.frame_timestamp_micros):raise ValueError('冻结场景身份不一致。')
+    camera=next(v.camera_name for v in packet.views if v.camera_label==packet.source_view)
+    return case,review,revealed,packet,path,scene,arrays,camera
+
+
+@router.get('/review/{token}/cases/{case_id}')
+def study_case(token:str,case_id:Id,request:Request):
+    try:
+        case,review,revealed,p,path,scene,arrays,camera=paper_assets(token,case_id,request)
+        from app.datasets.inspection import camera_views
+        mapping=case['payload']['mapping'];labels={v:k for k,v in mapping.items()};by_id={o.object_id:o for o in p.candidates}
+        selected=sample_indices(np.arange(len(arrays['points'])),22000)
+        cam=next(c for c in scene.cameras if c.camera_name==camera)
+        boxes=[{'box_id':f'P{i}','candidate_id':labels.get(b['object_id']),'category':b['category'],'xyxy':b['xyxy']}
+            for i,b in enumerate(p.provenance.get('scene_image_candidates',[])) if b.get('camera_name')==camera]
+        return {'case_id':case_id,'expression':case['payload']['expression'],'selection':review.get('selection'),
+            'answer':review.get('answer'),'revealed':revealed,'expected':case['payload']['expected'] if revealed else None,
+            'preview':{'points':arrays['points'][selected,:3].tolist(),'target_points':[],'target_corners':[],
+                'candidate_boxes':[{'object_id':label,'category':by_id[oid].category,'corners':corners(by_id[oid])} for label,oid in mapping.items()],
+                'sampling':'目标无关的全场景预览；完整单帧点云可下载'},
+            'candidates':[{'candidate_id':label,'category':by_id[oid].category} for label,oid in mapping.items()],
+            'cameras':[{'camera_name':camera,'width':cam.width,'height':cam.height,'view_axes':camera_views(path.parent,scene).get(camera),
+                'native_boxes':boxes,'projected_boxes':boxes,'image':f'/api/research/review/{token}/cases/{case_id}/image'}],
+            'full_cloud':f'/api/research/review/{token}/cases/{case_id}/cloud.npz','point_count':len(arrays['points'])}
+    except (ValueError,OSError,StopIteration) as exc:raise HTTPException(409,str(exc)) from exc
+
+
+@router.get('/review/{token}/cases/{case_id}/image')
+def study_image(token:str,case_id:Id,request:Request):
+    try:
+        _,_,_,_,path,scene,_,camera=paper_assets(token,case_id,request)
+        c=next(c for c in scene.cameras if c.camera_name==camera)
+        return FileResponse(checked_asset(path.parent,c.image.path,c.image.sha256))
+    except (ValueError,OSError,StopIteration) as exc:raise HTTPException(409,str(exc)) from exc
+
+
+@router.get('/review/{token}/cases/{case_id}/cloud.npz')
+def study_cloud(token:str,case_id:Id,request:Request):
+    import io
+    try:
+        _,_,_,_,_,_,arrays,_=paper_assets(token,case_id,request)
+        output=io.BytesIO();np.savez_compressed(output,points=arrays['points'])
+        return Response(output.getvalue(),media_type='application/octet-stream',headers={'Content-Disposition':'attachment; filename="single-frame-points.npz"'})
+    except (ValueError,OSError) as exc:raise HTTPException(409,str(exc)) from exc
+
+
+class PaperSelection(Contract):
+    selected_labels:list[str]=Field(max_length=500)
+    elapsed_seconds:float=Field(default=0,ge=0,le=86400,allow_inf_nan=False)
+
+
+@router.post('/review/{token}/cases/{case_id}/localization')
+def study_select(token:str,case_id:Id,body:PaperSelection,request:Request):
+    mutation_origin(request)
+    try:return request.app.state.paper_studies.select(token,case_id,body.selected_labels,body.elapsed_seconds)
+    except ValueError as exc:raise HTTPException(409,str(exc)) from exc
+
+
+@router.post('/review/{token}/cases/{case_id}/answer')
+def study_answer(token:str,case_id:Id,body:Judgment,request:Request):
+    mutation_origin(request)
+    try:return request.app.state.paper_studies.answer(token,case_id,body)
+    except ValueError as exc:raise HTTPException(409,str(exc)) from exc
+
+
 def service(request):
     return request.app.state.research
 

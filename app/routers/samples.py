@@ -388,6 +388,9 @@ def _review_sample(job_id, ordinal, body, request, *, retry_failed_run_id=None):
     mutation_origin(request)
     store = request.app.state.batches.store
     try:
+        from app.quality.paper_study import study_for_job
+        if study_for_job(store.runs,job_id):
+            raise ValueError('科研实验结果已冻结，请在科研评估的独立盲审页提交判断；不能通过日常审核修改。')
         with store.runs.maintenance():
             job, item, state, packet, revision = sample(store, job_id, ordinal,retry_failed_run_id=retry_failed_run_id)
             if retry_failed_run_id and body.verdict != 'rejected':

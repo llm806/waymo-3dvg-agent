@@ -218,6 +218,7 @@ using its schema. These are independently checked against associated images; nev
 Garment colors use upper_clothing_color or lower_clothing_color, never generic color.
 A jacket/coat/shirt describes upper clothing; trousers/pants/skirt describe lower clothing.
 An explicitly colored helmet maps to helmet_color, never color or upper_clothing_color.
+An explicitly colored backpack maps to backpack_color AND feature:backpack, never a garment color.
 For example "the person wearing a black helmet" states category:pedestrian and helmet_color:black.
 The same helmet phrase on a cyclist states helmet_color without changing category:cyclist.
 "In a black top" and "wearing a black top" both state upper_clothing_color:black.
@@ -349,6 +350,7 @@ the word foreground, apparent size, an ordinary derived crop, or partial visibil
 Color/subtype/shape/equipment clauses describing the subject are target visual attributes. Attributes
 inside a landmark noun phrase belong to the landmark predicate, not to the subject. Clothing colors
 use upper_clothing_color/lower_clothing_color; helmet colors use helmet_color. Person means pedestrian.
+An explicitly colored backpack states backpack_color AND feature:backpack; never assign its color to clothing.
 Use only facts actually named; report an unsupported or ambiguous claim instead of inventing a mapping.
 Return JSON with candidate_ids: [], parsed_predicate_ids, parsed_visual_attributes, unsupported_claims.
 Do not choose an object or calculate uniqueness; the deterministic tools do that after parsing."""
@@ -651,36 +653,109 @@ def normalize_visual_predicate_aliases(packet, generated):
         'requires_two_blind_checks':True}
 
 
-def normalize_parsed_scope_attributes(predicates, parsed):
-    """Complete redundant reader fields from that reader's own compound claims.
+WRITER_SCOPE_POLICY = 'selected-scope-attributes-v1'
 
-    No target, writer declarations or observations enter this function. An
-    independently parsed 'leftmost beige sedan' entails beige and sedan for its
-    referred member. Only absent kinds are filled; explicit contradictory values
-    survive and must fail ordinary agreement/appearance/uniqueness checks.
+
+def _complete_scope_attributes(predicates, selected_ids, attributes):
+    """Entail redundant fields from THIS speaker's selected subject conditions.
+
+    No expected target, appearance observations or other speaker's claims enter
+    here. Conflicting explicit attributes, unknown IDs and landmark attributes
+    are never repaired. All ordinary semantic and grounding checks still apply.
     """
     from app.quality.description_search import image_order_attributes
-    selected = set(parsed.parsed_predicate_ids)
+    selected = set(selected_ids)
     required = {}
     for predicate in predicates:
         if predicate.kind == 'image_relation' and predicate.predicate_id in selected:
             for attribute in image_order_attributes(predicate):
                 required.setdefault(attribute.kind, {}).setdefault(attribute.value, []).append(predicate.predicate_id)
-    known = {a.kind for a in parsed.parsed_visual_attributes}
-    attributes = list(parsed.parsed_visual_attributes)
+    known = {a.kind for a in attributes}
+    attributes = list(attributes)
     additions = []
+    backpack_colors=[a for a in attributes if a.kind=='backpack_color']
+    if backpack_colors and not any(a.kind=='feature' and a.value=='backpack' for a in attributes):
+        attribute=VisualAttribute(kind='feature',value='backpack')
+        attributes.append(attribute);known.add('feature')
+        additions.append({'attribute':attribute.model_dump(),
+            'predicate_ids':['attribute:backpack_color='+a.value for a in backpack_colors]})
     for kind, values in sorted(required.items()):
         if kind in known or kind != 'feature' and len(values) != 1:
             continue
         for value, sources in sorted(values.items()):
             attribute = VisualAttribute(kind=kind,value=value)
             attributes.append(attribute)
-            additions.append({'attribute':attribute.model_dump(),'parsed_predicate_ids':sources})
+            additions.append({'attribute':attribute.model_dump(),'predicate_ids':sources})
+    return attributes, additions
+
+
+def normalize_writer_scope_attributes(packet, predicate_ids, attributes):
+    """Bind target attributes already stated by the selected writing conditions.
+
+    This only makes a new proposal. It neither supplies facts from a target nor
+    changes the sentence, reader, evidence, candidate pool or passing verdict.
+    """
+    if packet.task.get('writer_claim_policy') != WRITER_SCOPE_POLICY:
+        return attributes, None
+    completed, additions = _complete_scope_attributes(packet.predicates, predicate_ids, attributes)
+    if not additions:
+        return attributes, None
+    return completed, {'policy':WRITER_SCOPE_POLICY,
+        'raw_visual_attributes':[a.model_dump() for a in attributes],
+        'predicate_ids':list(predicate_ids), 'additions':additions,
+        'requires_appearance_and_two_blind_checks':True}
+
+
+def normalize_parsed_scope_attributes(predicates, parsed):
+    """Complete fields ONLY from this independent reader's compound claims."""
+    attributes, additions = _complete_scope_attributes(predicates,
+        parsed.parsed_predicate_ids, parsed.parsed_visual_attributes)
     if not additions:
         return parsed, None
     return parsed.model_copy(update={'parsed_visual_attributes':attributes}), {
-        'policy':'compound-claim-entailment-v1','additions':additions,
+        'policy':'compound-claim-entailment-v1','additions':[
+            {'attribute':a['attribute'],'parsed_predicate_ids':a['predicate_ids']} for a in additions],
         'scope':'semantic entailment of independently parsed compound predicates; no target-derived facts'}
+
+
+APPEARANCE_EQUIVALENCE_POLICY = 'appearance-claim-equivalence-v1'
+
+
+def appearance_claim_closure(predicates, ids, attributes, expression):
+    """Expand one speaker's equivalent appearance clauses, without target data.
+
+    A registered appearance phrase and explicit camera visibility plus its
+    identical literal attributes have the same meaning. Ranks, landmarks,
+    missing/conflicting attributes and other cameras are never interchangeable.
+    """
+    from app.quality.description_search import image_order_attributes
+    by_id={p.predicate_id:p for p in predicates}
+    expanded=set(ids); scopes=set(); additions=[]
+    spoken={(a.kind,a.value) for a in attributes}
+    explicit_visible=bool(re.search(r'\bvisible\b',expression,re.I))
+    for pid in ids:
+        p=by_id.get(pid)
+        if p is None or p.kind!='image_relation':continue
+        parts=pid.split(':')
+        if len(parts)!=3:continue
+        if parts[0]=='image_visibility':scopes.add((parts[1],parts[2]))
+        elif parts[0]=='image_attribute' and explicit_visible:
+            required=image_order_attributes(p)
+            if required and all((a.kind,a.value) in spoken for a in required):
+                visible=f'image_visibility:{parts[1]}:{parts[2].split("~")[0]}'
+                if visible in by_id:
+                    expanded.add(visible);scopes.add((parts[1],parts[2].split('~')[0]))
+    for p in predicates:
+        parts=p.predicate_id.split(':')
+        if p.kind!='image_relation' or len(parts)!=3 or parts[0]!='image_attribute':continue
+        if (parts[1],parts[2].split('~')[0]) not in scopes:continue
+        required=image_order_attributes(p)
+        if not required or not all((a.kind,a.value) in spoken for a in required):continue
+        # Keep any explicit conflicting value of a single-valued kind.
+        if any(a.kind!='feature' and any(kind==a.kind and value!=a.value for kind,value in spoken) for a in required):continue
+        expanded.add(p.predicate_id)
+    additions=sorted(expanded-set(ids))
+    return sorted(expanded),additions
 
 
 def image_scope_errors(packet, expression, predicates, *, check_order=False):
@@ -696,11 +771,12 @@ def image_scope_errors(packet, expression, predicates, *, check_order=False):
         if predicate.predicate_id.startswith('image_visibility:') and not re.search(r'\bvisible\b',text):
             errors.append('image_visibility_not_explicit_in_text')
         if check_order and predicate.predicate_id.startswith('image_joint_spatial:'):
-            from app.quality.spatial_relations import BY_KEY
+            from app.quality.spatial_relations import BY_KEY,SIGN_STACK_POLICY
             relation=BY_KEY.get(json.loads(predicate.value).get('relation'))
             # An early omission guard only; the fresh blind parses still check
             # attribute binding, scope and every actual claim in the sentence.
-            if relation is None or not re.search(r'\b'+re.escape(relation.words)+r'\s+(?:a|an)\b',text):
+            article=(r'(?:a|an|another)' if packet.task.get('native_sign_stack_policy')==SIGN_STACK_POLICY else r'(?:a|an)')
+            if relation is None or not re.search(r'\b'+re.escape(relation.words)+r'\s+'+article+r'\b',text):
                 errors.append('declared_joint_relation_not_in_text')
             if relation is not None and relation.frame=='ego_native' and not re.search(
                     r"\bego vehicle(?:'s)? (?:orientation|axes|coordinate frame)\b",text):
@@ -749,6 +825,9 @@ def draft_reference_errors(packet, generated, observations=None):
     chosen = set(generated.predicate_ids)
     predicates = [p for p in packet.predicates if p.predicate_id in chosen]
     errors = (['non_scene_reference_cue'] if any(not draft_reference_predicate(packet,p) for p in predicates) else [])
+    from app.quality.joint_reference import COMPOSITION_POLICY, composition_errors
+    if packet.task.get('sentence_composition_policy') == COMPOSITION_POLICY:
+        errors.extend(composition_errors(packet,{'predicate_ids':generated.predicate_ids},generated.expression))
     if packet.task.get('sentence_style_policy') == 'simple-sufficient-sentence-v1':
         from app.quality.joint_reference import simple_sentence_errors
         errors.extend(simple_sentence_errors(generated.expression))
@@ -810,9 +889,20 @@ def image_framing_description(expression):
 
 def claim_payload(packet: EvidencePacket, expression: str, seed: int) -> tuple[dict, dict[str, str]]:
     payload, mapping = blind_payload(packet, expression, seed)
+    if packet.task.get('sign_inscription_policy') == 'literal-sign-inscription-v1':
+        payload['literal_text_claim_rule']=('If the sentence says a sign reads/is marked with a '
+            'short inscription, parse its literal phrase as kind=inscription. Do not invent text from '
+            'sign type, image memory or vocabulary. Preserve uncertainty and report unspoken/unsupported claims.')
     del payload["candidates"]
     random.Random(seed).shuffle(payload["predicate_vocabulary"])
     payload["grounding_mode"] = "blind_claim_parse_then_native_geometry"
+    if packet.task.get('blind_parse_scope_policy')=='literal-text-parse-v1':
+        payload['parse_channels']={
+            'visual_attributes':'Extract the SUBJECT descriptors literally into parsed_visual_attributes using the attribute schema. This channel is independent of predicate_vocabulary.',
+            'predicates':'Map subject category and actually stated spatial/visibility clauses to provided predicate IDs only.',
+            'unsupported_claims':'Only a literal assertion that cannot be represented in either channel; not absence of photographs, observations or a compound predicate.'}
+        schema=payload.setdefault('output_schema',GroundResult.model_json_schema())
+        schema['required']=list(dict.fromkeys([*schema.get('required',[]),'parsed_visual_attributes']))
     from app.quality.description_search import minimal_reference_policy
     if minimal_reference_policy(packet):
         from app.quality.description_search import draft_reference_predicate
@@ -823,6 +913,20 @@ def claim_payload(packet: EvidencePacket, expression: str, seed: int) -> tuple[d
             'also report its literal target attributes and category. Never add an unspoken appearance, '
             'ego direction or landmark. Camera scope alone does not imply an image_attribute predicate.')
     return payload, mapping
+
+
+def literal_parse_instruction(packet):
+    if packet.task.get('blind_parse_scope_policy')!='literal-text-parse-v1':return ''
+    return ('\nThis request is TEXT PARSING, not visual truth verification. There is intentionally no image or '
+        'designated object. First extract each literal SUBJECT color, type, inscription, shape or accessory '
+        'into parsed_visual_attributes using its schema; then independently map category and relation clauses '
+        'to predicate_vocabulary. Schema-defined colors and sign types, and a literally quoted/reading inscription, '
+        'are representable attributes even if no compound predicate contains all of them. Do not require such '
+        'a compound ID or photographic evidence to parse an assertion. Do not put a representable literal '
+        'attribute in unsupported_claims merely because its truth is not supplied here. Truth, identity and '
+        'uniqueness are checked separately by the observation and native tools. Do not infer missing words, '
+        'attributes, camera scope, negated claims or landmark attributes as subject attributes. '
+        'Always return parsed_visual_attributes; [] only if the SUBJECT has no asserted visual descriptors.')
 
 
 def verify_tool_grounding(packet: EvidencePacket, generated: GeneratedExpression, parsed: GroundResult,
@@ -837,7 +941,8 @@ def verify_tool_grounding(packet: EvidencePacket, generated: GeneratedExpression
     scope_entailment = None
     if packet.task.get('claim_normalization_policy') == 'compound-claim-entailment-v1':
         parsed, scope_entailment = normalize_parsed_scope_attributes(packet.predicates, parsed)
-    def closure(ids):
+    equivalence=[]
+    def closure(ids,attributes):
         by_id = {p.predicate_id: p for p in packet.predicates}
         expanded = set(ids)
         # The compound rule's named region and category are semantic entailments,
@@ -871,9 +976,13 @@ def verify_tool_grounding(packet: EvidencePacket, generated: GeneratedExpression
                     _, _, category, longitudinal, lateral, distance = parts
                     implied = [f"category:{category}", f"longitudinal:{longitudinal}", f"lateral:{lateral}", f"range:{distance}"]
                     expanded.update(p for p in implied if p in by_id)
+        if packet.task.get('appearance_equivalence_policy') == APPEARANCE_EQUIVALENCE_POLICY:
+            expanded,added=appearance_claim_closure(packet.predicates,expanded,attributes,generated.expression)
+            equivalence.append({'input_predicate_ids':sorted(ids),'entailed_predicate_ids':added,
+                'visual_attributes':[a.model_dump() for a in attributes]})
         return sorted(expanded)
-    normalized_generated = generated.model_copy(update={"predicate_ids": closure(generated.predicate_ids)})
-    normalized_parsed = parsed.model_copy(update={"parsed_predicate_ids": closure(parsed.parsed_predicate_ids)})
+    normalized_generated = generated.model_copy(update={"predicate_ids": closure(generated.predicate_ids,generated.visual_attributes)})
+    normalized_parsed = parsed.model_copy(update={"parsed_predicate_ids": closure(parsed.parsed_predicate_ids,parsed.parsed_visual_attributes)})
     feedback = verify(packet, normalized_generated, normalized_parsed, mapping)
     errors = [e for e in feedback["errors"] if e != "blind_reground_not_unique_target"]
     from app.quality.description_search import traffic_scene_policy
@@ -991,6 +1100,8 @@ def verify_tool_grounding(packet: EvidencePacket, generated: GeneratedExpression
         **({'multimodal_candidate_proof': search_proof} if search_proof is not None else {}),
         "raw_declared_predicate_ids": generated.predicate_ids, "raw_parsed_predicate_ids": parsed.parsed_predicate_ids,
         "claim_normalization": "named-class rank, camera order and vertical-region entailment closure; no target-derived facts",
+        **({'appearance_claim_equivalence':{'policy':APPEARANCE_EQUIVALENCE_POLICY,'speakers':equivalence,
+            'scope':'each speaker own claims only; appearance, unknown rivals and both blind rounds remain required'}} if equivalence else {}),
         "raw_vlm_grounding": {"provided": bool(parsed.candidate_ids),
             "correct_target": feedback["blind_candidates"] == [packet.target_object_id] if parsed.candidate_ids else None,
             "candidate_ids": parsed.candidate_ids, "role": "diagnostic only; not authoritative grounding"},
@@ -1043,6 +1154,9 @@ def blind_payload(packet: EvidencePacket, expression: str, seed: int = 17) -> tu
 def verify(packet: EvidencePacket, generated: GeneratedExpression, grounded: GroundResult,
            mapping: dict[str, str]) -> dict:
     errors = expression_policy_errors(generated.expression)
+    from app.quality.joint_reference import COMPOSITION_POLICY, composition_errors
+    if packet.task.get('sentence_composition_policy') == COMPOSITION_POLICY:
+        errors.extend(composition_errors(packet,{'predicate_ids':generated.predicate_ids},generated.expression))
     if packet.task.get('sentence_style_policy') == 'simple-sufficient-sentence-v1':
         from app.quality.joint_reference import simple_sentence_errors
         errors.extend(simple_sentence_errors(generated.expression))
@@ -1140,40 +1254,54 @@ def appearance_messages(packet: EvidencePacket) -> list[dict]:
     """Independent observation: no generated text, claimed attributes or coordinates."""
     from app.schemas.contracts import VisualObservation
     from app.agent.observation_wire import RGBVisualObservation, VehicleVisualObservation
-    from app.agent.appearance import OBSERVATION_SCOPE_GUIDE
+    from app.agent.appearance import OBSERVATION_SCOPE_GUIDE, sign_detail_instruction, sign_inscription_instruction, sign_shape_instruction,person_observation_instruction,vehicle_detail_instruction
     schema = VehicleVisualObservation if packet.target.category == 'vehicle' else RGBVisualObservation
-    from app.quality.joint_reference import feedback_target_features
+    from app.quality.joint_reference import feedback_attribute_kinds
     content = [{"type": "text", "text": json.dumps({"output_schema": schema.model_json_schema(),
         'expected_category': packet.target.category,
         'identity_instruction': 'Observe the target of this category inside the final tight crop. '
             'The full scene and wider crop are context only. If the tight crop shows an occluder or a different '
             'category, report target_visible=false; never describe that other object as the target. '
             'For a padded image, only its indicated original RGB region belongs to the evidence.'})}]
-    if feedback_target_features(packet.task):
+    if feedback_attribute_kinds(packet.task):
         payload = json.loads(content[0]['text'])
-        payload['attribute_focus'] = ['feature']
-        payload['attribute_focus_instruction'] = ('Inspect the target hands, held items and carried accessories separately. '
-            'Report confirmed device types in attributes and omit uncertain types. No expected value is supplied.')
+        payload['attribute_focus'] = feedback_attribute_kinds(packet.task)
+        payload['attribute_focus_instruction'] = ('Reinspect these kinds on this target, including the visible sign panel surface and held items as applicable. '
+            'For a sign seen from behind, inspect the visible back surface color, not its pole/stand or hidden printed face. '
+            'Report only confirmed attributes and omit uncertain values. No expected color or feature value is supplied.')
         content[0]['text'] = json.dumps(payload)
     for view in appearance_views(packet):
         strict = checks_rgb_visibility(packet)
         kinds = ['scene', 'appearance_context', 'appearance'] if strict else ['appearance']
+        point_guide = (packet.task.get('identity_point_guidance_policy') == 'box-point-owner-guide-v1'
+            and 'appearance_points' in view.artifacts)
+        if point_guide:
+            # Existing native-box returns supplement the raw photographs;
+            # they neither change the crop nor certify visible surfaces.
+            kinds.insert(kinds.index('appearance'), 'appearance_points')
         for kind in kinds:
             if kind not in view.artifacts:
                 raise ValueError('Visibility evidence lacks raw scene/context; prepare the target again')
             name = view.artifacts[kind]
             image = checked_asset(EVIDENCE_ROOT / packet.packet_id, name, packet.provenance['artifact_sha256'][name]).read_bytes()
             image, mime, note = observation_image_input(image)
+            ownership = (' Cyan dots are official camera projections of LiDAR returns contained in THIS native 3D box. '
+                'They help distinguish which visible unit belongs to this native box when its rectangle contains several vehicles. '
+                'They are NOT an instance mask, a color/texture measurement or proof of visibility. '
+                'Compare the same surfaces in the unmarked photographs. If dots lie on a foreground roof while a pickup '
+                'is behind it, do NOT borrow that pickup body, paint or subtype for the foreground unit. '
+                'A roof sliver does not establish sedan/SUV/pickup subtype. If ownership remains uncertain, '
+                'report uncertainty so another camera/frame can be examined.' if kind == 'appearance_points' else '')
             content.extend([{'type': 'text', 'text': f'Target {kind}, camera {view.camera_label}; identity source: {view.appearance_identity_source}. '
                 f'Original camera image: {view.width}x{view.height}; '
                 f'selected unit projection touches original camera boundary: {view.projection_touches_boundary}. '
                 'The red rectangle in the context image marks the selected unit; the tight crop shows its detail. '
                 'An official 3D projection is a region, not an instance mask: do not describe an occluder or neighboring object. '
                 'Neither a rectangle nor projected LiDAR returns prove the object is visible. '
-                'If the target itself cannot be recognized separately, target_visible=false.' + note},
+                'If the target itself cannot be recognized separately, target_visible=false.' + ownership + note},
                 {'type': 'image_url', 'image_url': {'url': f'data:{mime};base64,' + base64.b64encode(image).decode()}}])
     from app.agent.appearance import visibility_instruction
-    return [{"role": "system", "content": OBSERVATION_SCOPE_GUIDE + visibility_instruction(packet) + "Observe the object in the supplied identity-checked target crops. "
+    return [{"role": "system", "content": OBSERVATION_SCOPE_GUIDE + vehicle_detail_instruction(packet) + person_observation_instruction(packet) + sign_detail_instruction(packet) + sign_inscription_instruction(packet) + sign_shape_instruction(packet) + visibility_instruction(packet) + "Observe the object in the supplied identity-checked target crops. "
              "Independently report ONLY clearly visible attributes using the schema. No guessing from surroundings, "
              "shadow, highlights or occluders. If multiple objects make identity unclear, target_visible=false. "
              "For a vehicle, report vehicle_colors with separate dominant body paint and roof paint; use null for an uncertain part. "

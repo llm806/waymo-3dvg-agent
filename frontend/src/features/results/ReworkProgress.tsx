@@ -45,9 +45,9 @@ export default function ReworkProgress({items, task, measuredAt, preparationLabe
   failureLabel?:(value:string)=>string
 }) {
   if (!items.length) return null
-  return <section className="sample-rework rework-progress" aria-label="Agent 返工进度">
-    <div className="section-heading"><div><h2>Agent 返工进度</h2><p className="section-caption">根据人工反馈修正原样本；自动核验与人工审批的结论分别保留。</p></div>
-      {measuredAt&&<span className="muted">状态同步于 {new Date(measuredAt*1000).toLocaleTimeString('zh-CN',{hour12:false})}</span>}</div>
+  return <section className="sample-rework rework-progress" aria-label="反馈修改进度">
+    <div className="section-heading"><h2>修改进度</h2>
+      {measuredAt&&<span className="muted">更新于 {new Date(measuredAt*1000).toLocaleTimeString('zh-CN',{hour12:false})}</span>}</div>
     {items.map(item=>{
       const view = reworkPresentation(item,task)
       const failure = item.reason || (view.state==='waiting' ? task.reason : null)
@@ -61,23 +61,26 @@ export default function ReworkProgress({items, task, measuredAt, preparationLabe
         {failure&&!item.automatic_passed&&<p className={view.state==='failed'&&!item.manual_approved?'error':'notice'} role="status">{item.manual_approved?'当前版本已由人工审批纳入可用集，自动核验的原失败记录保留。':failureLabel(failure)}</p>}
         {view.state==='failed'&&!item.automatic_passed&&item.attempt_limit&&item.attempts&&item.attempts.length>=item.attempt_limit&&<p className="muted">已达到本轮最多 {item.attempt_limit} 版草稿（含首稿）；剩余调用额度不会自动增加改写次数。</p>}
         {view.state==='waiting'&&<p className="muted">{task.status==='queued'?'前序任务结束后接续；排队暂停时需先继续队列。':task.executor_active&&!task.control?'执行器会在有空位时处理这条返工。':'请在原任务中开始或继续；无需再次提交反馈。'} {jobId&&<a href={taskUrl(jobId)}>打开任务控制</a>}</p>}
-        {accepted&&<div className="rework-feedback"><strong>当前描述 · 自动核验通过</strong><p lang="en">{accepted.expression}</p><p className="muted">自动核验检查文本定位与真实性；反馈是否完整满足需单独确认。下方失败草稿保留为修改历史。</p></div>}
+        {accepted&&<div className="rework-feedback"><strong>修改后描述 · 自动核验通过</strong><p lang="en">{accepted.expression}</p></div>}
         {item.feedback&&<div className="rework-feedback"><strong>本次人工反馈</strong><p>{item.feedback}</p></div>}
         {item.feedback_check&&<div className="rework-feedback"><strong>反馈要求检查</strong>
-          {item.feedback_check.requirements.map(requirement=><p key={`${requirement.kind}:${requirement.label}`} className={['unsupported','missing','not_verified'].includes(requirement.status)?requirement.required===false?'notice':'error':'muted'}>
-            {requirement.label}{requirement.required===false?'（建议／示例）':''}：{({covered:requirement.kind==='concision'?'精简检查已满足（定位核验另计）':'已写入描述',missing:requirement.required===false?'未采用':'尚未落实',unsupported:'当前证据能力不支持',pending:'待检查',not_verified:'本轮未完成核验'} as Record<string,string>)[requirement.status]??requirement.status}。{requirement.reason}
-          </p>)}
-          {!item.feedback_check.requirements.length&&<p className="muted">此条自由文本反馈尚无自动验收规则，请人工确认是否满足。</p>}
-          {item.feedback_check.historical&&<p className="muted">这是对历史返工的补充提示；原自动核验结论、样本状态和调用记录未改写。</p>}
+          {item.feedback_check.requirements.map(requirement=><div key={`${requirement.kind}:${requirement.label}`} className={`feedback-requirement ${requirement.status}`}>
+            <span>{requirement.label}{requirement.required===false?'（建议）':''}：{({covered:requirement.kind==='concision'?'表达检查通过':'已写入描述',missing:requirement.required===false?'未采用':'未落实',unsupported:'暂不支持核验',pending:'待检查',not_verified:'未完成核验'} as Record<string,string>)[requirement.status]??requirement.status}</span>
+            {requirement.reason&&(requirement.status==='missing'
+              ? <p className="muted">{requirement.reason}</p>
+              : <details className="inline-help"><summary>说明</summary><p>{requirement.reason}</p></details>)}
+          </div>)}
+          {!item.feedback_check.requirements.length&&<p className="muted">这项反馈需人工确认是否落实。</p>}
+          {item.feedback_check.historical&&<details className="inline-help"><summary>历史记录说明</summary><p>以上为补充解读，原核验结论、状态和调用记录保留。</p></details>}
         </div>}
-        {item.previous_expression&&<div className="rework-previous"><strong>返工前描述</strong><p lang="en">{item.previous_expression}</p></div>}
-        {item.attempts?.map((attempt,index)=>accepted===attempt ? null : <details key={index} className="rework-attempt" open={!accepted&&index===item.attempts!.length-1}>
+        {item.previous_expression&&<details className="rework-previous"><summary>修改前的描述</summary><p lang="en">{item.previous_expression}</p></details>}
+        {item.attempts?.map((attempt,index)=>accepted===attempt ? null : <details key={index} className="rework-attempt">
           <summary>{accepted?'历史草稿':'返工草稿'} {index+1}{attempt.errors.length?' · 未通过':item.automatic_passed&&index===item.attempts!.length-1?' · 自动核验通过':' · 核验中'}</summary>
           <p lang="en">{attempt.expression}</p>
-          {[...new Set(attempt.errors)].map(error=><p className="error" key={error}>{errorLabels[error]??failureLabel(error)}</p>)}
+          {!!attempt.errors.length&&<ul className="check-error-list">{[...new Set(attempt.errors)].map(error=><li key={error}>{errorLabels[error]??failureLabel(error)}</li>)}</ul>}
           {!!attempt.unsupported_claims?.length&&<p className="muted">尚无证据支持的文本片段：{attempt.unsupported_claims.join('；')}</p>}
-          {attempt.errors.some(error=>['declared_expression_not_unique','parsed_expression_not_symbolically_unique','image_expression_not_unique'].includes(error))&&<p className="muted">仍保留 {attempt.native_remaining??'未知数量的'} 个原生 3D 候选、{attempt.image_remaining??'未知数量的'} 个未排除的图像对象（包含未知对象，不代表都已确认符合属性）。</p>}
-          <p className="muted">已执行 {attempt.ground_rounds} 次盲解析核验{attempt.binding_retries ? `（含 ${attempt.binding_retries} 次地标编号复核；原失败保留，通过仍需两轮有效核验）` : ''}</p>
+          {attempt.errors.some(error=>['declared_expression_not_unique','parsed_expression_not_symbolically_unique','image_expression_not_unique'].includes(error))&&<p className="muted">尚未排除：{attempt.native_remaining??'数量未知的'} 个三维物体、{attempt.image_remaining??'数量未知的'} 个图像物体；其中可能包含未确认的对象。</p>}
+          <p className="muted">已完成 {attempt.ground_rounds} 轮定位核验{attempt.binding_retries ? ` · 编号复核 ${attempt.binding_retries} 次` : ''}</p>
         </details>)}
         <div className="rework-record-footer"><span className="muted">{item.run_id?`本次运行模型调用 ${item.calls} / ${item.call_budget} 次`:'尚未进入模型调用阶段'}</span>
           {view.state==='failed'&&!item.automatic_passed&&<span className="muted">{item.manual_approved?'当前版本已人工审批，可纳入后续导出。':item.attempts?.length?'失败草稿保留供人工判断；人工审批通过后可纳入可用集。':'本轮未生成新草稿；返工前版本仅供查看，不能直接审批。'}</span>}</div>

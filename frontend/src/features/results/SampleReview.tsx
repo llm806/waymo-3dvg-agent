@@ -69,28 +69,28 @@ export default function SampleReview({ jobId, ordinal, revision, canReview, canR
   }
 
   const unavailable = busy || !revision || !canReview
-  return <section className={`sample-review${repairMode ? ' sample-rework' : ''}`} aria-label={repairMode ? '样本反馈与返工' : '人工审核结论'}>
-    <div className="section-heading"><h3>{repairMode || approvalInHeader ? '反馈与返工' : '人工审核'}</h3>
+  return <section className={`sample-review${repairMode ? ' sample-rework' : ''}`} aria-label={repairMode ? '样本反馈修改' : '人工审核结论'}>
+    <div className="section-heading"><h3>{repairMode || approvalInHeader ? '反馈修改' : '人工审核'}</h3>
       <strong className={`review-status ${decision?.verdict ?? ''}`}>{decision ? manualReviewLabels[decision.verdict] : '待审核'}</strong>
       {onClose && <button className="text-button" disabled={busy} onClick={onClose}>收起</button>}
     </div>
-    {repairMode && <p className="rework-guidance">先核对文本与图中目标：能指出描述问题时填写反馈并交给 Agent 修正；无法确认目标身份或无法消歧时，可废弃此版本。暂时不能判断可先保留待查；局部遮挡本身不构成废弃理由。</p>}
-    <label>{repairMode || approvalInHeader ? '问题与修正建议（用于返工）' : '审核意见'}<textarea ref={notesField} value={notes} maxLength={2000} disabled={busy}
-      placeholder="返工时请说明问题，例如：颜色不符、指向多个物体、缺少区分线索。Agent 会据此修正。"
+    {repairMode && <p className="rework-guidance">说明哪里不准确，系统会重新观察并修改。</p>}
+    <label>{repairMode || approvalInHeader ? '问题与修改建议' : '审核意见'}<textarea ref={notesField} value={notes} maxLength={2000} disabled={busy}
+      placeholder="例如：应为白色轿车；删除不准确的前后关系。"
       onChange={e => setNotes(e.target.value)} /></label>
     {!repairMode && !localizationCorrect && <p className="muted">请在图像或点云中选择物体，在场景上方确认定位并提交审批；无法唯一定位时，可填写反馈返工或废弃当前版本。</p>}
     {!canReview && <p className="muted">{canRetry?'上轮返工已结束但未生成新描述，可以针对当前展示的旧描述再次提交反馈返工；旧版本不能直接审批。':'当前版本暂不可提交审核或返工，请查看下方返工状态。'}</p>}
     <div className="controls">
       {!repairMode && !approvalInHeader && <button className={!automaticPassed?'primary':undefined} disabled={unavailable || !localizationCorrect} onClick={() => void save('accepted')}>{automaticPassed?'审核通过':'人工审批通过并纳入可用集'}</button>}
-      <button className="primary" disabled={busy || !revision || !canRetry || !notes.trim() || !!retry || taskGoalReached} onClick={() => void regenerate()}>{submittingRetry ? '正在提交返工…' : '保存反馈并让 Agent 返工'}</button>
+      <button className="primary" disabled={busy || !revision || !canRetry || !notes.trim() || !!retry || taskGoalReached} onClick={() => void regenerate()}>{submittingRetry ? '正在提交返工…' : '提交反馈并修改'}</button>
     </div>
     {!repairMode&&!automaticPassed&&<p className="muted">人工审批将当前描述纳入可用集和后续导出；自动未通过的结论与原因保留。请结合完整图像和点云核对描述，并先正确确认物体定位。</p>}
     {submittingRetry && <p className="notice" role="status" aria-live="polite">{waiting
       ? '后台仍未返回返工确认，反馈可能已保存。请勿重复点击；可刷新当前样本查看返工状态。'
       : '正在保存反馈并安排原任务返工，后台确认后会显示结果…'}</p>}
     {taskGoalReached && <p className="notice">本任务已达到目标条数，该条暂不能返工；请先手动删除一条有效标注，腾出名额。</p>}
-    <p className="muted rework-budget">返工会保存“人工不通过”结论和反馈，并将反馈交给模型修正，为本次返工分配最多 12 次新调用额度，在当前任务内重试，通过后计入本任务合格数量。达到任务目标时须先手动删除一条有效标注，腾出名额。同一次反馈重复提交不重复加额，历史调用与费用保留。新描述仍须通过自动核验。</p>
-    {retry && <div className="notice" role="status"><span>{retry.message ?? (retry.started ? 'Agent 已在原任务内重试；原样本及审核意见保留。' : '该样本已加入原任务等待重试。')}</span>
+    <details className="inline-help rework-budget"><summary>修改规则与调用额度</summary><p>返工会保存“人工不通过”结论和反馈，并将反馈交给模型修正，为本次返工分配最多 12 次新调用额度，在当前任务内重试，通过后计入本任务合格数量。达到任务目标时须先手动删除一条有效标注，腾出名额。同一次反馈重复提交不重复加额，历史调用与费用保留。新描述仍须通过自动核验。</p></details>
+    {retry && <div className="notice" role="status"><span>{retry.message ?? (retry.started ? '系统 已在原任务内重试；原样本及审核意见保留。' : '该样本已加入原任务等待重试。')}</span>
       <button disabled={busy} onClick={() => onOpenRetry(retry.job_id)}>查看样本返工</button>
       {!retry.started && <a href={sampleUrl(retry.job_id,ordinal)}>查看该样本进度</a>}
     </div>}

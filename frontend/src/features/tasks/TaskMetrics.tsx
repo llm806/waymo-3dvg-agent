@@ -29,12 +29,12 @@ export default function TaskMetrics({ metrics: m, jobId }: { metrics: TaskMetric
   if (m.schema_version !== 'task-metrics-v1') return <p className="notice">重启后端后可查看新版任务指标；旧任务缺失的计时不会补算。</p>
   const latency = m.speed.item_active_seconds
   return <section className="panel task-metrics" aria-label="任务统计">
-    <div className="section-heading"><div><h2>任务统计</h2><p className="section-caption">以物体轨迹计数；仅统计本任务，续接任务分别报告。</p></div><a className="button-link" href={`/api/batches/${jobId}/report?download=true`}>导出指标 JSON ↓</a></div>
+    <div className="section-heading"><div><h2>任务统计</h2><p className="section-caption">仅统计当前任务，同一物体只算一次。</p></div><a className="button-link" href={`/api/batches/${jobId}/report?download=true`}>导出统计 JSON ↓</a></div>
     <p className="muted">候选 {m.counts.pool} · 已尝试 {m.counts.attempted} · 已结束 {m.counts.settled} · 当前可用 {m.counts.passed} · 未尝试 {m.counts.unattempted}{m.counts.reused ? ` · 复用 ${m.counts.reused}` : ''}</p>
     {m.counts.human_approved!=null&&<p className="muted">自动核验通过 {m.counts.automatic_passed??0} · 人工审批纳入 {m.counts.human_approved}；人工审批不计入自动核验通过率。</p>}
     <div className="metric-grid">
       <div><span>任务候选利用率</span><strong>{percent(m.coverage.pool_utilization)}</strong><small>通过 / 本任务候选：{fraction(m.coverage.pool_utilization)}</small></div>
-      <div><span>本地数据集利用率</span><strong>{percent(m.coverage.dataset_utilization)}</strong><small>通过 / 目录全部轨迹：{fraction(m.coverage.dataset_utilization)}</small></div>
+      <div><span>数据集标注覆盖率</span><strong>{percent(m.coverage.dataset_utilization)}</strong><small>通过描述 / 数据集物体总数：{fraction(m.coverage.dataset_utilization)}</small></div>
       <div><span>尝试通过率</span><strong>{percent(m.coverage.pass_per_settled)}</strong><small>通过 / 已结束尝试：{fraction(m.coverage.pass_per_settled)}</small></div>
       <div><span>任务墙钟用时</span><strong>{formatDuration(m.timing.wall_seconds)}</strong><small>从首次启动至结束，包含暂停</small></div>
       <div><span>累计运行用时</span><strong>{formatTiming(m.timing)}</strong><small>包含准备、失败与核验，排除暂停</small></div>
@@ -43,7 +43,7 @@ export default function TaskMetrics({ metrics: m, jobId }: { metrics: TaskMetric
       <div><span>通过描述吞吐量</span><strong>{number(m.speed.new_passes_per_active_hour)} 条/时</strong><small>按运行用时；按墙钟 {number(m.speed.new_passes_per_wall_hour)} 条/时</small></div>
     </div>
     {hasIncompleteTiming(m.timing) && <p className="notice">历史计时不完整，缺失部分未计入已记录用时；相关速度指标无法完整测量。</p>}
-    <details><summary>质量与模型用量</summary><p className="muted">自动检查衡量内部一致性；首稿、修订与改词检查按执行记录统计，标注准确性由独立盲评衡量。</p>
+    <details><summary>质量与模型用量</summary><p className="muted">自动检查衡量内部一致性；首稿、修订与改词检查按执行记录统计，标注准确性由独立质量评估衡量。</p>
       <div className="metric-grid">
         <div><span>文本生成覆盖率</span><strong>{percent(m.candidate_coverage)}</strong><small>产生描述 / 已尝试：{fraction(m.candidate_coverage)}</small></div>
         <div><span>首稿自动检查通过率</span><strong>{percent(m.quality.first_draft_pass)}</strong><small>{fraction(m.quality.first_draft_pass)}；检查未完成 {m.quality.first_draft_incomplete} 条</small></div>
@@ -54,8 +54,8 @@ export default function TaskMetrics({ metrics: m, jobId }: { metrics: TaskMetric
         <div><span>Token 用量</span><strong>{m.cost.tokens.toLocaleString()}</strong><small>{m.cost.tokens_complete ? '用量记录完整' : '仅包含服务返回的已知用量，尚不完整'}</small></div>
         <div><span>每条新通过描述 Token</span><strong>{number(m.cost.tokens_per_new_pass)}</strong><small>包括未通过尝试的消耗</small></div>
       </div>
-      <h3>独立盲评</h3>
-      {!m.independent_audits.length && <p className="muted">尚未进行独立盲评，准确率与人工接受率未测量。</p>}
+      <h3>独立质量评估</h3>
+      {!m.independent_audits.length && <p className="muted">尚未进行独立质量评估，准确率与人工接受率未测量。</p>}
       {m.independent_audits.map(a => <p key={a.cohort_id}>{a.purpose} · {a.reviewed} / {a.sampled} 已评：{a.status === 'sealed' && a.report ? <>唯一目标定位 {percent(a.report.blind_unique_target_accuracy)}（{fraction(a.report.blind_unique_target_accuracy)}，{interval(a.report.blind_unique_target_accuracy)}）；联合接受率 {percent(a.report.human_joint_acceptance)}（{fraction(a.report.human_joint_acceptance)}，{interval(a.report.human_joint_acceptance)}）</> : '尚未封存，暂无最终指标'}</p>)}
       <a href="#results?mode=audit">查看或进行独立评估 →</a>
     </details>

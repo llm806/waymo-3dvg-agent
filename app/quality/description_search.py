@@ -43,7 +43,14 @@ def draft_reference_predicate(packet, predicate):
         return False
     if packet.task.get('sentence_style_policy') == 'simple-sufficient-sentence-v1':
         if predicate.predicate_id.startswith('image_joint_spatial:'):
-            return False  # No axis comparisons, elevation comparisons or chained frames.
+            import json
+            from app.quality.spatial_relations import SIGN_STACK_POLICY
+            proof=json.loads(predicate.value)
+            if not (packet.task.get('native_sign_stack_policy')==SIGN_STACK_POLICY
+                    and packet.target.category=='sign' and proof.get('category')=='sign'
+                    and proof.get('native_stack_policy')==SIGN_STACK_POLICY
+                    and proof.get('relation') in {'native_above','native_below'}):
+                return False  # No axis comparisons, generic elevation comparisons or chained frames.
     from app.quality.contrast import EGO_NEAR_ID, EGO_PROXIMITY_POLICY
     if predicate.predicate_id == EGO_NEAR_ID:
         return packet.task.get('ego_proximity_policy') == EGO_PROXIMITY_POLICY
@@ -125,7 +132,10 @@ def appearance_phrase(category, attributes, *, plural=False):
     if plural:
         noun = {'bus': 'buses', 'excavator body': 'excavator bodies'}.get(noun, noun + 's')
     words = [values[k] for k in ('color', 'shape') if k in values]
+    words = ['X-shaped' if word == 'x shaped' else word for word in words]
     phrase = 'the ' + ' '.join([*words, noun])
+    if 'inscription' in values and category == 'sign':
+        phrase += ' reading "' + values['inscription'] + '"'
     if category == 'cyclist' and values.get('subtype') in {'bicycle', 'motorcycle'}:
         phrase += ' on a ' + values['subtype']
     clothing = []
@@ -137,9 +147,11 @@ def appearance_phrase(category, attributes, *, plural=False):
         clothing.append('a ' + values['helmet_color'] + ' helmet')
     if clothing:
         phrase += ' wearing ' + (', '.join(clothing[:-1]) + ', and ' + clothing[-1] if len(clothing)>2 else ' and '.join(clothing))
-    features = [a.value for a in attributes if a.kind == 'feature' and a.value not in {'handheld bag', 'handheld camera', 'binoculars', 'visible rear face', 'pole mounted'}]
+    features = [a.value for a in attributes if a.kind == 'feature' and a.value not in {'handheld bag', 'handheld camera', 'binoculars', 'visible rear face', 'pole mounted'}
+        and not (a.value=='backpack' and 'backpack_color' in values)]
+    if 'backpack_color' in values:features.append(values['backpack_color']+' backpack')
     if features:
-        phrase += ' with ' + ' and '.join(f if f.endswith('stripes') or f.startswith('illuminated ') else ('an ' if f == 'umbrella' else 'a ') + f for f in features)
+        phrase += ' with ' + ' and '.join(f if f.endswith(('stripes','lenses')) or f.startswith('illuminated ') else ('an ' if f == 'umbrella' else 'a ') + f for f in features)
     held = [noun for value,noun in [('handheld camera','a camera'),('handheld bag','a bag')]
         if any(a.kind=='feature' and a.value==value for a in attributes)]
     if held:
@@ -166,9 +178,11 @@ def confirmed_attributes(category, record):
         if kind != 'feature' and len(values) != 1:
             continue
         for value in sorted(values):
+            if kind == 'inscription' and category != 'sign':
+                continue
             if kind == 'feature' and value in record.get('absent_features', []):
                 continue
-            if kind == 'helmet_color' and category not in {'pedestrian', 'cyclist'}:
+            if kind in {'helmet_color','backpack_color'} and category not in {'pedestrian', 'cyclist'}:
                 continue
             if kind == 'subtype' and category not in {'vehicle', 'sign'} and not (
                     category == 'cyclist' and value in {'bicycle', 'motorcycle'}):
@@ -181,8 +195,9 @@ def landmark_attributes(category, record, selected=()):
     """Keep a landmark's recognizable type and one conspicuous confirmed cue."""
     attributes = list(selected)
     confirmed = confirmed_attributes(category, record)
-    priority = ({'subtype': 0, 'color': 1, 'shape': 2} if category in {'vehicle', 'sign'} else
-                {'helmet_color': 0, 'feature': 1, 'upper_clothing_color': 2, 'subtype': 3})
+    priority = ({'inscription':0,'subtype':1,'color':2,'shape':3} if category == 'sign' else
+                {'subtype': 0, 'color': 1, 'shape': 2} if category == 'vehicle' else
+                {'helmet_color': 0, 'backpack_color':0, 'feature': 1, 'upper_clothing_color': 2, 'subtype': 3})
     core = sorted(confirmed, key=lambda a: (priority.get(a.kind, 9), a.kind, a.value))[:2]
     for attribute in core:
         if attribute not in attributes:
@@ -206,7 +221,9 @@ def descriptive_attributes(packet, observations):
     priorities = ({'subtype':0, 'color':1, 'feature':2, 'shape':3} if packet.target.category=='vehicle' else
         {'subtype':0, 'feature':1, 'color':2, 'shape':3} if packet.target.category=='sign' and road_scene else
         {'color':0, 'shape':1, 'subtype':2, 'feature':3} if packet.target.category=='sign' else
-        {'helmet_color':0, 'upper_clothing_color':1, 'feature':2, 'lower_clothing_color':3, 'subtype':4})
+        {'helmet_color':0, 'backpack_color':0, 'upper_clothing_color':1, 'feature':2, 'lower_clothing_color':3, 'subtype':4})
+    if packet.target.category=='sign' and packet.task.get('sign_inscription_policy')=='literal-sign-inscription-v1':
+        priorities={'inscription':0,'subtype':1,'feature':2,'color':3,'shape':4}
     from app.quality.joint_reference import feedback_target_features
     requested = {(a['kind'],a['value']) for a in feedback_target_features(packet.task)}
     attrs = sorted(confirmed_attributes(packet.target.category, record),

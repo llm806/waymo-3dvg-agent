@@ -20,8 +20,22 @@ from app.infrastructure.artifacts import atomic_json_text
 from app.agent.appearance import resolve_target_observation, target_visibility_error, effective_observations, required_body_color
 from app.quality.visibility_policy import SUPPORTED_POLICIES, allows_partial, source_camera_inventory
 
-VERSION = "adaptive-evidence-harness-v96-explicit-region-cards"
+VERSION = "adaptive-evidence-harness-v97-subject-scoped-composition"
 FORMAT_RETRY_LIMIT = 2
+
+
+def source_evidence(packet):
+    return {'packet_id':packet.packet_id, 'timestamp':packet.frame_timestamp_micros,
+        'source_view':packet.source_view}
+
+
+def source_attempts(packet, attempts):
+    # A failed sentence on OLD pixels is not a rejection on newly acquired
+    # evidence. Keep all drafts/calls in history and in the global limits.
+    from app.agent.scene_grounding import SOURCE_RETRY_POLICY,NATIVE_OWNER_RETRY_POLICY
+    if packet.task.get('scene_source_retry_policy') not in {SOURCE_RETRY_POLICY,NATIVE_OWNER_RETRY_POLICY}:
+        return list(attempts)
+    return [a for a in attempts if a.get('source_evidence', source_evidence(packet)) == source_evidence(packet)]
 CONNECTION_RETRY_DELAYS = (1.0, 2.0)
 TERMINAL = {"calibration_hold", "auto_pass", "abstained", "blocked", "needs_evidence"}
 ACTION_GUIDE = """You control evidence acquisition and expression repair for outdoor 3D grounding annotation.
@@ -84,7 +98,7 @@ def decision_context(packet: EvidencePacket, state: dict) -> tuple[dict, dict | 
         observations = effective_observations(packet,state.get('candidate_appearance'))
         if state.get('resolved_target_observation'):
             observations[packet.target_object_id] = state['resolved_target_observation']
-        contract = writing_plan(packet,observations,attempts=state['attempts'])
+        contract = writing_plan(packet,observations,attempts=source_attempts(packet,state['attempts']))
         local_repair = contract and fallback_sentence(packet,contract,observations) is not None
         from app.quality.spatial_relations import native_only
         if native_only(packet) and state['model_call_budget']-state['model_calls_used']>=3+observation_cost:
@@ -142,7 +156,8 @@ def initial_run(packet: EvidencePacket, calls, max_repairs: int, max_model_calls
                    'timestamp':packet.frame_timestamp_micros,'category':packet.target.category},
                "context": packet.context, "category": packet.target.category,
                "provider_scope": getattr(calls, "scope", "real-model"), "status": "running",
-               "phase": "precheck_target" if packet.task.get('admission_policy') == 'visible-distinct-v1' else "decide",
+               "phase": ('research_fixed_generate' if packet.task.get('research_baseline_policy') == 'fixed-vlm-one-request-v1'
+                    else "precheck_target" if packet.task.get('admission_policy') == 'visible-distinct-v1' else "decide"),
                "created_at": time.time(),
                "model_calls_used": 0, "relations_acquired": False, "attempts": [], "inflight": None,
                "current_packet": packet.model_dump(mode="json"), "auto_published": False, "tool_results": []}
@@ -371,8 +386,15 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
             events = [{'kind':'source_view_reselected','payload':json.loads(row['payload'])} for row in db.execute(
                 "SELECT payload FROM events WHERE run_id=? AND kind='source_view_reselected' ORDER BY seq",(run_id,))]
             if state.get('batch_id') and not state.get('revalidation_only'):
-                task_item = db.execute('SELECT target,packet_id FROM batch_items WHERE job_id=? AND run_id=?',
-                    (state['batch_id'],run_id)).fetchone()
+                if state.get('research_method')=='baseline':
+                    task_item=db.execute("""SELECT b.target,json_extract(t.initial_packet,'$.packet_id') AS packet_id
+                        FROM paper_trials t JOIN paper_studies s ON s.study_id=t.study_id
+                        JOIN batch_items b ON b.job_id=s.job_id AND b.ordinal=t.ordinal
+                        WHERE s.job_id=? AND s.study_id=? AND t.baseline_run=?""",
+                        (state['batch_id'],state.get('research_study_id'),run_id)).fetchone()
+                else:
+                    task_item = db.execute('SELECT target,packet_id FROM batch_items WHERE job_id=? AND run_id=?',
+                        (state['batch_id'],run_id)).fetchone()
         try:
             if state.get('batch_id') and not state.get('revalidation_only'):
                 if task_item is None:
@@ -394,8 +416,13 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
             generated = next((a['generated'] for a in reversed(state['attempts']) if a.get('generated')), None)
             if generated is not None or diagnostic_pass or not state.get('feedback_check'):
                 state['feedback_check'] = feedback_acceptance(task, generated)
+            from app.agent.appearance import feedback_landmark_report,explain_feedback_acquisition
+            report=feedback_landmark_report(EvidencePacket.model_validate(state['current_packet']))
+            if report:
+                state['feedback_check']=explain_feedback_acquisition(state['feedback_check'],report)
+                state['feedback_landmark_acquisition']=report
             if (not diagnostic_pass and generated is None
-                    and task.get('feedback_acquisition_policy') == 'feedback-landmark-recheck-v1'):
+                    and task.get('feedback_acquisition_policy') in {'feedback-landmark-recheck-v1','feedback-landmark-recheck-v2-diagnostics'}):
                 for requirement in state['feedback_check']['requirements']:
                     if requirement['status'] == 'pending':
                         requirement.update(status='not_verified', reason='本轮未能形成可核验的新描述；该要求尚未完成核验。')
@@ -415,6 +442,24 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
                 state['attempts'][-1]['verification'] = {'diagnostic_pass':False,'errors':style_errors}
         if diagnostic_pass and not check_sample_identity('before_success_commit'):
             diagnostic_pass, reason = False, 'sample_identity_binding_failed'
+        if diagnostic_pass:
+            from app.quality.joint_reference import person_wording_errors
+            person_errors=person_wording_errors(EvidencePacket.model_validate(state['current_packet']),
+                state['attempts'][-1]['generated']['expression'])
+            if person_errors:
+                diagnostic_pass,reason=False,person_errors[0]
+                state['attempts'][-1]['verification']={'diagnostic_pass':False,'errors':person_errors}
+        if state.get('feedback_check'):
+            for requirement in state['feedback_check']['requirements']:
+                if requirement['kind'] != 'distinctiveness':continue
+                requirement.update(status='covered' if diagnostic_pass else 'missing',
+                    reason='新增描述已通过完整候选池的两轮定位及身份核验。' if diagnostic_pass else
+                        '本轮仍未通过完整候选池的唯一定位核验，不能把改写或更换相机名称当作已补足区分线索。')
+                if not diagnostic_pass:
+                    error='manual_feedback_distinctiveness_missing'
+                    for field in ('errors','blocking_errors'):
+                        state['feedback_check'][field]=sorted(set([*state['feedback_check'][field],error]))
+                state['feedback_check']['passed']=not state['feedback_check']['errors']
         if state["attempts"] and "counterfactual_plan" in state["attempts"][-1] and "counterfactual" not in state["attempts"][-1]:
             attempt = state["attempts"][-1]
             attempt["counterfactual"] = counterfactual_summary(CounterfactualPlan.model_validate(attempt["counterfactual_plan"]),
@@ -449,10 +494,15 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
                 job_id=state.get('batch_id'), phase=state['phase'], reason=reason,
                 generated=bool(state.get('final_expression')), model_calls_used=state['model_calls_used'])
 
-    def try_alternate_source(current, reason):
+    def try_alternate_source(current, reason, *, after_identity_failure=False):
         # Each rejected camera is remembered durably. A new camera needs its own
         # RGB visibility check; positive observations never transfer across views.
-        if not current.task.get('view_selection_policy') or state['attempts']:
+        from app.agent.scene_grounding import SOURCE_RETRY_POLICY,NATIVE_OWNER_RETRY_POLICY
+        post_write = (after_identity_failure
+            and current.task.get('scene_source_retry_policy') in {SOURCE_RETRY_POLICY,NATIVE_OWNER_RETRY_POLICY}
+            and len(state['attempts']) <= state['max_repairs']
+            and max_model_calls - state['model_calls_used'] >= 5)
+        if not current.task.get('view_selection_policy') or state['attempts'] and not post_write:
             return False
         camera = next((v.camera_name for v in current.views if v.camera_label == current.source_view), None)
         rejected = state.setdefault('rejected_source_views', [])
@@ -469,7 +519,10 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
         choices = [v for v in confirmed_source_views(current.views, require_complete=not allows_partial(current),
             allow_back_facing=allows_partial(current))
             if v.camera_name not in tried and str(v.camera_name) in safe]
-        choices.sort(key=lambda v: -safe[str(v.camera_name)].get('image_selection_score', 0))
+        choices.sort(key=lambda v: (
+            post_write and v.appearance_identity_source not in {
+                'official_camera_lidar_association', 'native_box_point_correspondence'},
+            -safe[str(v.camera_name)].get('image_selection_score', 0)))
         if max_model_calls - state['model_calls_used'] < 4:
             return False
         if choices:
@@ -495,7 +548,7 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
         if current.task.get('manual_review_feedback'):
             updated = updated.model_copy(deep=True)
             updated.task['manual_review_feedback'] = current.task['manual_review_feedback']
-        for policy in ('feedback_feature_policy','ego_wording_policy','target_naming_policy','landmark_locality_policy','sentence_style_policy','spatial_language_policy','sentence_claim_repair_policy','feedback_relation_policy','scene_region_card_policy','ego_proximity_policy','feedback_detail_policy','source_camera_scope_policy','attribute_repair_policy','scene_geometry_authority_policy','feedback_acquisition_policy','landmark_salience_policy','manual_feedback_policy','scene_relation_reading_policy','scene_binding_policy','scene_input_policy','feedback_revision_policy','feedback_acceptance_policy'):
+        for policy in ('sentence_composition_policy','backpack_color_policy','disputed_attribute_policy','person_feedback_policy','scene_candidate_logic_policy','native_sign_stack_policy','sign_ambiguity_policy','appearance_equivalence_policy','feedback_group_position_policy','sign_shape_policy','feedback_intent_policy','sign_inscription_policy','sign_detail_policy','feedback_appearance_policy','identity_point_guidance_policy','scene_ego_direction_policy','recognition_preference_policy','scene_source_retry_policy','writer_claim_policy','feedback_feature_policy','ego_wording_policy','target_naming_policy','landmark_locality_policy','sentence_style_policy','spatial_language_policy','sentence_claim_repair_policy','feedback_relation_policy','scene_region_card_policy','ego_proximity_policy','feedback_detail_policy','source_camera_scope_policy','attribute_repair_policy','scene_geometry_authority_policy','feedback_acquisition_policy','landmark_salience_policy','manual_feedback_policy','scene_relation_reading_policy','scene_binding_policy','scene_input_policy','feedback_revision_policy','feedback_acceptance_policy'):
             updated.task.pop(policy,None)
             if policy in current.task:
                 updated.task[policy]=current.task[policy]
@@ -510,6 +563,9 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
             state.pop(key, None)
         state.pop('reused_scene_observation_ids',None)
         state.pop('precheck_reused_batch_ids',None)
+        for policy in ('vehicle_detail_policy','distinctiveness_search_policy','scene_camera_scope_policy','chinese_landmark_policy','blind_parse_scope_policy'):
+            updated.task.pop(policy,None)
+            if policy in current.task:updated.task[policy]=current.task[policy]
         state.update(current_packet=updated.model_dump(mode='json'), packet_id=updated.packet_id, phase='precheck_target',
                      relations_acquired=False, inflight=None)
         save('source_view_reselected', {'from_camera': camera,
@@ -535,7 +591,7 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
             current = EvidencePacket.model_validate(state["current_packet"])
             from app.quality.joint_reference import ACCEPTANCE_POLICIES, feedback_acceptance, feedback_relations
             disputed_landmarks = (any(r['denied'] for r in feedback_relations(current.task))
-                and current.task.get('feedback_acquisition_policy') != 'feedback-landmark-recheck-v1')
+                and current.task.get('feedback_acquisition_policy') not in {'feedback-landmark-recheck-v1','feedback-landmark-recheck-v2-diagnostics'})
             feedback_enabled = current.task.get('feedback_acceptance_policy') in ACCEPTANCE_POLICIES
             if feedback_enabled and state['inflight'] is None:
                 preflight = feedback_acceptance(current.task)
@@ -548,7 +604,20 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
                 appearance_observations = {**(appearance_observations or {}),
                     current.target_object_id: state['resolved_target_observation']}
             phase = state["phase"]
-            if phase == 'precheck_target':
+            if phase == 'research_fixed_generate':
+                from app.quality.paper_study import baseline_messages
+                from app.schemas.contracts import Contract
+                class BaselineSentence(Contract):
+                    expression: str
+                sentence=invoke('research_fixed_generate',baseline_messages(current,EVIDENCE_ROOT),BaselineSentence)
+                state['attempts']=[{'attempt':0,'ground_checks':[], 'generated':{
+                    'expression':sentence.expression.strip(),'predicate_ids':[],'visual_attributes':[]}}]
+                state['research_baseline_delivered']=bool(sentence.expression.strip())
+                finish(False,'research_fixed_output_delivered' if sentence.expression.strip() else 'research_fixed_abstained')
+                # Delivery is not a quality verdict. Never publish this baseline
+                # through production training/export or claim self-verification.
+                break
+            elif phase == 'precheck_target':
                 if not current.provenance.get('scene_image_candidates'):
                     state['admission'] = {'passed': False, 'reason': 'precheck_scene_image_inventory_missing'}
                     finish(False, 'precheck_scene_image_inventory_missing')
@@ -743,16 +812,31 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
                 save('blocking_objects_reobserved', {'objects': list(records), 'reason': 'resolve missing or conflicting visual evidence before giving up'})
             elif phase == 'precheck_decision':
                 from app.quality.admission import admission_plan, observation_plan_sufficient
-                from app.quality.joint_reference import feedback_target_features
-                if (feedback_target_features(current.task) and not state.get('feedback_target_rechecked')
+                from app.quality.joint_reference import feedback_attribute_kinds,feedback_distinctiveness_requested,feedback_gender_requests
+                focus_kinds=feedback_attribute_kinds(current.task)
+                if (current.target.category in {'pedestrian','cyclist'} and feedback_gender_requests(current.task)
+                        and current.task.get('backpack_color_policy')=='worn-backpack-color-v1'):
+                    focus_kinds=sorted(set(focus_kinds)|{'upper_clothing_color','lower_clothing_color','backpack_color','feature'})
+                disambiguate_sign=(current.target.category=='sign' and feedback_distinctiveness_requested(current.task))
+                from app.agent.appearance import distinctiveness_manifest
+                distinction_manifest=distinctiveness_manifest(current)
+                if distinction_manifest:
+                    focus_kinds=sorted(set(focus_kinds)|{'color','subtype','feature'})
+                if disambiguate_sign:
+                    focus_kinds=sorted(set(focus_kinds)|{'color','feature','shape','subtype','inscription'})
+                if (focus_kinds and not state.get('feedback_target_rechecked')
                         and max_model_calls-state['model_calls_used'] >= 4):
-                    from app.agent.appearance import source_identity_candidate
+                    from app.agent.appearance import source_identity_candidate,sign_disambiguation_manifest
                     selected = source_identity_candidate(current)
                     if selected is not None:
+                        manifest=distinction_manifest or (sign_disambiguation_manifest(current,state.get('candidate_appearance',{}))
+                            if disambiguate_sign else [{**selected,'attribute_recheck':focus_kinds}])
                         state.update(phase='recheck_source_attributes', feedback_target_rechecked=True,
-                            source_attribute_recheck_manifest=[{**selected,'attribute_recheck':['feature']}], inflight=None)
-                        save('feedback_target_recheck_planned', {'attribute_kinds':['feature'],
-                            'source_view':current.source_view, 'scope':'fresh target pixels; no requested value or prior answer sent'})
+                            source_attribute_recheck_manifest=manifest, inflight=None)
+                        if disambiguate_sign:state['scene_sign_detail_rechecked']=True
+                        save('feedback_target_recheck_planned', {'attribute_kinds':focus_kinds,
+                            'source_view':current.source_view,'candidate_ids':[m['candidate_id'] for m in manifest],
+                            'scope':'fresh target/rival pixels; no requested value or prior answer sent'})
                         continue
                 observed = VisualObservation.model_validate(state['target_precheck_observation'])
                 current, result = expand_relations(current, state.get('candidate_appearance'), target_observation=observed)
@@ -765,7 +849,21 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
                 state['tool_results'].append(result)
                 # Feedback must guide acquisition, not merely reject the final sentence.
                 # Do this on the reviewed source before generic relooks or a view switch.
-                if (plan['passed'] and not state.get('feedback_landmark_rechecks')
+                from app.agent.appearance import feedback_landmark_report
+                report=feedback_landmark_report(current)
+                if report and state.get('feedback_landmark_acquisition',{}).get('packet_id')!=current.packet_id:
+                    state['feedback_landmark_acquisition']=report
+                    save('feedback_landmark_acquisition_checked',report)
+                if (report and any(r['native_supported_count']==0 for r in report['requests'])
+                        and not state.get('feedback_source_retry_used') and not state['attempts']
+                        and max_model_calls-state['model_calls_used']>=5):
+                    state['feedback_source_retry_used']=True
+                    save('feedback_source_retry_planned',{'packet_id':current.packet_id,
+                        'reason':'requested native relation unresolved; bounded new source attempt before writing'})
+                    if try_alternate_source(current,'feedback_landmark_relation_unresolved'):
+                        continue
+                checked_source=any(r.get('packet_id')==current.packet_id for r in state.get('feedback_landmark_rechecks',[])) if report else bool(state.get('feedback_landmark_rechecks'))
+                if (plan['passed'] and not checked_source
                         and max_model_calls-state['model_calls_used'] >= 4):
                     from app.agent.appearance import feedback_landmark_manifest
                     manifest = feedback_landmark_manifest(current)
@@ -933,6 +1031,38 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
                     resolve_target_observation(observed,(appearance_observations or {}).get(current.target_object_id),
                         allow_partial=allows_partial(current)).model_dump()}
                 joint_plan = writing_plan(current, joint_observations)
+                # Explicit ambiguity feedback calls for new evidence before
+                # paying to test another generic sentence on the rejected view.
+                # Likewise, a suggested landmark with unresolved appearance is
+                # a reason to try one other source, never to invent its color.
+                requested_landmarks=[r for r in feedback_relations(current.task) if not r['denied']]
+                missing_landmark=(current.task.get('chinese_landmark_policy')=='literal-chinese-landmarks-v1'
+                    and requested_landmarks and not (joint_plan or {}).get('feedback_alignment',{}).get('requested_relation_selected'))
+                missing_distinction=(current.task.get('distinctiveness_search_policy')=='distinctiveness-evidence-search-v1'
+                    and feedback_distinctiveness_requested(current.task))
+                if (plan['passed'] and not (joint_plan or {}).get('unique_plan_found')
+                        and (missing_landmark or missing_distinction) and not state['attempts']
+                        and not state.get('feedback_source_retry_used') and max_model_calls-state['model_calls_used']>=5):
+                    state['feedback_source_retry_used']=True
+                    save('feedback_source_retry_planned',{'packet_id':current.packet_id,
+                        'reason':'reviewed source still lacks a verified distinguishing cue or requested landmark appearance'})
+                    if try_alternate_source(current,'feedback_distinguishing_evidence_unresolved'):
+                        continue
+                from app.quality.joint_reference import FEEDBACK_INTENT_POLICY
+                if (plan['passed'] and current.task.get('feedback_intent_policy') == FEEDBACK_INTENT_POLICY
+                        and joint_plan is None
+                        and any(r['required'] and not r['denied'] for r in feedback_relations(current.task))):
+                    # Acquisition has run on this source. Do not admit an unrelated
+                    # appearance-only plan and ask the writer to repeat rejected text.
+                    if (not state.get('feedback_source_retry_used')
+                            and max_model_calls-state['model_calls_used'] >= 5):
+                        state['feedback_source_retry_used'] = True
+                        if try_alternate_source(current,'feedback_landmark_relation_unresolved'):
+                            continue
+                    state['feedback_check'] = feedback_acceptance(current.task,
+                        {'expression':'','predicate_ids':[],'visual_attributes':[]},check_style=False)
+                    finish(False,'manual_feedback_landmark_missing')
+                    break
                 if (plan['passed'] and not plan.get('unique_plan_found') and joint_plan
                         and joint_plan.get('requires_full_scene') and max_model_calls-state['model_calls_used']>=3):
                     plan.update(joint_plan,reason='joint_reference_requires_sentence_validation')
@@ -1026,18 +1156,28 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
                 save('scene_appearance_observed', {'observed_candidates': len(state['candidate_appearance']),
                     'scope': 'anonymous candidate crops; no target designation or generated sentence'})
             elif phase == "generate":
-                previous = state["attempts"][-2] if len(state["attempts"]) > 1 else None
-                failed_expressions = [a['generated']['expression'] for a in state['attempts'][:-1]
+                state['attempts'][-1]['source_evidence'] = source_evidence(current)
+                prior_attempts = source_attempts(current,state['attempts'][:-1])
+                previous = prior_attempts[-1] if prior_attempts else None
+                failed_expressions = [a['generated']['expression'] for a in prior_attempts
                     if a.get('generated') and a.get('verification',{}).get('diagnostic_pass') is False]
                 generated = None
                 from app.quality.joint_reference import writing_plan, writer_messages, WrittenSentence, fallback_sentence
-                contract = writing_plan(current,appearance_observations or {},attempts=state['attempts'][:-1])
+                contract = writing_plan(current,appearance_observations or {},attempts=prior_attempts)
+                from app.agent.harness import normalize_writer_scope_attributes
+                if contract:
+                    attrs, repair = normalize_writer_scope_attributes(current, contract['predicate_ids'],
+                        [VisualAttribute.model_validate(a) for a in contract['visual_attributes']])
+                    if repair:
+                        contract = {**contract,'visual_attributes':[a.model_dump() for a in attrs]}
+                        state['attempts'][-1]['writing_scope_attribute_entailment'] = repair
                 from app.quality.spatial_relations import native_only
                 if contract is None and previous and native_only(current):
                     finish(False, 'description_validation_failed')
                     break
                 if feedback_enabled:
                     coverage = feedback_acceptance(current.task, {'predicate_ids': (contract or {}).get('predicate_ids', []),
+                        'visual_attributes':(contract or {}).get('visual_attributes',[]),
                         'expression': ' and '.join(p.phrase for p in current.predicates
                             if p.predicate_id in (contract or {}).get('predicate_ids', []))}, check_style=False)
                     if coverage['blocking_errors']:
@@ -1049,8 +1189,10 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
                     finish(False,'precheck_no_distinguishing_cues')
                     break
                 if contract:
+                    from app.quality.joint_reference import local_wording_retry
                     local = (fallback_sentence(current,contract,appearance_observations or {})
-                        if ((previous and not native_only(current)) or max_model_calls-state['model_calls_used']<3) and state['inflight'] is None and not state.get('pending_format_retry')
+                        if ((previous and not native_only(current)) or local_wording_retry(current,previous)
+                            or max_model_calls-state['model_calls_used']<3) and state['inflight'] is None and not state.get('pending_format_retry')
                         and not state.get('pending_connection_retry') else None)
                     sentence = local or invoke('generate',writer_messages(current,contract,previous,
                         appearance_observations or {}),WrittenSentence).expression
@@ -1072,6 +1214,10 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
                 elif not contract:
                     state['attempts'][-1]['generation_source'] = 'simple verified fallback; fewer than three calls remain; not model inference'
                 generated = generated.model_copy(update={"expression": normalize_expression(generated.expression)})
+                attrs, repair = normalize_writer_scope_attributes(current, generated.predicate_ids, generated.visual_attributes)
+                if repair:
+                    generated = generated.model_copy(update={'visual_attributes':attrs})
+                    state['attempts'][-1]['writer_scope_attribute_entailment'] = repair
                 from app.agent.harness import normalize_visual_predicate_aliases
                 generated, alias_repair = normalize_visual_predicate_aliases(current, generated)
                 if alias_repair:
@@ -1129,7 +1275,7 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
                         and set(generated.predicate_ids) == set(a['generated'].get('predicate_ids', []))
                         and {(v.kind,v.value) for v in generated.visual_attributes} ==
                             {(v['kind'],v['value']) for v in a['generated'].get('visual_attributes', [])}
-                        for a in state['attempts'][:-1] if a.get('generated')
+                        for a in prior_attempts if a.get('generated')
                         and a.get('verification', {}).get('diagnostic_pass') is False):
                     policy_errors.append('failed_draft_text_repeated')
                 if policy_errors:
@@ -1239,6 +1385,8 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
                 from app.quality.description_search import minimal_reference_policy
                 from app.agent.harness import MINIMAL_CLAIM_PARSE_GUIDE
                 parse_guide = MINIMAL_CLAIM_PARSE_GUIDE if minimal_reference_policy(current) else CLAIM_PARSE_GUIDE
+                from app.agent.harness import literal_parse_instruction
+                parse_guide += literal_parse_instruction(current)
                 if current.task.get('sentence_claim_repair_policy') == 'sentence-claim-repair-v1':
                     parse_guide += ('\nVisual attributes have their own schema; they do not need a matching spatial predicate. '
                         'For example, with a roof rack means feature:roof rack even when an image_attribute ID only names color and subtype. '
@@ -1247,7 +1395,7 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
                 if current.task.get('ego_proximity_policy') == 'native-ego-proximity-v1':
                     parse_guide += '\nOnly when the sentence explicitly says close/very close/near the ego vehicle, parse range:ego_near. This is native 3D proximity, not a nearest rank, motion or camera-size claim. Do not infer it from left/right or appearance.'
                 grounded = invoke(phase, [{"role": "system", "content": parse_guide},
-                                         {"role": "user", "content": json.dumps({**payload, "output_schema": GroundResult.model_json_schema()})}], GroundResult)
+                                         {"role": "user", "content": json.dumps({**payload, "output_schema": payload.get('output_schema',GroundResult.model_json_schema())})}], GroundResult)
                 feedback = verify_tool_grounding(current, generated, grounded, mapping,
                     appearance_observations=appearance_observations,
                     target_appearance_verified=state['attempts'][-1].get('appearance_check', {}).get('passed') is True)
@@ -1293,6 +1441,7 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
             elif phase in {'scene_ground','scene_ground_permuted'}:
                 from app.agent.scene_grounding import messages, verify as verify_scene, SceneGroundResult, binding_retry_allowed
                 attempt=state['attempts'][-1]
+                attempt.setdefault('source_evidence',source_evidence(current))
                 retry_index=attempt.get('scene_binding_retries',{}).get(phase,0)
                 seed=601+100*(len(state['attempts'])-1)+(0 if phase=='scene_ground' else 1)+10*retry_index
                 inputs,mapping,receipt=messages(current,attempt['generated']['expression'],seed)
@@ -1317,6 +1466,30 @@ def run_agent(packet: EvidencePacket, calls, max_repairs: int, output_root: Path
                 else:
                     state['phase']='decide'
                 save('scene_grounding_completed',feedback)
+                from app.agent.appearance import sign_detail_recheck_allowed,source_identity_candidate,sign_disambiguation_manifest
+                if sign_detail_recheck_allowed(current,feedback,remaining_calls=max_model_calls-state['model_calls_used'],
+                        attempts=len(state['attempts']),max_repairs=state['max_repairs'],used=state.get('scene_sign_detail_rechecked',False)):
+                    selected=source_identity_candidate(current)
+                    if selected is not None:
+                        kinds=['color','feature','subtype']
+                        if current.task.get('sign_inscription_policy')=='literal-sign-inscription-v1':
+                            kinds.append('inscription')
+                        rivals=[*feedback.get('tool_grounded_candidates',[]),
+                            *[mapping.get(cid) for cid in feedback.get('ambiguous_candidate_ids',[]) if cid in mapping]]
+                        manifest=(sign_disambiguation_manifest(current,rivals)
+                            if current.task.get('sign_ambiguity_policy')=='ambiguity-driven-sign-recheck-v1' else
+                            [{**selected,'attribute_recheck':kinds}])
+                        state.update(phase='recheck_source_attributes',scene_sign_detail_rechecked=True,
+                            source_attribute_recheck_manifest=manifest,inflight=None)
+                        save('sign_detail_recheck_planned',{'attribute_kinds':kinds,
+                            'candidate_ids':[m['candidate_id'] for m in manifest],
+                            'scope':'fresh anonymous sign observation; no previous answer, requested colors or expected subtype supplied; original failed verdict retained'})
+                        continue
+                from app.agent.scene_grounding import needs_identity_source_retry
+                if (not feedback['diagnostic_pass']
+                        and needs_identity_source_retry(current, feedback, mapping)):
+                    if try_alternate_source(current, 'scene_image_identity_unresolved', after_identity_failure=True):
+                        continue
             elif phase == "counterfactual":
                 attempt = state["attempts"][-1]
                 plan = CounterfactualPlan.model_validate(attempt["counterfactual_plan"])

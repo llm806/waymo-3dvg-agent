@@ -85,6 +85,10 @@ export function reasonLabel(reason: string) {
     incomplete_ego_direction: '目标具有明显的斜向偏移，描述遗漏了必要的前后或左右方位。',
     annotation_meta_wording: '描述含“它是目标”等标注术语，请直接使用自然的物体描述。',
     manual_feedback_target_feature_missing: '尚未落实反馈中的目标手持物特征；需重新核实，不能用包等其它附件替代。',
+    manual_feedback_appearance_missing: '未能用已确认的图像依据落实反馈要求的颜色或可见背面；本轮未通过，原始观察和描述保留。',
+    declared_inscription_not_in_text: '描述漏掉了所选方案中已确认的牌面文字，需要补写后重新核验。',
+    camera_led_feedback_wording: '请先描述物体，再自然补充来源视角，避免用相机视角开头。',
+    mechanical_surface_wording: '请自然描述标志牌的背面及其已确认颜色，不要机械复述“可见后表面”。',
     declared_ego_direction_not_in_text: '草稿遗漏了已选定的自车方位线索；来源视角不能替代“在自车前方”等真实空间关系。',
     unselected_ego_direction_in_text: '草稿添加了所选证据方案之外的自车方位，需要按已核实的方向改写。',
     joint_reference_pair_missing: '完整场景盲定位未提供支持该描述的目标与车辆地标组合。',
@@ -121,7 +125,8 @@ export function reasonLabel(reason: string) {
     precheck_no_reliable_visual_feature: '图像未提供可靠的类型或外观特征，未进入文本标注。',
     precheck_invalid_scene_observation: '场景观察返回了无效或重复的物体索引，未进入文本标注。',
     sample_identity_binding_failed: '物体、实际采集帧或换帧凭据不一致，已保留记录并停止将此样本计为成功，其余目标可继续处理。',
-    all_oracle_checks_passed: '自动检查已根据文本找回选定目标。尚未完成独立抽检或定位测试，暂不能用于正式训练。',
+    two_round_blind_scene_grounding_passed: '两轮定位检查均通过，描述已保存并计入任务完成数量。',
+    all_oracle_checks_passed: '自动定位检查已通过，描述已保存。独立质量评估另行进行。',
     agent_abstained: '系统判断现有证据或预算不足，结束此次尝试。',
     target_spatially_ambiguous: '现有空间线索仍无法可靠区分目标，已跳过，不作为训练标签。',
     description_validation_failed: '描述中的属性或区分线索未通过核验，未取得通过检查的修复版本，不作为训练标签。',
@@ -143,11 +148,11 @@ export function reasonLabel(reason: string) {
     response_deadline_exceeded: '模型响应超过时长限制，已保留调用记录并跳过此目标，其余目标继续处理。',
     'model_call:connection_failed': '模型服务连接失败，已保留进度；确认未发送的请求可在原预算内重试。',
     provider_temporarily_unavailable: '连续两个目标在自动重试后仍无法连接模型服务，已停止后续请求。网络恢复后可重试失败目标并继续。',
-    oracle_passed_counterfactual_not_applicable: '文本通过自动定位检查，但尚未测试删改关键词后的定位变化。独立评估也未完成，暂不能用于正式训练。',
-    oracle_passed_counterfactual_budget_incomplete: '原句定位通过；剩余调用额度不足以完成反事实检查。文本保留为候选，等待独立评估。',
-    oracle_and_counterfactual_checks_passed: '原句定位与反事实检查均通过；仍需独立评估后才能发布训练标签。',
-    oracle_passed_counterfactual_reader_inconsistent: '原句定位通过，但反事实文本的解析与预期候选集合不一致。文本保留为待核验候选，未发布。',
-  } as Record<string, string>)[reason] ?? '本次执行已结束或遇到问题，请查看执行记录中的具体原因。'
+    oracle_passed_counterfactual_not_applicable: '自动定位检查已通过，描述已保存并计入任务完成数量。本条无需改词对照检查；独立质量评估另行进行。',
+    oracle_passed_counterfactual_budget_incomplete: '自动定位检查已通过，描述已保存。剩余模型调用次数不足，未完成改词对照检查；独立质量评估另行进行。',
+    oracle_and_counterfactual_checks_passed: '自动定位和改词对照检查均通过，描述已保存。独立质量评估另行进行。',
+    oracle_passed_counterfactual_reader_inconsistent: '自动定位检查已通过，描述已保存。额外的改词对照检查结果不一致，相关记录已保留，供后续质量评估。',
+  } as Record<string, string>)[reason] ?? `处理说明：${reason}。详细信息见执行记录。`
 }
 
 export function sourcePath(file: string | null | undefined) {
@@ -158,6 +163,33 @@ export function sourcePath(file: string | null | undefined) {
 }
 
 export const objectName = (id: string) => `物体 ${Number(id.slice(1))}`
+export function recordStatus(item: {status:string; run_status?:string; manual_approved?:boolean; manual_review?:{verdict:string}|null; provider_diagnosis?:string; reason?:string|null}, task?:{status:string; control?:string|null}) {
+  if (item.manual_review?.verdict === 'discarded') return {label:'已废弃', tone:'neutral'}
+  if (item.manual_review?.verdict === 'rejected') return {label:'人工审核未通过', tone:'failed'}
+  if (item.manual_approved) return {label:'人工审批通过', tone:'passed'}
+  const status=item.run_status ?? item.status
+  if (['calibration_hold','auto_pass'].includes(status)) return {label:'自动核验通过', tone:'passed'}
+  const active=['pending','ready','preparing','prepared','running','paused','stopped'].includes(status)
+  if (active && task?.control === 'pause') return {label:'正在暂停', tone:'waiting'}
+  if (active && task?.control === 'stop') return {label:'正在停止', tone:'waiting'}
+  if (active && (task?.status === 'paused' || status === 'paused')) return {label:'已暂停', tone:'waiting'}
+  if (active && (task?.status === 'stopped' || status === 'stopped')) return {label:'已停止', tone:'neutral'}
+  if (item.provider_diagnosis === 'remote_outcome_unknown' || item.reason === 'interrupted_response_outcome_unknown' || item.reason === 'model_call:interrupted_response') return {label:'连接中断 · 结果待确认', tone:'error'}
+  if (['connection_not_established','local_network_access_denied'].includes(item.provider_diagnosis ?? '') || item.reason === 'model_call:connection_failed') return {label:'网络连接失败', tone:'error'}
+  if (item.reason === 'response_deadline_exceeded') return {label:'模型响应超时', tone:'error'}
+  if (item.reason?.startsWith('model_call:') || item.provider_diagnosis) return {label:'模型请求异常', tone:'error'}
+  if (status === 'failed' || status === 'blocked') return {label:'执行出错', tone:'error'}
+  if (status === 'needs_evidence') return {label:'未通过核验', tone:'failed'}
+  if (status === 'abstained') return {label:'未完成标注', tone:'failed'}
+  if (status === 'excluded') return {label:'预检查未通过', tone:'failed'}
+  if (status === 'budget_skipped') return {label:'调用次数不足 · 未执行', tone:'waiting'}
+  if (status === 'not_needed') return {label:'未执行', tone:'neutral'}
+  if (status === 'preparing') return {label:'正在准备数据', tone:'running'}
+  if (status === 'running') return {label:'执行中', tone:'running'}
+  if (status === 'prepared') return {label:'数据已准备', tone:'waiting'}
+  if (status === 'pending' || status === 'ready') return {label:'等待处理', tone:'waiting'}
+  return {label:'状态待确认', tone:'neutral'}
+}
 export function isAnnotationResult(item: { status: string; run_status?: string; expression?: string | null; manual_approved?:boolean; manual_review?: { verdict: string } | null }): boolean {
   return !['rejected', 'discarded'].includes(item.manual_review?.verdict ?? '')
     && !!item.expression?.trim() && (item.manual_approved===true||['calibration_hold', 'auto_pass'].includes(item.run_status ?? item.status))

@@ -214,6 +214,10 @@ class TaskCleaner:
         if set(requested) - jobs.keys():
             raise ValueError('所选任务已不存在，请刷新任务列表。')
         selected = set(requested)
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='paper_studies'").fetchone():
+            protected={r['job_id'] for r in db.execute('SELECT job_id FROM paper_studies')}
+            if selected & protected:
+                raise ValueError('所选任务被科研实验引用；需保留生成记录、盲审证据及调用账本，不能按普通标注任务删除。')
         if return_to_pool is None:
             return_to_pool = not any(jobs[job]['status'] == 'completed' for job in selected)
         if type(return_to_pool) is not bool:

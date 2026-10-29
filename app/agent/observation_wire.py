@@ -5,7 +5,7 @@ from typing import Literal
 
 from pydantic import ConfigDict, Field
 
-from app.schemas.contracts import CandidateVisualObservation, SceneVisualObservation, VisualAttribute, VisualObservation, VehicleColors, VISUAL_ATTRIBUTE_VALUES, VISUAL_COLORS
+from app.schemas.contracts import CandidateVisualObservation, SceneVisualObservation, VisualAttribute, VisualObservation, VehicleColors, VISUAL_ATTRIBUTE_VALUES, VISUAL_COLORS, valid_inscription
 
 
 def compact_alias(name):
@@ -76,7 +76,8 @@ def unknown_optional_evidence(value, output_type):
                 if isinstance(a, dict) and set(a) == {kind_key, value_key}
                 and isinstance(a[kind_key], str) and a[kind_key] in VISUAL_ATTRIBUTE_VALUES
                 and isinstance(a[value_key], str)
-                and a[value_key] not in VISUAL_ATTRIBUTE_VALUES[a[kind_key]]}
+                and (not valid_inscription(a[value_key]) if a[kind_key]=='inscription'
+                     else a[value_key] not in VISUAL_ATTRIBUTE_VALUES[a[kind_key]])}
             if invalid_kinds:
                 # Retain malformed structures for strict validation/retry.
                 record[attr_key] = [a for a in attributes if not (

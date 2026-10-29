@@ -132,7 +132,7 @@ def render_verified_plan(packet, observations):
     # A relative clause after "with a trailer" or clothing could attach to that
     # part instead of the target. Keep canonical image wording for such nouns.
     relative_clause = alternate and not any(a.kind in {
-        'feature', 'upper_clothing_color', 'lower_clothing_color', 'helmet_color'} for a in attributes)
+        'feature', 'upper_clothing_color', 'lower_clothing_color', 'helmet_color', 'backpack_color'} for a in attributes)
     subject = appearance_phrase(packet.target.category, attributes)
     # Preserve canonical nouns/attributes, including separately boxed bus or
     # excavator parts. Surface variation never changes the selected facts.

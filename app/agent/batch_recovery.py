@@ -45,6 +45,10 @@ def prepare_recovery(service, job, *, dry_run=False):
         return {'job_id':job,'started':False,'retained_passed':passed,
                 'remaining_goal':None if goal is None else max(0,goal-passed),'reset_items':0}
     available = {target['target_id']:target for target in catalog['targets']}
+    review_ordinals={item['ordinal'] for item in store.pending_review_retries(job)}
+    review_only=bool(detail['status']=='ready' and review_ordinals and not any(
+        item['status'] in {'pending','preparing','running'} and item['ordinal'] not in review_ordinals
+        for item in detail['items']))
     changes, retired, uncertain, unknown_states = [], [], [], []
     with runs.connect() as db:
         completed = set()
@@ -54,6 +58,8 @@ def prepare_recovery(service, job, *, dry_run=False):
                 completed.add(row['run_id'])
     attempt = uuid4().hex[:24]
     for item in detail['items']:
+        if review_only and item['ordinal'] not in review_ordinals:
+            continue  # Updating code for one explicit review is not a batch-wide retry.
         if item.get('run_id') in completed:
             continue
         potential_retry = (any(item.get(key) for key in ('retryable_connection_failure','retryable_parameter_failure',
@@ -118,7 +124,9 @@ def prepare_recovery(service, job, *, dry_run=False):
     receipt = {'job_id':job, 'started':False, 'retained_passed':passed,
         'remaining_goal':None if goal is None else max(0,goal-passed),
         'reset_items':sum(target is not None and bool(item.get('run_id') or item.get('packet_id')) for item,target,_,_ in changes),
-        'skipped_unknown_outcome_targets':len(uncertain)}
+        'skipped_unknown_outcome_targets':len(uncertain),
+        'recovery_scope':'pending_review_retries' if review_only else 'unfinished_task',
+        **({'review_ordinals':sorted(review_ordinals)} if review_only else {})}
     if dry_run:
         return {**receipt, 'dry_run':True, 'code_or_configuration_changed':changed,
             'ready_targets':sum(target is not None for _,target,_,_ in changes),
