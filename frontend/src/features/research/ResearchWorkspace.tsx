@@ -27,9 +27,9 @@ export default function ResearchWorkspace() {
 function StudyManager(){
   const [studies,setStudies]=useState<Study[]>([]),[selected,setSelected]=useState(''),[error,setError]=useState(''),[busy,setBusy]=useState(false)
   const [creating,setCreating]=useState(false),[loading,setLoading]=useState(true)
-  const [title,setTitle]=useState('标注质量评估'),[size,setSize]=useState('200'),[reviewSize,setReviewSize]=useState('20'),[split,setSplit]=useState('validation')
-  const [people,setPeople]=useState(['','',''])
-  const [reviewAll,setReviewAll]=useState(false)
+  const [title,setTitle]=useState('标注质量评估'),[size,setSize]=useState('200'),[reviewSize,setReviewSize]=useState('20'),[split,setSplit]=useState('train')
+  const [reviewer,setReviewer]=useState('')
+  const [reviewAll,setReviewAll]=useState(true)
   const [requestId,setRequestId]=useState(()=>crypto.randomUUID().replaceAll('-','').slice(0,24))
   async function refresh(){const data=await get<{studies:Study[]}>('studies');setStudies(data.studies);setSelected(old=>old||data.studies[0]?.study_id||'')}
   useEffect(()=>{let live=true
@@ -39,7 +39,7 @@ function StudyManager(){
   },[])
   const study=studies.find(s=>s.study_id===selected)
   async function create(e:FormEvent){e.preventDefault();setBusy(true);setError('')
-    try{const data=await post<Study>('studies',{request_id:requestId,title,sample_size:Number(size),seed:parseInt(requestId.slice(0,7),16),dataset_split:split,reviewers:people,
+    try{const data=await post<Study>('studies',{request_id:requestId,title,sample_size:Number(size),seed:parseInt(requestId.slice(0,7),16),dataset_split:split,reviewers:[reviewer],
       review_sample_size:Number(reviewSize),review_all_deliveries:reviewAll})
       await refresh();setSelected(data.study_id);setCreating(false);setRequestId(crypto.randomUUID().replaceAll('-','').slice(0,24))
     }catch(e){setError(errorMessage(e))}finally{setBusy(false)}
@@ -52,11 +52,11 @@ function StudyManager(){
     {error&&<p className="error" role="alert">{error}</p>}
     {creating&&<form className="paper-card paper-create" onSubmit={create}><h3>设置评估</h3><div className="paper-form-grid">
       <label className="paper-wide">评估名称<input required maxLength={100} value={title} onChange={e=>setTitle(e.target.value)}/></label>
-      <label>官方数据划分<select value={split} onChange={e=>setSplit(e.target.value)}><option value="validation">Validation 验证集</option><option value="train">Training 训练集</option></select></label>
+      <label>样本来源<select value={split} onChange={e=>setSplit(e.target.value)}><option value="train">训练集</option><option value="validation">验证集</option></select></label>
       <label>随机任务数<input type="number" min={1} max={500} required value={size} onChange={e=>setSize(e.target.value)}/></label>
       <label>盲审抽样数<input type="number" min={1} max={500} required value={reviewSize} onChange={e=>setReviewSize(e.target.value)}/></label>
       <label><input type="checkbox" checked={reviewAll} onChange={e=>setReviewAll(e.target.checked)}/>审核全部交付样本，同时计算全量交付有效率</label>
-      {people.map((person,i)=><label key={i}>{i===2?'第三人 · 分歧裁定':`独立审核者 ${i+1}`}<input required maxLength={80} placeholder="填写真实审核者标识" value={person} onChange={e=>setPeople(old=>old.map((v,n)=>n===i?e.target.value:v))}/></label>)}
+      <label>审核者<input required maxLength={80} placeholder="填写你的审核者标识" value={reviewer} onChange={e=>setReviewer(e.target.value)}/></label>
     </div><p className="paper-note">样本不足时审核全部交付样本。点击开始后才调用模型，每个目标最多 12 次。</p>
     <button className="primary" disabled={busy}>{busy?'正在冻结…':'创建评估'}</button></form>}
     <div className="paper-layout"><aside className="paper-card paper-list"><h3>评估记录</h3>{loading?<p>正在读取…</p>:!studies.length?<p className="muted">还没有质量评估。</p>:studies.map(s=><button key={s.study_id} className={s.study_id===selected?'selected':''} onClick={()=>setSelected(s.study_id)}><strong>{s.spec.title}</strong><span>{s.spec.sample_size} 个任务 · {names[s.status==='ready'?s.batch.status:s.status]??s.status}</span><small>{new Date(s.created_at*1000).toLocaleDateString()}</small></button>)}</aside>
@@ -65,8 +65,8 @@ function StudyManager(){
         <p>已处理 {study.batch.finished??0} / {study.spec.sample_size} 个目标</p>
         {study.status!=='review'&&study.status!=='sealed'&&<div className="paper-actions"><button disabled={busy||['completed','blocked','running','queued'].includes(study.batch.status)} onClick={()=>void control('start')}>开始 / 继续生成</button><button disabled={busy||!['running','queued'].includes(study.batch.status)} onClick={()=>void control('pause')}>暂停实验</button><button className="primary" disabled={busy||!['completed','blocked'].includes(study.batch.status)} onClick={()=>void control('freeze')}>冻结结果，进入盲审</button></div>}
       </section>
-      <section className="paper-card"><h3>独立审核入口</h3><p className="muted">每位审核者使用自己的链接。第一阶段选择所有可能对象，全部定位锁定后才显示预期目标；第二阶段核对事实。分歧出现后第三人才能开始裁定。</p><div className="paper-reviewers">{study.reviewers.map(r=><div key={r.role}><div><strong>{r.name}</strong><small>{r.role===2?'分歧裁定':`独立审核者 ${r.role+1}`}</small></div><span>定位 {r.localized} · 判断 {r.answered}</span>{study.status==='review'||study.status==='sealed'?<a href={r.url} target="_blank" rel="noreferrer">打开专属盲审页 ↗</a>:<span className="muted">等待生成结果冻结</span>}</div>)}</div>
-        {study.status==='review'&&<button className="primary" disabled={busy} onClick={()=>void control('seal')}>完成裁定并封存报告</button>}</section>
+      <section className="paper-card"><h3>独立审核入口</h3><p className="muted">先为全部审核条目锁定候选，再查看预期目标并核对事实。{study.reviewers.length>1&&'旧评估仍按原审核安排处理分歧。'}</p><div className="paper-reviewers">{study.reviewers.map(r=><div key={r.role}><div><strong>{r.name}</strong><small>{r.role===2?'分歧裁定':`独立审核者 ${r.role+1}`}</small></div><span>定位 {r.localized} · 判断 {r.answered}</span>{study.status==='review'||study.status==='sealed'?<a href={r.url} target="_blank" rel="noreferrer">打开专属盲审页 ↗</a>:<span className="muted">等待生成结果冻结</span>}</div>)}</div>
+        {study.status==='review'&&<button className="primary" disabled={busy} onClick={()=>void control('seal')}>封存评估报告</button>}</section>
       <section className="paper-card"><div className="paper-section-heading"><h3>评估指标</h3>{study.report&&<a href={`/api/research/studies/${study.study_id}/report.json`}>下载报告</a>}</div>
         <StudyReport report={study.report} completion={study.automatic_completion_rate}/></section>
     </>:<section className="paper-card paper-empty">新建评估后，即可在这里查看进度、盲审入口和指标。</section>}</div></div>
@@ -105,7 +105,7 @@ function BlindReview({token}:{token:string}){
   const fields=[['factual_correct','表达中的事实是否都正确？'],['unique','表达是否只符合一个对象，没有其他可能对象？'],['input_sufficient','只凭这张原图与同帧点云，是否足以理解表达？'],['prior_target_exposure','本轮锁定定位之前，你是否已知道预期目标？']]
   return <div className="paper-workspace paper-blind"><section className="paper-intro"><div><span className="paper-eyebrow">INDEPENDENT BLIND REVIEW</span><h2>{inbox?.title??'独立人工盲审'}</h2><p>{inbox?`${inbox.reviewer} · ${inbox.role===2?'第三人裁定':'独立审核'} · ${inbox.phase==='localization'?'第一阶段：先找出所有可能对象':'第二阶段：核对预期目标及描述事实'}`:'正在读取审核任务…'}</p></div></section>
     {error&&<p role="alert" className="error">{error}</p>}
-    {inbox?.waiting?<section className="paper-card paper-empty"><h3>等待两名审核者完成</h3><p>独立判断全部提交后，这里仅提供有分歧的表达。</p><button onClick={()=>window.location.reload()}>刷新进度</button></section>:inbox&&!inbox.cases.length?<section className="paper-card paper-empty"><h3>当前没有需要审核的表达</h3><p>可能没有生成文本，或两位审核者没有分歧。无输出任务仍保留在实验分母。</p></section>:<>
+    {inbox?.waiting?<section className="paper-card paper-empty"><h3>等待两名审核者完成</h3><p>独立判断全部提交后，这里仅提供有分歧的表达。</p><button onClick={()=>window.location.reload()}>刷新进度</button></section>:inbox&&!inbox.cases.length?<section className="paper-card paper-empty"><h3>当前没有需要审核的表达</h3><p>本入口没有待分配的条目。无输出任务仍计入自动完成率的分母。</p></section>:<>
     {inbox&&<section className="paper-card paper-review-progress"><label>审核条目<select value={cid} onChange={e=>setCid(e.target.value)}>{inbox.cases.map((c,i)=><option key={c.case_id} value={c.case_id}>{i+1} / {inbox.cases.length} · {c.answered?'已判断':c.localized?'已锁定定位':'待定位'}</option>)}</select></label><span>已定位 {inbox.cases.filter(c=>c.localized).length} · 已判断 {inbox.cases.filter(c=>c.answered).length}</span></section>}
     {data?.case_id===cid&&<section className="paper-card"><blockquote className="paper-expression">{data.expression}</blockquote><p className="paper-note">{data.revealed?`预期目标：${data.expected}。你之前锁定的候选：${data.selection?.join('、')||'没有匹配对象'}。请独立判断事实和唯一性。`:'请选择所有符合表达的对象；可多选，也可明确提交空选。预期目标、生成方法和系统判断均已隐藏。全部条目定位锁定前不会揭示目标。'}</p>
       <TaskScene key={cid} data={{...data,job_id:'',ordinal:0,revision:'',run_id:'',can_confirm:false,review:true,selected_candidate_id:null,confirmation:null,image_box_source:'official_lidar_box_projection'}} selected={focus} onSelect={id=>{setFocus(id)}}/>

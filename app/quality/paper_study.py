@@ -23,8 +23,8 @@ class StudySpec(Contract):
     seed: int = Field(default=42, ge=0, le=2147483647)
     review_sample_size: int | None = Field(default=None, ge=1, le=500)
     review_all_deliveries: bool = False
-    dataset_split: str = Field(default='validation', pattern=r'^(train|validation)$')
-    reviewers: list[str] = Field(min_length=3, max_length=3)
+    dataset_split: str = Field(default='train', pattern=r'^(train|validation)$')
+    reviewers: list[str] = Field(min_length=1, max_length=3)
     input_price_per_million: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     output_price_per_million: float | None = Field(default=None, ge=0, allow_inf_nan=False)
 
@@ -32,8 +32,12 @@ class StudySpec(Contract):
     def people(self):
         self.title = self.title.strip()
         self.reviewers = [r.strip() for r in self.reviewers]
-        if not self.title or any(not r or len(r)>80 for r in self.reviewers) or len(set(self.reviewers))!=3:
-            raise ValueError('请填写三个不同的审核者标识。前两人独立审核，第三人裁定。')
+        count=len(self.reviewers)
+        allowed=(3,) if self.review_sample_size is None else (1,3)
+        if count not in allowed:
+            raise ValueError('请填写一名审核者，或为原有多人流程填写三名审核者。')
+        if not self.title or any(not r or len(r)>80 for r in self.reviewers) or len(set(self.reviewers))!=count:
+            raise ValueError('请填写评估名称及有效且互不重复的审核者标识。')
         return self
 
 
@@ -156,7 +160,8 @@ class PaperStudyStore:
                 rows=[t for t in catalog['targets'] if t['status']=='selected' and t.get('official_split')==official
                     and (t['context'],t['object_id']) not in unavailable]
                 rows.sort(key=lambda t:t['target_id']);random.Random(spec.seed).shuffle(rows)
-                if len(rows)<spec.sample_size: raise ValueError(f'未处理的可用任务只有 {len(rows)} 个，请减少样本量或更换官方划分。')
+                if not rows: raise ValueError('所选来源暂无可用目标，请选择有可用目标的样本来源。')
+                if len(rows)<spec.sample_size: raise ValueError(f'所选来源只有 {len(rows)} 个可用目标，请将随机任务数调至 {len(rows)} 以内。')
                 chosen=rows[:spec.sample_size]
                 db.execute('INSERT INTO paper_studies VALUES(?,NULL,?,?,?, ?,NULL)',
                     (sid,json.dumps(spec.model_dump()),method_fingerprint(),'creating',time.time()))
@@ -397,9 +402,9 @@ class PaperStudyStore:
                 if data['expression'] and review_required:
                     for p in people[:2]:
                         review=reviews.get((c['case_id'],p['token']),{})
-                        if not review.get('answer'):raise ValueError('两名审核者尚未完成全部独立判断。')
+                        if not review.get('answer'):raise ValueError('审核者尚未完成全部盲审判断。')
                         judgments.append({'reviewer':p['name'],**review})
-                    conflict=self.disagreement(c,judgments[0],judgments[1]);disputes+=conflict
+                    conflict=len(judgments)==2 and self.disagreement(c,judgments[0],judgments[1]);disputes+=conflict
                     selected=judgments[0]
                     if conflict:
                         review=reviews.get((c['case_id'],people[2]['token']),{})
@@ -464,7 +469,7 @@ class PaperStudyStore:
 
     def export_csv(self,sid):
         s=self.private(sid)
-        if s['status']!='sealed':raise ValueError('完成双人盲审、裁定并封存后才能导出带方法标签的结果。')
+        if s['status']!='sealed':raise ValueError('完成盲审并封存后才能导出结果。')
         output=io.StringIO();fields=['ordinal','method','expression','accepted','valid','status','reason','input_sha256','run_ids','cost','judgments','exposure_excluded']
         writer=csv.DictWriter(output,fieldnames=fields);writer.writeheader()
         for row in s['report']['rows']:
