@@ -616,8 +616,8 @@ class BatchExecution:
                 study.bind(study_id,ordinal,packet,run_id)
             if self.cancelled():
                 self.worker.store.request_control(run_id, self.store.command(self.job) or 'pause')
-            if study:
-                # Complete the fixed branch before Agent. A pause cannot leave
+            if study and study.private(study_id)['spec'].get('review_sample_size') is None:
+                # Complete the legacy fixed branch before Agent. A pause cannot leave
                 # an accepted Agent item hiding unfinished baseline work.
                 baseline=study.baseline(self,study_id,ordinal,calls)
                 if baseline['status'] in {'paused','stopped'}:

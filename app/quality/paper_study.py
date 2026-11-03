@@ -21,6 +21,8 @@ class StudySpec(Contract):
     title: str = Field(min_length=1, max_length=100)
     sample_size: int = Field(default=200, ge=1, le=500)
     seed: int = Field(default=42, ge=0, le=2147483647)
+    review_sample_size: int | None = Field(default=None, ge=1, le=500)
+    review_all_deliveries: bool = False
     dataset_split: str = Field(default='validation', pattern=r'^(train|validation)$')
     reviewers: list[str] = Field(min_length=3, max_length=3)
     input_price_per_million: float | None = Field(default=None, ge=0, allow_inf_nan=False)
@@ -122,7 +124,7 @@ class PaperStudyStore:
             with self.runs.connect() as db:
                 old=db.execute('SELECT spec,job_id,status FROM paper_studies WHERE study_id=?',(sid,)).fetchone()
             if old:
-                if json.loads(old['spec'])!=spec.model_dump(): raise ValueError('重复请求的实验设置不同。')
+                if StudySpec.model_validate_json(old['spec']).model_dump()!=spec.model_dump(): raise ValueError('重复请求的实验设置不同。')
                 if old['job_id']:return self.detail(sid,service)
             service.ensure_loaded_code()
             catalog=load_catalog()
@@ -182,6 +184,10 @@ class PaperStudyStore:
         with self.runs.connect() as db:
             reviewers=[dict(r) for r in db.execute('SELECT token,role,name FROM paper_reviewers WHERE study_id=? ORDER BY role',(sid,))]
             cases=db.execute('SELECT COUNT(*) FROM paper_cases WHERE study_id=?',(sid,)).fetchone()[0]
+            completion=None
+            if cases and s['spec'].get('review_sample_size') is not None:
+                delivered=db.execute("SELECT COUNT(*) FROM paper_cases WHERE study_id=? AND json_extract(payload,'$.accepted')=1",(sid,)).fetchone()[0]
+                completion=wilson(delivered,cases)
             for r in reviewers:
                 r['localized']=db.execute('SELECT COUNT(*) FROM paper_reviews WHERE token=? AND selection IS NOT NULL',(r['token'],)).fetchone()[0]
                 r['answered']=db.execute('SELECT COUNT(*) FROM paper_reviews WHERE token=? AND answer IS NOT NULL',(r['token'],)).fetchone()[0]
@@ -194,7 +200,7 @@ class PaperStudyStore:
                 batch['finished']=db.execute("SELECT COUNT(*) FROM batch_items WHERE job_id=? AND status NOT IN ('pending','running','preparing')",(s['job_id'],)).fetchone()[0]
         return {k:s[k] for k in ('study_id','job_id','spec','status','created_at','report')} | {
             'protocol':PROTOCOL,'baseline':BASELINE,'cases':cases,'reviewers':reviewers,
-            'batch':batch,'method_sha256':s['method_sha256']}
+            'batch':batch,'method_sha256':s['method_sha256'],'automatic_completion_rate':completion}
 
     def ensure_method(self, job):
         from app.agent.batch import method_fingerprint
@@ -262,11 +268,13 @@ class PaperStudyStore:
             if batch['status'] not in {'completed','blocked'} or batch['executor_active']:
                 raise ValueError('请等待全部固定任务结束；暂停或排队中的实验不能进入盲审。')
             rows=[]
+            sample_size=s['spec'].get('review_sample_size')
+            methods=('agent',) if sample_size is not None else ('agent','baseline')
             with self.runs.connect() as db:
                 trials={r['ordinal']:dict(r) for r in db.execute('SELECT * FROM paper_trials WHERE study_id=?',(sid,))}
             for item in batch['items']:
                 trial=trials.get(item['ordinal'])
-                for method in ('agent','baseline'):
+                for method in methods:
                     runs=(json.loads(trial['agent_runs']) if method=='agent' else [trial['baseline_run']] if trial['baseline_run'] else []) if trial else []
                     states=[self.runs.snapshot(rid) for rid in runs]
                     if any(t.get('provider_scope')!='real-model' for t in states):
@@ -287,7 +295,17 @@ class PaperStudyStore:
                         case['mapping']={f'C{i+1:03d}':oid for i,oid in enumerate(ids)}
                         case['expected']=next(k for k,v in case['mapping'].items() if v==p.target_object_id)
                     rows.append((secrets.token_hex(12),sid,item['ordinal'],method,json.dumps(case)))
-            if len(rows)!=s['spec']['sample_size']*2:raise ValueError('固定任务数不符，不能改变实验分母。')
+            if len(rows)!=s['spec']['sample_size']*len(methods):raise ValueError('固定任务数不符，不能改变实验分母。')
+            if sample_size is not None:
+                payloads=[json.loads(row[4]) for row in rows]
+                delivered=[i for i,payload in enumerate(payloads) if payload['accepted']]
+                selected=set(random.Random(s['spec']['seed']).sample(delivered,min(sample_size,len(delivered))))
+                for i,payload in enumerate(payloads):
+                    payload['sampled']=i in selected
+                    payload['review_required']=payload['sampled'] or (s['spec'].get('review_all_deliveries',False) and payload['accepted'])
+                    if payload['review_required'] and (not payload['expression'] or not payload.get('mapping')):
+                        raise ValueError('抽中的交付样本缺少盲审证据，无法冻结。')
+                    rows[i]=(*rows[i][:4],json.dumps(payload))
             with self.runs.connect() as db:
                 db.execute('BEGIN IMMEDIATE')
                 db.executemany('INSERT INTO paper_cases VALUES(?,?,?,?,?)',rows)
@@ -321,7 +339,7 @@ class PaperStudyStore:
     def assigned(self,token):
         person=self.reviewer(token);s=self.private(person['study_id'])
         cases,reviews,people=self.records(s['study_id'])
-        visible=[c for c in cases if c['payload']['expression']]
+        visible=[c for c in cases if c['payload']['expression'] and c['payload'].get('review_required',c['payload'].get('sampled',True))]
         complete=all(reviews.get((c['case_id'],p['token']),{}).get('answer') for c in visible for p in people[:2])
         if person['role']==2:
             visible=[c for c in visible if complete and self.disagreement(c,reviews[(c['case_id'],people[0]['token'])],reviews[(c['case_id'],people[1]['token'])])]
@@ -373,7 +391,10 @@ class PaperStudyStore:
             cases,reviews,people=self.records(sid);rows=[];disputes=0
             for c in cases:
                 data=c['payload'];judgments=[];effective=False;excluded=False
-                if data['expression']:
+                review_required=data.get('review_required',data.get('sampled',True))
+                if not review_required:
+                    effective=None
+                if data['expression'] and review_required:
                     for p in people[:2]:
                         review=reviews.get((c['case_id'],p['token']),{})
                         if not review.get('answer'):raise ValueError('两名审核者尚未完成全部独立判断。')
@@ -389,6 +410,20 @@ class PaperStudyStore:
                 rows.append({'case_id':c['case_id'],'ordinal':c['ordinal'],'method':c['method'],
                     **{k:v for k,v in data.items() if k not in {'packet','mapping'}},
                     'judgments':judgments,'valid':effective,'exposure_excluded':excluded})
+            if s['spec'].get('review_sample_size') is not None:
+                delivered=[r for r in rows if r['accepted']]
+                sampled=[r for r in rows if r['sampled']]
+                valid=sum(r['valid'] is True for r in sampled)
+                blind=not any(r['exposure_excluded'] for r in sampled)
+                full_review=all(r['valid'] is not None for r in delivered)
+                report={'protocol':'agent-quality-sample-v1','study_id':sid,'spec':s['spec'],
+                    'method_sha256':s['method_sha256'],'rows':rows,'quality':{
+                        'automatic_completion_rate':wilson(len(delivered),len(rows)),
+                        'accepted_validity':wilson(sum(r['valid'] is True for r in delivered),len(delivered)) if full_review else None,
+                        'random_sample_pass_rate':wilson(valid,len(sampled)) if blind else None}}
+                with self.runs.connect() as db:
+                    db.execute("UPDATE paper_studies SET status='sealed',report=? WHERE study_id=?",(json.dumps(report),sid))
+                return self.detail(sid,service)
             metrics={}
             for method in ('agent','baseline'):
                 items=[r for r in rows if r['method']==method];accepted=[r for r in items if r['accepted']]
