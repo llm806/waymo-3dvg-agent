@@ -12,6 +12,135 @@ import { renderToStaticMarkup } from 'react-dom/server'
 
 const require = createRequire(import.meta.url)
 const ts = require('typescript')
+
+test('blind review synchronizes picked boxes and safely advances through localization and judgment', async () => {
+  const source = readFileSync(new URL('../src/features/research/ResearchWorkspace.tsx', import.meta.url), 'utf8')
+  const code = ts.transpileModule(source + '\nexport { BlindReview, studyStatus, selectedStudy };', {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },
+  }).outputText
+  const savedFetch = globalThis.fetch
+  const slots = [], dependencies = [], cleanups = [], pendingEffects = []
+  let cursor = 0, tree, fail = false, release, hold = false, failLoad = false
+  const records = [{case_id:'a', localized:false, answered:false}, {case_id:'b', localized:false, answered:false}]
+  const selections = {}, judgments = {}, posts = []
+  const inbox = () => ({title:'Test', reviewer:'test', role:0, status:'review', waiting:false,
+    phase:records.every(c=>c.localized)?'judgment':'localization', cases:structuredClone(records)})
+  globalThis.fetch = async (url, options) => {
+    const parts = url.split('/'), cid = parts[6], kind = parts[7]
+    if (options?.method==='POST') {
+      posts.push({cid,kind,body:JSON.parse(options.body)})
+      if (hold) await new Promise(resolve=>{release=resolve})
+      if (fail) return new Response(JSON.stringify({detail:'保存失败'}),{status:503})
+      const row = records.find(c=>c.case_id===cid)
+      if (kind==='localization') { row.localized=true; selections[cid]=posts.at(-1).body.selected_labels }
+      else { row.answered=true; judgments[cid]=posts.at(-1).body }
+      return Response.json(inbox())
+    }
+    if (!cid) return Response.json(inbox())
+    if(failLoad) return new Response(JSON.stringify({detail:'加载失败'}),{status:503})
+    const revealed = records.every(c=>c.localized)
+    return Response.json({case_id:cid, expression:`Expression ${cid}`,selection:selections[cid]??null,
+      answer:judgments[cid]??null,revealed,expected:revealed?(cid==='a'?'C002':'C001'):null,preview:{},cameras:[],
+      candidates:[{candidate_id:'C001',category:'vehicle'},{candidate_id:'C002',category:'vehicle'}],point_count:10,full_cloud:'/test'})
+  }
+  const hooks = {
+    useState(initial) { const i=cursor++; if(!(i in slots))slots[i]=typeof initial==='function'?initial():initial;
+      return [slots[i], value=>{slots[i]=typeof value==='function'?value(slots[i]):value}] },
+    useRef(initial) { const i=cursor++; if(!(i in slots))slots[i]={current:initial}; return slots[i] },
+    useEffect(effect,deps) { const i=cursor++; if(!dependencies[i]||deps.some((v,j)=>!Object.is(v,dependencies[i][j]))) {
+      dependencies[i]=deps;pendingEffects.push(()=>{cleanups[i]?.();cleanups[i]=effect()}) } },
+  }
+  const exports = {}, Scene = ()=>null
+  new Function('require','exports',code)(name=>{
+    if(name==='react')return hooks
+    if(name.endsWith('/annotationDisplay'))return {readJson,errorMessage,categoryLabel}
+    if(name.endsWith('/duration'))return {formatDuration,hasIncompleteTiming}
+    if(name.endsWith('/TaskScene'))return {__esModule:true,default:Scene}
+    if(name.endsWith('.css'))return {}
+    return require(name)
+  },exports)
+  const walk = node => Array.isArray(node)?node.flatMap(walk):node&&typeof node==='object'?[node,...walk(node.props?.children)]:[]
+  const nodes = ()=>walk(tree)
+  const button = text=>nodes().find(n=>n.type==='button'&&n.props.children===text)
+  const scene = ()=>nodes().find(n=>n.type===Scene)
+  const picker = ()=>nodes().find(n=>n.type==='select')
+  const empty = ()=>nodes().find(n=>n.props?.['aria-label']==='没有匹配对象')
+  const render = ()=>{cursor=0;tree=exports.BlindReview({token:'test'});pendingEffects.splice(0).forEach(f=>f())}
+  const settle = async()=>{for(let i=0;i<4;i++){render();await setImmediate()}render()}
+  const pick = id=>{scene().props.onSelect(id);render()}
+  try {
+    await settle()
+    assert.equal(scene().props.selected,'')
+    assert.equal(scene().props.data.expected,null)
+    assert.equal(button('确认所选对象，下一条').props.disabled,true)
+    button('确认所选对象，下一条').props.onClick();await settle();assert.equal(posts.length,0)
+    pick('C001');pick('C001');pick('C002')
+    assert.equal(nodes().filter(n=>n.props?.['aria-label']?.startsWith('移除所选对象')).length,2)
+    assert.equal(empty().props.disabled,true)
+    nodes().find(n=>n.props?.['aria-label']==='移除所选对象 C002').props.onClick();render()
+    assert.equal(nodes().find(n=>n.props?.className==='paper-candidates').props.children[0].props.children[0].props.checked,true)
+    fail=true;hold=true
+    const submit=button('确认所选对象，下一条').props.onClick
+    submit();submit();render()
+    assert.equal(posts.length,1);assert.deepEqual(posts[0].body.selected_labels,['C001'])
+    assert.equal(picker().props.disabled,true);assert.equal(button('正在保存…').props.disabled,true)
+    picker().props.onChange({target:{value:'b'}});render();assert.equal(picker().props.value,'a')
+    release();await settle()
+    assert.equal(picker().props.value,'a');assert.equal(button('确认所选对象，下一条').props.disabled,false)
+    assert.ok(nodes().some(n=>n.props?.role==='alert'))
+    fail=false;hold=false;failLoad=true
+    button('确认所选对象，下一条').props.onClick();await settle()
+    assert.equal(picker().props.value,'b');assert.equal(scene(),undefined)
+    assert.ok(button('重新加载当前条目'))
+    failLoad=false;button('重新加载当前条目').props.onClick();await settle()
+    assert.equal(button('确认所选对象，下一条').props.disabled,true)
+    picker().props.onChange({target:{value:'a'}});await settle()
+    assert.equal(button('定位已锁定').props.disabled,true)
+    pick('C002');assert.equal(nodes().filter(n=>n.props?.['aria-label']?.startsWith('移除所选对象')).length,1)
+    picker().props.onChange({target:{value:'b'}});await settle()
+    empty().props.onChange({target:{checked:true}});render()
+    assert.equal(button('确认无匹配对象，下一条').props.disabled,false)
+    pick('C001');assert.equal(empty().props.checked,false)
+    nodes().find(n=>n.props?.['aria-label']==='移除所选对象 C001').props.onClick();render()
+    assert.equal(button('确认所选对象，下一条').props.disabled,true)
+    empty().props.onChange({target:{checked:true}});render()
+    button('确认无匹配对象，下一条').props.onClick();await settle()
+    assert.deepEqual(posts.at(-1).body.selected_labels,[])
+    assert.equal(picker().props.value,'a');assert.equal(scene().props.data.revealed,true)
+    assert.equal(nodes().some(n=>n.props?.['aria-label']==='盲评定位确认'),false)
+    for(const id of ['a','b']) {
+      assert.equal(picker().props.value,id)
+      assert.equal(scene().props.selected,id==='a'?'C002':'C001')
+      assert.equal(scene().props.onSelect,undefined)
+      assert.deepEqual(scene().props.data.selection,id==='a'?['C001']:[])
+      assert.equal(nodes().filter(n=>n.type==='fieldset').length,3)
+      const count=posts.length
+      nodes().find(n=>n.type==='form').props.onSubmit({preventDefault(){}});await settle()
+      assert.equal(posts.length,count)
+      for(const n of nodes().filter(n=>n.type==='input'&&n.props.type==='radio'&&n.props.value==='false'))n.props.onChange()
+      render();nodes().find(n=>n.type==='form').props.onSubmit({preventDefault(){}});await settle()
+      assert.equal(posts.at(-1).kind,'answer')
+      assert.equal('prior_target_exposure' in posts.at(-1).body,false)
+    }
+    assert.equal(scene(),undefined)
+    assert.equal(picker(),undefined)
+    assert.ok(nodes().some(n=>n.props?.children==='全部独立判断已保存，审核完成。'))
+    assert.equal(nodes().find(n=>n.props?.className==='primary paper-completion-link').props.href,'#research?review_done=test')
+    button('查看已提交判断').props.onClick();await settle()
+    assert.equal(button('判断已保存').props.disabled,true)
+    assert.equal(scene().props.selected,'C001')
+    button('收起已提交判断').props.onClick();render();assert.equal(scene(),undefined)
+    const study={status:'review',spec:{review_sample_size:20,review_all_deliveries:true},batch:{passed:10},reviewers:[{answered:10}]}
+    assert.equal(exports.studyStatus(study),'审核完成 · 待生成报告')
+    assert.equal(exports.studyStatus({...study,reviewers:[{answered:9}]}),'独立盲审中')
+    assert.equal(exports.studyStatus({...study,reviewers:[{answered:10},{answered:0},{answered:0}]}),'独立盲审中')
+    assert.equal(exports.studyStatus({...study,status:'sealed'}),'已封存')
+    const studies=[{study_id:'new',reviewers:[{url:'#research?review=other'}]},{study_id:'reviewed',reviewers:[{url:'#research?review=test'}]}]
+    assert.equal(exports.selectedStudy(studies,'','test'),'reviewed')
+    assert.equal(exports.selectedStudy(studies,'new','test'),'new')
+    assert.equal(exports.selectedStudy(studies,'',null),'new')
+  } finally { cleanups.forEach(f=>f?.());globalThis.fetch=savedFetch }
+})
 const compiled = ts.transpileModule(readFileSync(new URL('../src/features/tasks/TaskManager.tsx', import.meta.url), 'utf8'), {
   compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },
 }).outputText

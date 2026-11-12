@@ -5024,7 +5024,10 @@ def _check_paired_paper_study(root,monkeypatch):
     assert detail['cases']==4 and detail['status']=='review'
     cases,reviews,people=papers.records(sid);visible=[c for c in cases if c['payload']['expression']]
     assert len(visible)==2 and all('method' not in c for c in papers.inbox('token-0')['cases'])
-    answer=Judgment(factual_correct=True,unique=True,input_sufficient=True,prior_target_exposure=False,notes='',elapsed_seconds=15)
+    answer=Judgment(factual_correct=True,unique=True,input_sufficient=True,notes='',elapsed_seconds=15)
+    assert answer.prior_target_exposure is None
+    historical=answer.model_copy(update={'prior_target_exposure':True})
+    assert papers.verdict(visible[0],{'selection':[visible[0]['payload']['expected']],'answer':historical.model_dump()}) is None
     for token in ('token-0','token-1'):
         c=visible[0]
         with pytest.raises(ValueError,match='定位'):papers.answer(token,c['case_id'],answer)

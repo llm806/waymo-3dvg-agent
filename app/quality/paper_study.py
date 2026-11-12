@@ -19,7 +19,7 @@ BASELINE = 'fixed-vlm-one-request-v1'
 class StudySpec(Contract):
     request_id: str = Field(pattern=r'^[a-f0-9]{24}$')
     title: str = Field(min_length=1, max_length=100)
-    sample_size: int = Field(default=200, ge=1, le=500)
+    sample_size: int = Field(default=50, ge=1, le=500)
     seed: int = Field(default=42, ge=0, le=2147483647)
     review_sample_size: int | None = Field(default=None, ge=1, le=500)
     review_all_deliveries: bool = False
@@ -45,7 +45,8 @@ class Judgment(Contract):
     factual_correct: bool
     unique: bool
     input_sufficient: bool
-    prior_target_exposure: bool
+    # Legacy answers retain their exposure flag; new forms do not collect it.
+    prior_target_exposure: bool | None = None
     notes: str = Field(default='', max_length=2000)
     elapsed_seconds: float = Field(ge=0, le=86400, allow_inf_nan=False)
 
@@ -207,6 +208,29 @@ class PaperStudyStore:
             'protocol':PROTOCOL,'baseline':BASELINE,'cases':cases,'reviewers':reviewers,
             'batch':batch,'method_sha256':s['method_sha256'],'automatic_completion_rate':completion}
 
+    def delete_empty(self, sid, service):
+        with service.runner.lock:
+            study=self.private(sid)
+            job=study['job_id']
+            if study['status']!='ready' or not job or service.store.detail(job)['executor_active']:
+                raise ValueError('仅可删除尚未生成结果且已退出执行的评估。')
+            with self.runs.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                batch=db.execute('SELECT status FROM batches WHERE job_id=?',(job,)).fetchone()
+                current=db.execute('SELECT status FROM paper_studies WHERE study_id=?',(sid,)).fetchone()
+                if (not current or current['status']!='ready' or not batch or batch['status'] not in {'ready','paused','stopped'}
+                    or db.execute("SELECT 1 FROM batch_items WHERE job_id=? AND (status!='pending' OR run_id IS NOT NULL OR packet_id IS NOT NULL)",(job,)).fetchone()
+                    or db.execute('SELECT 1 FROM paper_trials WHERE study_id=?',(sid,)).fetchone()
+                    or db.execute('SELECT 1 FROM paper_cases WHERE study_id=?',(sid,)).fetchone()):
+                    raise ValueError('评估已开始生成证据或已有运行记录，不能按空评估删除。')
+                db.execute('DELETE FROM paper_reviewers WHERE study_id=?',(sid,))
+                db.execute('DELETE FROM paper_targets WHERE study_id=?',(sid,))
+                db.execute('DELETE FROM paper_studies WHERE study_id=?',(sid,))
+                db.execute('DELETE FROM batch_items WHERE job_id=?',(job,))
+                db.execute('DELETE FROM batch_events WHERE job_id=?',(job,))
+                db.execute('DELETE FROM batches WHERE job_id=?',(job,))
+        return {'study_id':sid,'deleted':True}
+
     def ensure_method(self, job):
         from app.agent.batch import method_fingerprint
         sid=study_for_job(self.runs,job)
@@ -339,7 +363,7 @@ class PaperStudyStore:
     @staticmethod
     def disagreement(case,first,second):
         fields=('unique','factual_correct','input_sufficient','prior_target_exposure')
-        return first['selection']!=second['selection'] or any(first['answer'][k]!=second['answer'][k] for k in fields)
+        return first['selection']!=second['selection'] or any(bool(first['answer'].get(k))!=bool(second['answer'].get(k)) for k in fields)
 
     def assigned(self,token):
         person=self.reviewer(token);s=self.private(person['study_id'])
@@ -410,7 +434,7 @@ class PaperStudyStore:
                         review=reviews.get((c['case_id'],people[2]['token']),{})
                         if not review.get('answer'):raise ValueError('分歧尚未由第三人裁定。')
                         selected={'reviewer':people[2]['name'],**review};judgments.append(selected)
-                    excluded=any(j['answer']['prior_target_exposure'] for j in judgments)
+                    excluded=any(j['answer'].get('prior_target_exposure') is True for j in judgments)
                     effective=self.verdict(c,selected) if not excluded else None
                 rows.append({'case_id':c['case_id'],'ordinal':c['ordinal'],'method':c['method'],
                     **{k:v for k,v in data.items() if k not in {'packet','mapping'}},
