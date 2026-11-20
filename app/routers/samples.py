@@ -253,7 +253,8 @@ def samples(job_id: Id, request: Request):
                         row['legacy_rules'] = row['legacy_rules'] or run_version not in {None, VERSION}
                     elif not row.get('legacy_rules') and (item['format'] or '').startswith(cache_format + ':'):
                         row['legacy_rules'] = item['format'] != f'{cache_format}:{VERSION}'
-                    result.append({**row, 'reviewed': (row['ordinal'], row['revision']) in confirmations})
+                    result.append({**row, 'object_id': json.loads(item['target']).get('object_id'),
+                        'reviewed': (row['ordinal'], row['revision']) in confirmations})
                 elif item['status'] == 'needs_evidence' and (item['reason'] or '').startswith('precheck_'):
                     precheck_failed += 1
         if pending:

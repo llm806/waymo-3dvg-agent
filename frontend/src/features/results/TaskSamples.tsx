@@ -16,7 +16,7 @@ import type { ResultView } from './resultViewState'
 import type { ReworkState } from './ReworkProgress'
 
 type Job = { job_id: string; created_at: number; status: string; counts: Record<string,number> }
-type Sample = { ordinal: number; category: string; expression: string; run_id: string; packet_id: string; status: string; automatic_passed?: boolean; manual_approved?:boolean; usable?:boolean; viewing_previous?:boolean; reviewed: boolean; source_view?: string | null; legacy_rules?: boolean; revision: string | null; can_review: boolean; can_retry?: boolean; retry_failed_run_id?: string; manual_review: ManualReview | null }
+type Sample = { ordinal: number; object_id?: string | null; category: string; expression: string; run_id: string; packet_id: string; status: string; automatic_passed?: boolean; manual_approved?:boolean; usable?:boolean; viewing_previous?:boolean; reviewed: boolean; source_view?: string | null; legacy_rules?: boolean; revision: string | null; can_review: boolean; can_retry?: boolean; retry_failed_run_id?: string; manual_review: ManualReview | null }
 type CheckFilter = ResultView['filter']
 type Samples = { task_goal?: number | null; job_id: string; status: string; samples: Sample[]; total_objects: number; created_at: number; review_summary: { unreviewed: number; accepted: number; rejected: number; discarded: number; usable: number; precheck_failed: number } }
 const jobLabels: Record<string,string> = localizeLabels({ ready:'待启动', queued:'排队中', running:'执行中', paused:'已暂停', completed:'已完成', stopped:'已停止', blocked:'执行受阻' })
@@ -59,6 +59,7 @@ export default function TaskSamples() {
   const sampleArea=useRef<HTMLDivElement|null>(null)
   const scrollToSample=useRef(Boolean(fromUrl().ordinal)&&!restoredView.restored)
   const [sampleIdInput,setSampleIdInput]=useState('')
+  const [sampleSearchError,setSampleSearchError]=useState<InterfaceMessage>('')
   const pageTarget=useRef<{job:string;ordinal:number}|null>(restoredView.restored?null:fromUrl())
   const listArea=useRef<HTMLOListElement|null>(null)
   const restoreScroll=useRef(restoredView.restored?{...restoredView,listDone:false}:null)
@@ -201,7 +202,7 @@ export default function TaskSamples() {
   },[jobId,ordinal,samples,refresh])
   function toggleReview(){setReview(v=>!v);setScene(null);setSelected('');setConfirmation(null);setSceneError('')}
   function chooseSample(n:number){pageTarget.current=null;setSampleActionError('');setOrdinal(n);if(n===ordinal)return;setScene(null);setSelected('');setConfirmation(null);setSceneError('')}
-  function chooseJob(id:string){restoreScroll.current=null;pageTarget.current=null;setSampleActionError('');const cached=sampleCache.current.get(id);setJobId(id);setSamples(cached??null);setOrdinal(cached?.samples[0]?.ordinal??0);setScene(null);setSelected('');setConfirmation(null);setSceneError('');setQueue(null);setCheckFilter('all');setListPage(0);setReview(false);setSelectionError('');setError('')}
+  function chooseJob(id:string){restoreScroll.current=null;pageTarget.current=null;setSampleActionError('');const cached=sampleCache.current.get(id);setJobId(id);setSamples(cached??null);setOrdinal(cached?.samples[0]?.ordinal??0);setScene(null);setSelected('');setConfirmation(null);setSceneError('');setQueue(null);setCheckFilter('all');setListPage(0);setReview(false);setSelectionError('');setSampleIdInput('');setSampleSearchError('');setError('')}
   async function drawSamples(){
     const count=Number(drawCount)
     if(!Number.isSafeInteger(count)||count<1||count>1000){setSelectionError("抽样数量请输入 1～1000 的整数。");return}
@@ -213,13 +214,27 @@ export default function TaskSamples() {
     }catch(e){setSelectionError(errorMessage(e))}finally{setBusy(false)}
   }
   function jumpToSampleId(){
-    const match=/^#?\s*(\d+)$/.exec(sampleIdInput.trim())
-    const id=match?Number(match[1]):0
-    if(!Number.isSafeInteger(id)||id<=0){setSelectionError("请输入有效的样本编号，例如 4104 或 #4104。");return}
-    if(!rows.some(s=>s.ordinal===id)&&!(retryReceipt?.job_id===jobId&&retryReceipt.ordinal===id)){
-      setSelectionError(["当前任务没有样本 #{0}，请核对编号或切换任务。", id]);return
+    const query=sampleIdInput.trim()
+    const number=/^#?\s*(\d+)$/.exec(query)
+    const ordinal=number?Number(number[1]):0
+    const validNumber=Number.isSafeInteger(ordinal)&&ordinal>0
+    let found=validNumber&&(rows.some(s=>s.ordinal===ordinal)||(retryReceipt?.job_id===jobId&&retryReceipt.ordinal===ordinal))?ordinal:undefined
+    if(found===undefined&&query&&!query.startsWith('#')){
+      const matching=rows.filter(s=>s.object_id===query)
+      if(matching.length>1){
+        setSampleSearchError("该物体 ID 对应多条样本，请用样本编号查找。")
+        return
+      }
+      found=matching[0]?.ordinal
     }
-    setReworkTarget('');openSample(jobId,id)
+    if(found===undefined){
+      setSampleSearchError(!query||query.startsWith('#')&&!validNumber
+        ?"请输入样本编号或 Waymo 物体 ID。"
+        :validNumber?["当前任务没有样本 #{0}，请核对编号或切换任务。",ordinal]
+        :"当前任务没有匹配的样本。")
+      return
+    }
+    setSampleSearchError('');setReworkTarget('');openSample(jobId,found)
   }
   function jumpToIndex(){
     const index=Number(jumpIndex),rows=visibleRows
@@ -372,7 +387,6 @@ export default function TaskSamples() {
         {!!rows.length&&<div id="review-selection" className="review-selection" role="region" aria-label={t("审核样本选择")} hidden={!selectionOpen}>
           <div className="review-toolbar">
             <form onSubmit={e=>{e.preventDefault();void drawSamples()}}><label htmlFor="review-count">{t("抽样数量")}</label><input id="review-count" type="number" min="1" max="1000" value={drawCount} disabled={busy} onChange={e=>setDrawCount(e.target.value)}/><label className="review-checkbox"><input type="checkbox" checked={unreviewed} disabled={busy} onChange={e=>setUnreviewed(e.target.checked)}/>{t("仅未审核")}</label><button className="primary" disabled={busy}>{t("随机抽样")}</button></form>
-            <form onSubmit={event=>{event.preventDefault();jumpToSampleId()}}><label htmlFor="review-sample-id">{t("样本编号 ")}</label><input id="review-sample-id" type="text" value={sampleIdInput} placeholder={t("例如 #4104")} disabled={busy} onChange={event=>setSampleIdInput(event.target.value)}/><button disabled={busy}>{t("查看样本")}</button></form>
             <form onSubmit={e=>{e.preventDefault();jumpToIndex()}}><label htmlFor="review-index">{t("列表位置 ")}<span className="muted">1–{visibleRows.length}</span></label><input id="review-index" type="number" min="1" max={visibleRows.length} value={jumpIndex} disabled={busy} onChange={e=>setJumpIndex(e.target.value)}/><button disabled={busy}>{t("跳转")}</button></form>
             {queue&&<button className="text-button" disabled={busy} onClick={()=>{setQueue(null);setListPage(Math.floor(rows.findIndex(s=>s.ordinal===ordinal)/pageSize))}}>{t("退出抽样")}</button>}
           </div>
@@ -382,8 +396,17 @@ export default function TaskSamples() {
       {retryReceipt?.job_id===jobId&&<div className="notice" role="status"><span>{t("样本 #")}{retryReceipt.ordinal}：{(retryReceipt.message?serviceText(retryReceipt.message):undefined)??t("返工已受理，新描述仍须通过自动核验。")}</span> <a href={sampleUrl(jobId,retryReceipt.ordinal)} onClick={event=>{if(event.button!==0||event.ctrlKey||event.metaKey||event.shiftKey||event.altKey)return;event.preventDefault();openSample(jobId,retryReceipt.ordinal)}}>{t("查看该样本")}</a><button className="text-button" onClick={()=>setRetryReceipt(null)}>{t("关闭提示")}</button></div>}
       {!samples||samples.job_id!==jobId?<section className="panel results-loading" role="status">{!error&&<span className="loading-dot"/>}{error?t("样本读取未完成"):t("正在读取该任务的样本…")}</section>:!samples.samples.length&&!linkedOrdinal?<section className="panel results-empty-state"><h2>{t("该任务还没有生成文本样本")}</h2></section>:<div className={`sample-browser-grid${alignPanels?' sample-browser-aligned':''}`}>
         <aside className="sample-list panel" aria-label={t("当前任务样本")}>
+          <div className="sample-list-header">
           <h3 className="sample-list-heading">{queue?t("本轮抽样"):t("标注样本")}</h3>
+          <form className="sample-list-search" role="search" onSubmit={event=>{event.preventDefault();jumpToSampleId()}}>
+            <input id="review-sample-id" type="search" aria-label={t("样本编号或物体 ID")} aria-invalid={!!sampleSearchError}
+              aria-describedby={sampleSearchError?'review-sample-search-error':undefined} placeholder={t("编号 / 物体 ID")}
+              value={sampleIdInput} disabled={busy} onChange={event=>{setSampleIdInput(event.target.value);setSampleSearchError('')}} />
+            <button disabled={busy}>{t("查找")}</button>
+          </form>
+          {sampleSearchError&&<p id="review-sample-search-error" className="error" role="alert">{serviceText(sampleSearchError)}</p>}
           <select className="sample-check-filter" aria-label={t("样本状态筛选")} value={checkFilter} disabled={busy} onChange={e=>filterChecks(e.target.value as CheckFilter)}>{(Object.keys(sampleFilterLabels) as CheckFilter[]).map(key=><option key={key} value={key}>{sampleFilterLabels[key]}（{listedRows.filter(s=>matchesSampleFilter(s,key)).length}）</option>)}</select>
+          </div>
           <ol ref={listArea} onScroll={event=>{if(savedView.current&&(!restoreScroll.current||restoreScroll.current.listDone)){savedView.current.listScroll=Math.round(event.currentTarget.scrollTop);saveResultView(savedView.current)}}} start={page*pageSize+1}>
             {pageRows.map(s=>{
               const state=automaticCheckState(s)

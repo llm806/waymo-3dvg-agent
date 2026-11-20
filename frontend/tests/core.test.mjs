@@ -1164,7 +1164,8 @@ test('sample discard is available outside localization and protects the displaye
       can_review:mode!=='unfinished',manual_review:mode==='discarded'?decision:null}
     const list={job_id:job.job_id,created_at:0,status:'completed',total_objects:1,samples:[sample],
       review_summary:{unreviewed:1,accepted:0,rejected:0,discarded:0,usable:1}}
-    if(mode==='navigation')list.samples.push(...Array.from({length:35},(_,i)=>({...sample,ordinal:1000+i})),{...sample,ordinal:4104})
+    if(mode==='navigation')list.samples.push(...Array.from({length:35},(_,i)=>({...sample,ordinal:1000+i})),
+      {...sample,ordinal:4104,object_id:'waymo-track-4104'})
     const states=[mode==='review',[job],job.job_id,true,list,12,null,'',null,false]
     let index=0
     new Function('require','exports',compiled)(name => {
@@ -1193,6 +1194,11 @@ test('sample discard is available outside localization and protects the displaye
       if(mode==='navigation'){
         const input=()=>nodes().find(n=>n.type==='input'&&n.props.id==='review-sample-id')
         const submit=()=>nodes().find(n=>n.type==='form'&&flatten(n.props.children).some(c=>c.props?.id==='review-sample-id')).props.onSubmit({preventDefault(){}})
+        assert.ok(flatten(nodes().find(n=>n.type==='aside').props.children).some(node=>node.props?.id==='review-sample-id'))
+        input().props.onChange({target:{value:'waymo-track-4104'}});submit()
+        assert.equal(states[5],4104)
+        input().props.onChange({target:{value:'12'}});submit()
+        assert.equal(states[5],12)
         input().props.onChange({target:{value:'#4104'}});submit()
         assert.equal(states[5],4104)
         assert.equal(globalThis.window.location.hash,sampleUrl(job.job_id,4104))

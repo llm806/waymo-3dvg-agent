@@ -178,7 +178,7 @@ select { appearance:none; padding-inline-end:32px; background-image:url("data:im
 .review-metric.usable dd { color:var(--ui-accent-dark); }
 .review-selection { margin:var(--field-gap) 0 0; padding-top:var(--field-gap); border-top:1px solid var(--ui-border); }
 .review-selection > p { margin-bottom:0; }
-.review-toolbar { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); align-items:start; gap:var(--field-gap); }
+.review-toolbar { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); align-items:start; gap:var(--field-gap); }
 .review-toolbar form { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:end; gap:6px; min-width:0; }
 .review-toolbar form > label:first-child { grid-column:1/-1; font-weight:600; }
 .review-toolbar input[type=text], .review-toolbar input[type=number] { width:100%; min-width:0; }
@@ -188,11 +188,14 @@ select { appearance:none; padding-inline-end:32px; background-image:url("data:im
 .sample-browser-grid { display:grid; grid-template-columns:clamp(210px,22%,var(--sidebar-width)) minmax(0,1fr); align-items:start; gap:var(--section-gap); }
 .sample-list.panel { position:sticky; top:72px; margin:0; padding:var(--panel-padding) var(--field-gap) var(--field-gap); }
 .sample-list .sample-list-heading { margin:0 0 8px; font-size:15px; }
+.sample-list-search { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:6px; margin-bottom:8px; }
+.sample-list-search :is(input,button) { min-width:0; min-height:var(--compact-control-height); padding:4px 8px; font-size:13px; }
+.sample-list-header > p.error { margin:0 0 8px; color:var(--ui-error); white-space:normal; overflow-wrap:anywhere; }
 .sample-list .sample-check-filter { width:100%; min-height:var(--compact-control-height); margin-bottom:12px; padding-block:4px; font-size:13px; }
 .sample-list ol { list-style:none; margin:0; padding:0; overflow:auto; max-height:clamp(220px,48dvh,440px); scrollbar-gutter:stable; }
 @media (min-width:821px) {
   .sample-browser-aligned { align-items:stretch; }
-  .sample-browser-aligned .sample-list.panel { position:static; display:grid; grid-template-rows:auto auto minmax(0,1fr) auto; contain:size; }
+  .sample-browser-aligned .sample-list.panel { position:static; display:grid; grid-template-rows:auto minmax(0,1fr) auto; contain:size; }
   .sample-browser-aligned .sample-list ol { max-height:none; }
   .sample-browser-aligned .sample-main { display:grid; min-width:0; }
 }
