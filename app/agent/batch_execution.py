@@ -211,6 +211,7 @@ class BatchExecution:
             pending = FrameAffinityQueue((i for i in detail['items'] if i['status'] not in SETTLED),
                 enabled=parallelism > 1 and self.preparation_concurrency > 1)
             exhausted, inflight, connection_failures, request_rejections = False, {}, 0, 0
+            response_shape_failures = 0
             dispatched = set()
             self.store.update(self.job, 'execution_pipeline_started', {
                 'target_concurrency': parallelism, 'preparation_concurrency': min(parallelism,self.preparation_concurrency),
@@ -230,7 +231,13 @@ class BatchExecution:
                             diagnostic_event(self.worker.root, 'target_worker_failed', exception=exc, job_id=self.job)
                             outcome = ('blocked', type(exc).__name__)
                         if halt is None:
-                            if outcome and outcome[0] == 'request_rejected':
+                            if outcome and outcome[0] == 'response_shape_failed':
+                                request_rejections = 0
+                                connection_failures = 0
+                                response_shape_failures += 1
+                                if response_shape_failures >= 2:
+                                    halt = ('paused', 'repeated_response_shape_failures')
+                            elif outcome and outcome[0] == 'request_rejected':
                                 request_rejections += 1
                                 if request_rejections >= 3:
                                     halt = ('paused', 'repeated_request_rejections')
@@ -631,10 +638,15 @@ class BatchExecution:
                 'status': result['status'], 'auto_published': False}, ordinal=ordinal,
                 item_status='failed' if result['status'] == 'blocked' else result['status'],
                 reason=result.get('stop_reason'), run_id=run_id)
-            if result['status'] != 'blocked' or result.get('stop_reason') == 'model_call:invalid_output':
+            if result['status'] != 'blocked':
                 return None
             failure = (saved_call_diagnostic(self.worker.root / run_id / result['inflight']['folder'])
                 if result.get('inflight') else {})
+            if result.get('stop_reason') == 'model_call:invalid_output':
+                if any(error.get('location') == [] and error.get('type') == 'model_type'
+                       for error in failure.get('validation_errors', [])):
+                    return ('response_shape_failed', None)
+                return None
             outcome = failure.get('remote_outcome')
             if result.get('stop_reason') == 'model_call:api_failed' and isolated_request_failure(failure):
                 self.store.update(self.job, 'target_request_rejected', {'ordinal':ordinal, 'run_id':run_id,

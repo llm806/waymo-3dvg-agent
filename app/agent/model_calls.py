@@ -17,8 +17,8 @@ from openai import APIConnectionError, APIStatusError, OpenAI
 from pydantic import BaseModel, ValidationError
 
 from app.datasets.evidence import atomic_json
-from app.schemas.contracts import SceneVisualObservation
-from app.agent.observation_wire import unknown_optional_evidence, wire_response_type
+from app.schemas.contracts import GeneratedExpression, SceneVisualObservation, VisualObservation
+from app.agent.observation_wire import scene_candidate_array, unknown_optional_evidence, wire_response_type
 
 
 class ModelCallFailure(RuntimeError):
@@ -62,6 +62,13 @@ def release_auth_rejection(state, failure):
     return True
 
 
+def is_dashscope_endpoint(base_url):
+    host = (urlparse(base_url).hostname or '').lower()
+    return (host in {'dashscope.aliyuncs.com', 'dashscope-intl.aliyuncs.com', 'dashscope-us.aliyuncs.com'}
+        or host.endswith('.dashscope.aliyuncs.com')
+        or host.endswith('.maas.aliyuncs.com'))
+
+
 def image_model_error(model, base_url):
     """Reject documented text-only DashScope models, not entire model families.
 
@@ -69,12 +76,8 @@ def image_model_error(model, base_url):
     support. New/unknown models are not declared text-only from their names.
     https://help.aliyun.com/zh/model-studio/deepseek-v4-flash
     """
-    host = (urlparse(base_url).hostname or '').lower()
-    dashscope = (host in {'dashscope.aliyuncs.com', 'dashscope-intl.aliyuncs.com', 'dashscope-us.aliyuncs.com'}
-        or host.endswith('.dashscope.aliyuncs.com')
-        or host.endswith('.maas.aliyuncs.com'))
     text_only = re.fullmatch(r'deepseek-v4-(?:flash(?:-0731)?|pro(?:-0813)?)(?:-us)?', model)
-    if dashscope and text_only:
+    if text_only and is_dashscope_endpoint(base_url):
         return (f'{model} 在当前百炼接入仅支持文本，不能用于图像标注。'
             '请使用支持图像输入的模型，例如 qwen3.7-flash-2026-07-15。')
     return None
@@ -88,8 +91,24 @@ def validated_response(answer, output_type, expected_candidate_ids=None):
     trail. The caller retains the exact original answer.
     """
     normalization = None
+    # A bare object takes the normal validation path without a second JSON parse.
+    if isinstance(answer, str) and answer.lstrip().startswith('['):
+        try:
+            root = json.loads(answer)
+        except ValueError:
+            root = None
+        # Accept a transport wrapper only when its sole object already validates.
+        # Several observations or alternative descriptions cannot be combined.
+        if isinstance(root, list) and len(root) == 1 and isinstance(root[0], dict):
+            try:
+                parsed = output_type.model_validate_json(json.dumps(root[0]))
+            except ValidationError:
+                pass
+            else:
+                normalization = 'single-object-array-wrapper-v1'
     try:
-        parsed = output_type.model_validate_json(answer)
+        if normalization is None:
+            parsed = output_type.model_validate_json(answer)
     except ValidationError as validation_error:
         try:
             value = json.loads(answer)
@@ -100,6 +119,14 @@ def validated_response(answer, output_type, expected_candidate_ids=None):
                 and 'output' not in output_type.model_fields):
             value = value['output']
             normalization = 'single-output-wrapper-v1'
+            try:
+                output_type.model_validate(value)
+            except ValidationError as inner_error:
+                validation_error = inner_error
+        scene = scene_candidate_array(value, output_type, expected_candidate_ids)
+        if scene is not None:
+            value = scene
+            normalization = 'exact-candidate-array-v1'
             try:
                 output_type.model_validate(value)
             except ValidationError as inner_error:
@@ -138,6 +165,8 @@ def validation_diagnostics(exc, answer):
     for error in exc.errors(include_input=False, include_url=False):
         detail = {'location': list(error['loc']), 'type': error['type'], 'message': error['msg']}
         value = root
+        if isinstance(root, list) and error['loc'] and error['loc'][0] in {'c', 'candidates'}:
+            value = {error['loc'][0]: root}
         for key in error['loc']:
             if isinstance(value, dict) and isinstance(value.get('id', value.get('candidate_id')), str):
                 detail['candidate_id'] = value.get('id', value.get('candidate_id'))[:120]
@@ -195,19 +224,20 @@ def format_retry_messages(messages, output_type, errors):
     # their exact schema instead of replacing it with an unconstrained default.
     if "output_schema" not in payload:
         payload["output_schema"] = wire_response_type(messages, output_type).model_json_schema()
-    keys = list(payload['output_schema'].get('properties', {}))
-    payload["format_feedback"] = {"errors": errors, 'allowed_top_level_keys': keys,
-        "instruction": 'Return the result JSON object itself at the root. '
-        'Do not wrap it in output, result or data; do not echo output_schema, candidate_ids, '
-        'format_feedback or type unless that key is explicitly allowed. '
-        'Keep the original task, observations, IDs and allowed actions. Every supplied candidate '
-        'needs its own record and required ID/visibility fields. Do not merge records or invent values. '
-        'Shorten explanation strings to the schema limits; visibility_reason/why is at most 300 characters. '
-        'Use only the allowed values for each attribute KIND, not values belonging to another kind. '
-        'For observations, omit unsupported or uncertain attributes; car/vehicle are categories, '
-        'not supported subtypes. Use JSON null for unknown paint, never the string "null". '
-        'For generated text or grounding, do not hide unsupported claims by omitting their parsed attributes; '
-        'correct the expression or report the unsupported claim.'}
+    schema = payload['output_schema']
+    instruction = ('Return one JSON object with the required keys and types. '
+        'Keep the original task and allowed actions. Fix the reported fields without inventing evidence. '
+        'Follow the schema limits on explanation length.')
+    if output_type is SceneVisualObservation:
+        instruction += ' Return one complete observation record per supplied candidate ID.'
+    if output_type in {SceneVisualObservation, VisualObservation}:
+        instruction += (' Keep required visibility fields and use only supported values for each attribute kind. '
+            'Omit uncertain attributes and use JSON null for unknown paint.')
+    if output_type is GeneratedExpression or 'unsupported_claims' in schema.get('properties', {}):
+        instruction += (' Keep declarations aligned with the actual expression. '
+            'Correct or report unsupported claims where the task permits.')
+    payload['format_feedback'] = {'errors': errors, 'allowed_top_level_keys': list(schema.get('properties', {})),
+        'required_top_level_keys': schema.get('required', []), 'instruction': instruction}
     encoded = json.dumps(payload)
     if isinstance(user["content"], str):
         user["content"] = encoded
@@ -227,15 +257,37 @@ def has_json_instruction(messages):
     return any(re.search(r"\bjson\b", text, re.IGNORECASE) for text in texts)
 
 
-def json_mode_messages(messages):
-    """Keep wire requests valid without mutating durable phase input messages."""
+def json_mode_messages(messages, output_type):
+    """Specify the output contract at the request boundary, including after images."""
     updated = copy.deepcopy(messages)
-    if not has_json_instruction(updated):
-        instruction = "Return only a valid JSON object matching the supplied output schema."
-        if updated and updated[0].get("role") == "system" and isinstance(updated[0].get("content"), str):
-            updated[0]["content"] += "\n" + instruction
-        else:
-            updated.insert(0, {"role": "system", "content": instruction})
+    keys = ', '.join(field.alias or name for name, field in output_type.model_fields.items())
+    required = ', '.join(field.alias or name for name, field in output_type.model_fields.items() if field.is_required())
+    instruction = (
+        'Return exactly one JSON object, starting with { and ending with }. '
+        'Use the supplied output schema. Allowed root keys: ' + keys + '. '
+        + ('Always include these required root keys: ' + required + '. ' if required else '')
+        + 'Arrays belong only inside their schema fields. Do not emit a root array, wrapper, '
+        'Markdown, echoed schema, or alternative answers.'
+    )
+    if updated and updated[0].get("role") == "system" and isinstance(updated[0].get("content"), str):
+        updated[0]["content"] += "\n" + instruction
+    else:
+        updated.insert(0, {"role": "system", "content": instruction})
+    content = updated[-1]['content']
+    if updated[-1]['role'] == 'user' and isinstance(content, list) and any(
+            part.get('type') == 'image_url' for part in content):
+        scene_hint = ''
+        if issubclass(output_type, SceneVisualObservation):
+            key = output_type.model_fields['candidates'].alias or 'candidates'
+            scene_hint = (f' Place all candidate records inside the "{key}" array of that one object. '
+                'For absence checks use only the values allowed by the absence field; omit all other negative claims.')
+        elif issubclass(output_type, VisualObservation):
+            scene_hint = (' Describe only the selected target region across its supplied images. '
+                'Other visible objects are context and must not receive separate observations.')
+        content.append({'type': 'text', 'text': instruction + ' '
+            'The images are evidence for the same task. Use the supplied region and candidate information as input. '
+            'Do not return detections, bounding boxes, or one result per image. '
+            'If candidate IDs are supplied for reporting, follow the requested ID set and count.' + scene_hint})
     return updated
 
 
@@ -351,11 +403,9 @@ class QwenCalls:
         def parse(answer):
             value, normalization = validated_response(answer, wire_type, expected_ids)
             return (value if wire_type is output_type else output_type.model_validate(value.model_dump())), normalization
-        wire_messages = json_mode_messages(messages)
-        wire_messages.insert(0, {'role': 'system', 'content':
-            'Return only the result JSON object at the root, without an output/result/data wrapper '
-            'or echoed input/schema. Allowed root keys: ' + ', '.join(wire_type.model_fields[f].alias or f for f in wire_type.model_fields)
-            + '. Follow the supplied schema and candidate IDs/count exactly. Keep visibility_reason/why under 300 characters.'})
+        wire_messages = json_mode_messages(messages, wire_type)
+        parts = [part for message in wire_messages if isinstance(message.get('content'), list)
+            for part in message['content']]
         request = {"model": self.model, "messages": wire_messages, "stream": True,
                    "stream_options": {"include_usage": True}, "extra_body": {"enable_thinking": False},
                    "response_format": {"type": "json_object"},
@@ -364,6 +414,10 @@ class QwenCalls:
             request.pop('extra_body')
         if (request_options or {}).get('response_format') is False:
             request.pop('response_format')
+        elif (self.model == 'qwen4-max' and is_dashscope_endpoint(self.base_url)
+                and all(part.get('type') == 'text' for part in parts)):
+            request['response_format'] = {'type': 'json_schema', 'json_schema': {
+                'name': wire_type.__name__, 'strict': True, 'schema': wire_type.model_json_schema()}}
         request_hash = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
         result_path = folder / "result.json"
         if result_path.exists():
@@ -380,8 +434,6 @@ class QwenCalls:
         record = {"status": "running", "started_at": datetime.now(timezone.utc).isoformat(),
                   "request_sha256": request_hash, "model_requested": self.model, "base_url": self.base_url,
                   "python": platform.python_version(), "sdk_version": version("openai")}
-        parts = [part for message in wire_messages if isinstance(message.get('content'), list)
-            for part in message['content']]
         record['request_shape'] = {'image_count':sum(p.get('type') == 'image_url' for p in parts),
             'output_type':output_type.__name__, 'max_tokens':request['max_tokens']}
         atomic_json(result_path, record)

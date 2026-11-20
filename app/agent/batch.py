@@ -983,11 +983,26 @@ class BatchService:
     def recover_running(self):
         """Resume abandoned running jobs after lease expiry; respect explicit controls."""
         worker = self.runner
-        if worker.closed or worker.active or worker.active_batch:
-            return
-        with worker.store.connect() as db:
-            if db.execute('SELECT 1 FROM executor WHERE lease_until>?', (time.time(),)).fetchone():
+        with worker.lock, worker.store.connect() as db:
+            if self.closing or worker.closed or worker.active or worker.active_batch:
                 return
+            db.execute('BEGIN IMMEDIATE')
+            now = time.time()
+            if db.execute('SELECT 1 FROM executor WHERE lease_until>?', (now,)).fetchone():
+                return
+            # A crash can leave a committed command without its final batch status.
+            # Apply it without starting a worker or touching the child checkpoints.
+            controls = {'pause': 'paused', 'stop': 'stopped'}
+            controlled = db.execute("""SELECT job_id,control FROM batches
+                WHERE status='running' AND control IN ('pause','stop')""").fetchall()
+            if controlled:
+                if db.execute('SELECT 1 FROM runs WHERE owner IS NOT NULL AND lease_until>?', (now,)).fetchone():
+                    return
+                db.execute('UPDATE batch_queue_control SET paused=1 WHERE singleton=1')
+            for row in controlled:
+                job, command = row['job_id'], row['control']
+                db.execute('UPDATE batches SET status=?,owner=NULL WHERE job_id=?', (controls[command], job))
+                self.store.event(db, job, 'batch_control_applied', {'command': command, 'recovered': True})
             jobs = [r['job_id'] for r in db.execute(
                 "SELECT job_id FROM batches WHERE status='running' AND control IS NULL ORDER BY created_at")]
         for job in jobs:

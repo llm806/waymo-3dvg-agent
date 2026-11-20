@@ -353,7 +353,7 @@ def exercise_manual_reviews(root, monkeypatch, scene_folder):
                 assert len(changed['samples'])==len(listed['samples'])
                 assert all(row['legacy_rules'] for row in changed['samples'])
                 assert all('_run_version' not in row for row in changed['samples'])
-            assert listed['review_summary']=={'unreviewed':4,'accepted':0,'rejected':0,'discarded':0,'usable':4}
+            assert listed['review_summary']=={'unreviewed':4,'accepted':0,'rejected':0,'discarded':0,'usable':4,'precheck_failed':0}
             drawn=routes.random_samples(job,request,count=10)['ordinals']
             assert len(drawn)==len(set(drawn))==4
             assert viewed['ordinal']==1 and viewed['selected_candidate_id'] is None and viewed['source_view'] is None
@@ -493,7 +493,7 @@ def exercise_manual_reviews(root, monkeypatch, scene_folder):
                 if number==1: rejected=result
                 assert rejection(runner.store.snapshot(row['run_id']))=='manual_'+verdict
             refreshed=routes.samples(job,request)
-            assert refreshed['review_summary']=={'unreviewed':2,'accepted':0,'rejected':1,'discarded':1,'usable':2}
+            assert refreshed['review_summary']=={'unreviewed':2,'accepted':0,'rejected':1,'discarded':1,'usable':2,'precheck_failed':0}
             assert set(routes.random_samples(job,request,count=10)['ordinals'])=={3,4}
             assert set(routes.random_samples(job,request,count=10,unreviewed=False)['ordinals'])=={1,3,4}
             retry_body=routes.RetryReview(revision=first['revision'],review_id=rejected['review_id'])
@@ -5057,6 +5057,40 @@ def _check_paired_paper_study(root,monkeypatch):
     with pytest.raises(ValueError,match='封存'):papers.select('token-0',visible[0]['case_id'],[])
     # Protection applies even to direct deletion APIs, not just the tab.
     with pytest.raises(ValueError,match='科研'):TaskCleaner(store,root).preview([job])
+    draft_sid,draft_job,draft_run=ident(988010),ident(988011),ident(988012)
+    draft_target={'target_id':ident(988013),'context':'draft-context','object_id':'draft-object','status':'selected'}
+    draft_spec=spec.model_copy(update={'request_id':draft_sid,'title':'Interrupted draft'})
+    store.create({**result,'run_id':draft_run,'batch_id':draft_job,'status':'blocked'})
+    with store.connect() as db:
+        db.execute("INSERT INTO batches VALUES(?,?,?,?,'paused',NULL,NULL,NULL,?)",
+            (draft_job,'{}','a'*64,method_fingerprint(),time.time()))
+        db.execute('INSERT INTO batch_items(job_id,ordinal,target,status,run_id) VALUES(?,1,?,?,?)',
+            (draft_job,json.dumps(draft_target),'failed',draft_run))
+        db.execute('INSERT INTO paper_studies VALUES(?,?,?,?,?,?,NULL)',
+            (draft_sid,draft_job,draft_spec.model_dump_json(),method_fingerprint(),'ready',time.time()))
+        db.execute('INSERT INTO paper_trials VALUES(?,1,?,?,?,NULL)',
+            (draft_sid,p.model_dump_json(),digest({'initial':1}),json.dumps([draft_run])))
+        db.execute('INSERT INTO paper_reviewers VALUES(?,?,0,?)',('draft-token',draft_sid,'A'))
+        db.execute('INSERT INTO paper_targets VALUES(?,?,?,?)',
+            (draft_target['context'],draft_target['object_id'],draft_sid,draft_target['target_id']))
+    cleaner=TaskCleaner(store,root)
+    preview=cleaner.preview([draft_job])
+    assert preview['research_drafts']==[{'study_id':draft_sid,'title':'Interrupted draft','reserved_targets':1}]
+    assert reserved_for_other(store,job,draft_target)
+    with store.connect() as db:
+        db.execute("UPDATE paper_studies SET status='review' WHERE study_id=?",(draft_sid,))
+    with pytest.raises(ValueError,match='盲审'):
+        cleaner.delete([draft_job],preview['token'])
+    with store.connect() as db:
+        db.execute("UPDATE paper_studies SET status='ready' WHERE study_id=?",(draft_sid,))
+    assert cleaner.delete([draft_job],preview['token'])['deleted_job_ids']==[draft_job]
+    assert not reserved_for_other(store,job,draft_target)
+    with store.connect() as db:
+        for table in ('paper_studies','paper_trials','paper_reviewers','paper_targets'):
+            assert not db.execute(f'SELECT 1 FROM {table} WHERE study_id=?',(draft_sid,)).fetchone()
+        assert not db.execute('SELECT 1 FROM runs WHERE run_id=?',(draft_run,)).fetchone()
+    assert papers.private(sid)['report']==report
+    _check_independent_quality_metrics(papers, batches, p, result)
     # Prospective random sampling and actual paired dispatch use the existing
     # lease/queue/call ledger. No real provider is contacted in this regression.
     with monkeypatch.context() as scoped:
@@ -5101,6 +5135,73 @@ def _check_paired_paper_study(root,monkeypatch):
             with pytest.raises(ValueError,match='模拟'):prospective.freeze(created['study_id'],paired_service)
         finally:
             paired_service.close();worker.close()
+
+
+def _check_independent_quality_metrics(papers, batches, packet, template):
+    import random
+    from app.agent.batch import method_fingerprint
+    from app.quality.paper_study import QUALITY_METRICS, Judgment, StudySpec, quality_metrics
+
+    study_id, job_id, token = 'a' * 24, 'b' * 24, 'metrics-reviewer'
+    spec = StudySpec(request_id=study_id, title='Independent metric regression', sample_size=6,
+                     review_sample_size=3, reviewers=['R'], quality_protocol=QUALITY_METRICS)
+    with papers.runs.connect() as db:
+        db.execute('INSERT INTO paper_studies VALUES(?,?,?,?,?,?,NULL)',
+                   (study_id, job_id, spec.model_dump_json(), method_fingerprint(), 'ready', time.time()))
+        db.execute('INSERT INTO paper_reviewers VALUES(?,?,?,?)', (token, study_id, 0, 'R'))
+        db.execute("INSERT INTO batches VALUES(?,?,?,?,'completed',NULL,NULL,NULL,?)",
+                   (job_id, '{}', 'catalog', method_fingerprint(), time.time()))
+    items = []
+    for ordinal in range(1, 7):
+        current = packet.model_copy(deep=True)
+        current.context = f'metrics-{ordinal}'
+        current.task.pop('research_baseline_policy', None)
+        run_id = ident(989000 + ordinal)
+        state = {**template, 'run_id': run_id, 'batch_id': job_id, 'provider_scope': 'real-model',
+                 'model_calls_used': 1, 'current_packet': current.model_dump(mode='json'),
+                 'status': 'calibration_hold' if ordinal < 6 else 'needs_evidence',
+                 'final_expression': 'The white vehicle ahead.', 'diagnostic_pass': ordinal < 6}
+        if ordinal == 5:
+            state['manual_review'] = {'verdict': 'accepted'}
+        papers.runs.create(state)
+        target = {'target_id': ident(990000 + ordinal), 'context': current.context, 'object_id': current.target_object_id}
+        items.append({'ordinal': ordinal, 'target': target, 'status': state['status'], 'run_id': run_id})
+        with papers.runs.connect() as db:
+            db.execute('INSERT INTO paper_trials VALUES(?,?,?,?,?,NULL)',
+                       (study_id, ordinal, current.model_dump_json(), 'input', json.dumps([run_id])))
+    batch = {'status': 'blocked', 'executor_active': False, 'items': items, 'spec': {}}
+    service = SimpleNamespace(store=SimpleNamespace(detail=lambda _: batch, execution_progress=batches.execution_progress))
+    with pytest.raises(ValueError, match='固定任务'):
+        papers.freeze(study_id, service)
+    batch['status'] = 'completed'
+    frozen = papers.freeze(study_id, service)
+    assert frozen['automatic_completion_rate']['numerator'] == 4
+    cases, _, _ = papers.records(study_id)
+    sampled = [case for case in cases if case['payload']['sampled']]
+    assert {case['ordinal'] for case in sampled} == set(random.Random(spec.seed).sample(range(1, 5), 3))
+    first = sampled[0]
+    expected = first['payload']['expected']
+    wrong = next(label for label in first['payload']['mapping'] if label != expected)
+    with pytest.raises(ValueError, match='一个目标'):
+        papers.select(token, first['case_id'], [expected, wrong])
+    papers.select(token, first['case_id'], [wrong])
+    assert not papers.case(token, first['case_id'])[2]
+    papers.select(token, sampled[1]['case_id'], [sampled[1]['payload']['expected']])
+    papers.select(token, sampled[2]['case_id'], [])
+    assert papers.case(token, first['case_id'])[2]
+    with pytest.raises(ValueError, match='已经知道'):
+        papers.answer(token, first['case_id'], Judgment(factual_correct=True, elapsed_seconds=1))
+    for index, case in enumerate(sampled):
+        papers.answer(token, case['case_id'], Judgment(factual_correct=index != 1,
+                      prior_target_exposure=False, elapsed_seconds=1))
+    report = papers.seal(study_id, service)['report']
+    quality = report['quality']
+    assert report['protocol'] == QUALITY_METRICS
+    assert [(r['numerator'], r['denominator']) for r in quality.values()] == [(4, 6), (2, 3), (1, 3)]
+    assert 'factual_correct,localization_correct' in papers.export_csv(study_id).splitlines()[0]
+    rows = [{**row, 'exposure_excluded': row['case_id'] == first['case_id']} for row in report['rows']]
+    assert quality_metrics(rows)['text_accuracy'] == quality['text_accuracy']
+    assert quality_metrics(rows)['blind_target_identification_accuracy'] is None
 
 
 def test_adaptive_loop_two_blind_orders_and_idempotent_completion(tmp_path, monkeypatch):
@@ -5532,6 +5633,39 @@ def test_format_correction_is_bounded_by_request_and_total_budget(tmp_path, monk
     assert parsed.candidates[1].attributes[-1].model_dump() == {'kind': 'subtype', 'value': 'sedan'}
     assert len(audit['discarded_evidence']) == 2
     assert validated_response(json.dumps({'output': raw}), CompactSceneObservation, expected)[0] == parsed
+    unwrapped, wrapper_audit = validated_response(json.dumps([{'c': [
+        {'id': 'rival', 'seen': False, 'vis': 'occluded', 'why': 'Occluded'},
+        {'id': 'target', 'seen': True, 'vis': 'clear', 'why': 'Visible'},
+    ]}]), CompactSceneObservation, expected)
+    assert [item.candidate_id for item in unwrapped.candidates] == expected
+    assert wrapper_audit == 'single-object-array-wrapper-v1'
+    scene_array = [
+        {'id':'rival','target_visible':True,'visibility':'clear','visibility_reason':'Visible',
+         'attributes':[{'kind':'subtype','value':'sedan'}],'absent_features':['roof rack','rear spoiler']},
+        {'id':'target','seen':True,'vis':'clear','why':'Visible','a':[],'absent':['roof rack']},
+    ]
+    scene_value, scene_audit = validated_response(json.dumps(scene_array), CompactSceneObservation, expected)
+    assert [item.candidate_id for item in scene_value.candidates] == expected
+    assert scene_value.candidates[0].attributes[0].value == 'sedan'
+    assert scene_value.candidates[0].absent_features == []
+    assert scene_value.candidates[1].absent_features == ['roof rack']
+    assert scene_audit['transport'] == 'exact-candidate-array-v1'
+    assert scene_audit['discarded_evidence'] == [{'path':['c',0,'absent'],'unknown_features':True}]
+    for candidate_records in (
+        scene_array[:1], [scene_array[0],scene_array[0]],
+        [scene_array[0],{**scene_array[1],'id':'unexpected'}],
+        [scene_array[0],{**scene_array[1],'candidate_id':'target'}],
+        [scene_array[0],{k:v for k,v in scene_array[1].items() if k!='vis'}],
+        [scene_array[0],{**scene_array[1],'a':[{'k':'feature','kind':'feature','v':'roof rack'}]}],
+    ):
+        with pytest.raises(ValidationError):
+            validated_response(json.dumps(candidate_records), CompactSceneObservation, expected)
+    with pytest.raises(ValidationError):
+        validated_response(json.dumps(scene_array), CompactSceneObservation)
+    for array in ([raw, raw], [{'bbox': [0, 0, 100, 100], 'label': 'vehicle'}],
+                  [{'c': [{'id': 'wrong', 'seen': False, 'vis': 'occluded', 'why': 'Occluded'}]}]):
+        with pytest.raises(ValidationError):
+            validated_response(json.dumps(array), CompactSceneObservation, expected)
     assert raw['c'][0]['a'][-1]['v'] == 'car'  # The original answer stays intact.
     # A hand-carried bag is supported end-to-end, including anonymous negatives.
     # A missing bag annotation or a worn backpack does not prove hand-bag absence.
@@ -5646,6 +5780,42 @@ def test_format_correction_is_bounded_by_request_and_total_budget(tmp_path, monk
     assert saved['status'] == 'completed' and saved['answer'] == answer
     assert saved['response_normalization'] == audit
     assert sdk.call(messages, SceneVisualObservation, folder) == result
+    image = {'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,fixture'}}
+    multimodal = [{'role': 'system', 'content': 'Inspect the supplied regions.'},
+        {'role': 'user', 'content': [{'type': 'text', 'text': messages[0]['content']}, image]}]
+    assert sdk.call(multimodal, SceneVisualObservation, tmp_path/'image-contract') == result
+    wire = json.loads((tmp_path/'image-contract'/'request.json').read_text())['messages']
+    assert [message['role'] for message in wire] == ['system', 'user']
+    assert wire[-1]['content'][:2] == multimodal[-1]['content']
+    assert 'Allowed root keys: c.' in wire[-1]['content'][-1]['text']
+    assert 'Do not return detections' in wire[-1]['content'][-1]['text']
+    with monkeypatch.context() as structured:
+        structured.setattr(sdk, 'model', 'qwen4-max')
+        structured.setattr(sdk, 'base_url', 'https://example.cn-beijing.maas.aliyuncs.com/compatible-mode/v1')
+        structured.setattr(chunk.choices[0].delta, 'content', json.dumps({
+            'expression': 'The black vehicle.', 'predicate_ids': ['p'], 'visual_attributes': []}))
+        text_parts = [{'role': 'user', 'content': [multimodal[-1]['content'][0]]}]
+        for name, prompt, mode in (('text-only', text_parts, 'json_schema'),
+                                   ('with-image', multimodal, 'json_object')):
+            destination = tmp_path/name
+            sdk.call(prompt, GeneratedExpression, destination)
+            request = json.loads((destination/'request.json').read_text())
+            assert request['response_format']['type'] == mode
+            if mode == 'json_schema':
+                contract = request['response_format']['json_schema']
+                assert contract['strict'] is True
+                assert contract['schema'] == GeneratedExpression.model_json_schema()
+        from app.quality.joint_reference import WrittenSentence
+        for output, value in (
+            (WrittenSentence, {'expression':'The black vehicle.'}),
+            (GroundResult, {'candidate_ids':['target'],'parsed_predicate_ids':['p'],'unsupported_claims':[]}),
+        ):
+            structured.setattr(chunk.choices[0].delta, 'content', json.dumps(value))
+            destination = tmp_path/output.__name__
+            sdk.call(text_parts, output, destination)
+            request = json.loads((destination/'request.json').read_text())
+            assert request['response_format'] == {'type':'json_schema','json_schema':{
+                'name':output.__name__,'strict':True,'schema':output.model_json_schema()}}
     # Many small deltas retain their complete raw trace with bounded flushes.
     original_open = Path.open
     flushed = []
@@ -6979,15 +7149,23 @@ def test_multiple_successes_count_unique_objects_until_goal(harness, monkeypatch
             assert restart_worker.store.snapshot(initial['run_id'])['model_calls_used']==1
             restart_service.store.update(restarted,'test_crash',{},status='running')
             restart_worker.store.acquire_executor('previous-process')
+            with restart_worker.store.connect() as db:
+                db.execute("UPDATE batches SET owner='previous-process',control='pause' WHERE job_id=?",(restarted,))
             restart_service.recover_running()
             assert restart_worker.active_batch is None and not prepared_after_restart
+            assert restart_service.store.detail(restarted)['status']=='running'
             with restart_worker.store.connect() as db:
                 db.execute('UPDATE executor SET lease_until=0')
-                db.execute("UPDATE batches SET control='pause' WHERE job_id=?",(restarted,))
             restart_service.recover_running()
+            restart_service.recover_running()
+            paused = restart_service.store.detail(restarted)
+            assert paused['status']=='paused' and paused['control']=='pause'
+            assert paused['model_calls_reserved']==1 and not prepared_after_restart
+            assert sum(e['kind']=='batch_control_applied' for e in paused['events'])==1
             assert restart_worker.active_batch is None
             with restart_worker.store.connect() as db:
-                db.execute('UPDATE batches SET control=NULL WHERE job_id=?',(restarted,))
+                # Exercise a separate crash without a committed control request.
+                db.execute("UPDATE batches SET status='running',control=NULL WHERE job_id=?",(restarted,))
             restart_service.recover_running();wait(restart_worker)
             completed=restart_service.store.detail(restarted)
             assert completed['status']=='completed' and completed['selection_progress']['diagnostic_passed']==3
@@ -6997,6 +7175,16 @@ def test_multiple_successes_count_unique_objects_until_goal(harness, monkeypatch
             reservations=[e for e in restart_worker.store.events(initial['run_id']) if e['kind']=='model_call_reserved']
             assert sum(e['payload']['kind']=='decide' for e in reservations)==1
             assert any(e['kind']=='restart_recovery_started' for e in completed['events'])
+            stopped_job,_=restart_service.create(BatchSpec(catalog_id=parallel_catalog['catalog_id'],
+                target_ids=[parallel_catalog['targets'][0]['target_id']],prepare_only=True))
+            with restart_worker.store.connect() as db:
+                db.execute("UPDATE batches SET status='running',control='stop' WHERE job_id=?",(stopped_job,))
+            restart_service.recover_running()
+            stopped=restart_service.store.detail(stopped_job)
+            assert stopped['status']=='stopped' and stopped['control']=='stop'
+            assert not stopped['executor_active'] and stopped['model_calls_reserved']==0
+            with restart_worker.store.connect() as db:
+                assert db.execute('SELECT paused FROM batch_queue_control WHERE singleton=1').fetchone()['paused']==1
             # Shared storage errors pause with the item pending; an explicit
             # pause never gets undone by the automatic restart sweep.
             storage_unavailable=True
@@ -7151,14 +7339,16 @@ def test_multiple_successes_count_unique_objects_until_goal(harness, monkeypatch
 
     # Several targets can encounter a temporary outage without halting the
     # batch. Every retry is bounded/accounted, and the next healthy target runs.
-    outage_rejection = {'http_status':503, 'contexts':{'parallel-context-1','parallel-context-2'}}
+    outage_rejection = {'failure':{'status':'api_failed','http_status':503},
+        'contexts':{'parallel-context-1','parallel-context-2'}}
     class OutageCalls(RestartCalls):
         def call(self,messages,schema,folder,heartbeat=None):
             context=outage_worker.store.snapshot(folder.parents[1].name)['current_packet']['context']
             if context in outage_rejection['contexts']:
                 self.count += 1
-                atomic_json(folder/'result.json',{'status':'api_failed','http_status':outage_rejection['http_status']})
-                raise ModelCallFailure('api_failed')
+                failure = outage_rejection['failure']
+                atomic_json(folder/'result.json',failure)
+                raise ModelCallFailure(failure['status'])
             return super().call(messages,schema,folder,heartbeat)
     outage_worker=ConsoleRunner(worker.root/'provider-outage',OutageCalls)
     outage_worker.model_slots=ModelSlots(1,interval=0)
@@ -7185,7 +7375,7 @@ def test_multiple_successes_count_unique_objects_until_goal(harness, monkeypatch
     # The reported HTTP 400 must settle one target, not pause healthy siblings.
     # Repeated input refusals still stop after three targets to bound wasted calls.
     for rejected_count in (1,3):
-        outage_rejection.update(http_status=400,
+        outage_rejection.update(failure={'status':'api_failed','http_status':400},
             contexts={f'parallel-context-{i}' for i in range(1,rejected_count+1)})
         outage_worker=ConsoleRunner(worker.root/f'input-rejection-{rejected_count}',OutageCalls)
         outage_worker.model_slots=ModelSlots(1,interval=0)
@@ -7208,6 +7398,33 @@ def test_multiple_successes_count_unique_objects_until_goal(harness, monkeypatch
                 else:
                     assert refused['status']=='paused' and refused['reason']=='repeated_request_rejections'
                     assert refused['model_calls_reserved']==3
+            finally:
+                outage_service.close();outage_worker.close()
+
+    for malformed_count in (1,2):
+        outage_rejection.update(
+            failure={'status':'invalid_output','validation_errors':[{'location':[],'type':'model_type'}]},
+            contexts={f'parallel-context-{i}' for i in range(1,malformed_count+1)})
+        outage_worker=ConsoleRunner(worker.root/f'output-shape-{malformed_count}',OutageCalls)
+        outage_worker.model_slots=ModelSlots(1,interval=0)
+        outage_service=BatchService(outage_worker,lambda t,*args:parallel_packets[t['ordinal']],
+            lambda _:parallel_catalog,lambda _:None)
+        with monkeypatch.context() as shape_patch:
+            shape_patch.setattr('app.agent.batch.run_agent',runtime.run_agent)
+            try:
+                shape_job,_=outage_service.create(BatchSpec(catalog_id=parallel_catalog['catalog_id'],
+                    prepare_only=False,desired_count=1,target_concurrency=1,max_repairs=0))
+                outage_service.start(shape_job);wait(outage_worker)
+                result=outage_service.store.detail(shape_job)
+                assert result['counts']['failed']==malformed_count
+                if malformed_count==1:
+                    assert result['status']=='completed'
+                    assert result['selection_progress']['diagnostic_passed']==1
+                    assert result['model_calls_reserved']==9
+                else:
+                    assert result['status']=='paused'
+                    assert result['reason']=='repeated_response_shape_failures'
+                    assert result['model_calls_reserved']==6
             finally:
                 outage_service.close();outage_worker.close()
 

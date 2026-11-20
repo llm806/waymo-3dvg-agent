@@ -176,9 +176,14 @@ class VisualObservation(Contract):
         description="Camera-visible illuminated lights, independently of unknown body paint. Absent means a complete inspectable original-image region was checked for this visible cue, not that physical lights are off/missing. Use uncertain for glare, noise, hidden/unclear regions or ambiguous light ownership.")
 
 
+AbsentVisualFeature = Literal["handheld camera", "binoculars", "visible rear face", "pole mounted",
+    "roof rack", "roof cargo box", "trailer", "stripes", "orange and white stripes", "red and white stripes",
+    "black and yellow stripes", "warning light", "backpack", "handheld bag", "umbrella", "high visibility vest"]
+
+
 class CandidateVisualObservation(VisualObservation):
     candidate_id: str
-    absent_features: list[Literal["handheld camera", "binoculars", "visible rear face", "pole mounted", "roof rack", "roof cargo box", "trailer", "stripes", "orange and white stripes", "red and white stripes", "black and yellow stripes", "warning light", "backpack", "handheld bag", "umbrella", "high visibility vest"]] = Field(default_factory=list, max_length=6)
+    absent_features: list[AbsentVisualFeature] = Field(default_factory=list, max_length=6)
 
 
 class SceneVisualObservation(Contract):

@@ -178,6 +178,7 @@ def samples(job_id: Id, request: Request):
         cache_format = SAMPLE_PRESENTATION_VERSION
         legacy_format = cache_format + ':%'
         result, pending = [], []
+        precheck_failed = 0
         # One consistent read. A hit never selects the snapshot column; misses
         # stream individually so cold reads do not retain hundreds of MB.
         with store.runs.connect() as db:
@@ -253,6 +254,8 @@ def samples(job_id: Id, request: Request):
                     elif not row.get('legacy_rules') and (item['format'] or '').startswith(cache_format + ':'):
                         row['legacy_rules'] = item['format'] != f'{cache_format}:{VERSION}'
                     result.append({**row, 'reviewed': (row['ordinal'], row['revision']) in confirmations})
+                elif item['status'] == 'needs_evidence' and (item['reason'] or '').startswith('precheck_'):
+                    precheck_failed += 1
         if pending:
             # Never upgrade a read transaction or overwrite a newer generation.
             # Concurrent annotation/review/deletion may have invalidated any row.
@@ -264,7 +267,7 @@ def samples(job_id: Id, request: Request):
                 'task_goal':json.loads(header['spec']).get('desired_count'),
                 'review_summary': {**{key: sum((s['manual_review'] or {}).get('verdict', 'unreviewed') == key for s in result)
                     for key in ('unreviewed', 'accepted', 'rejected', 'discarded')},
-                    'usable': sum(s['usable'] for s in result)}}
+                    'usable': sum(s['usable'] for s in result), 'precheck_failed': precheck_failed}}
     except (ValueError, OSError, KeyError) as exc:
         raise HTTPException(409, str(exc)) from exc
 

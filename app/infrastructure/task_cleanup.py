@@ -197,6 +197,27 @@ class TaskCleaner:
             raise RunBusy('所选任务正在执行，请先暂停该任务并等待保存后再删除。')
         return active_jobs, active_runs
 
+    @staticmethod
+    def draft_studies(db, selected):
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_studies'").fetchone():
+            return []
+        studies = []
+        for job in sorted(selected):
+            row = db.execute("""SELECT s.study_id, s.job_id, s.status, s.method_sha256, s.created_at,
+                json_extract(s.spec,'$.title') AS title, s.report IS NOT NULL AS has_report,
+                (SELECT COUNT(*) FROM paper_trials WHERE study_id=s.study_id) AS trials,
+                (SELECT COUNT(*) FROM paper_targets WHERE study_id=s.study_id) AS reserved_targets,
+                EXISTS(SELECT 1 FROM paper_cases WHERE study_id=s.study_id) AS has_cases,
+                EXISTS(SELECT 1 FROM paper_reviewers p JOIN paper_reviews r ON r.token=p.token
+                       WHERE p.study_id=s.study_id) AS has_reviews
+                FROM paper_studies s WHERE s.job_id=?""", (job,)).fetchone()
+            if row is None:
+                continue
+            if row['status'] != 'ready' or row['has_report'] or row['has_cases'] or row['has_reviews']:
+                raise ValueError('所选任务关联的科研评估已进入盲审或已有报告，需保留评估证据。')
+            studies.append(dict(row))
+        return studies
+
     def plan(self, db, requested, return_to_pool=None, preserve_shared=None):
         self.report(stage='references', message='正在核对任务与共享引用', completed=0, total=0)
         active_jobs, active_runs = self.guard(db, requested)
@@ -214,10 +235,8 @@ class TaskCleaner:
         if set(requested) - jobs.keys():
             raise ValueError('所选任务已不存在，请刷新任务列表。')
         selected = set(requested)
-        if db.execute("SELECT 1 FROM sqlite_master WHERE name='paper_studies'").fetchone():
-            protected={r['job_id'] for r in db.execute('SELECT job_id FROM paper_studies')}
-            if selected & protected:
-                raise ValueError('所选任务被科研实验引用；需保留生成记录、盲审证据及调用账本，不能按普通标注任务删除。')
+        draft_studies = self.draft_studies(db, selected)
+        study_ids = {study['study_id'] for study in draft_studies}
         if return_to_pool is None:
             return_to_pool = not any(jobs[job]['status'] == 'completed' for job in selected)
         if type(return_to_pool) is not bool:
@@ -404,7 +423,7 @@ class TaskCleaner:
         for rid in removed_runs:
             if states.get(rid, {}).get('kind') == 'counterfactual_audit' and not re.fullmatch('[a-f0-9]{24}', str(states[rid].get('parent_run_id', ''))):
                 raise ValueError('补检父记录 ID 无效，已停止删除。')
-        deleted_ids = selected | removed_runs | removed_cohorts | removed_releases | removed_packets | removed_scenes | removed_methods
+        deleted_ids = selected | study_ids | removed_runs | removed_cohorts | removed_releases | removed_packets | removed_scenes | removed_methods
         paths = {self.annotation / 'batches' / j for j in selected}
         paths |= {self.runtime / 'evidence' / p for p in removed_packets}
         paths |= {self.runtime / 'scenes' / s for s in removed_scenes}
@@ -482,6 +501,8 @@ class TaskCleaner:
                    'cohorts': len(removed_cohorts), 'releases': len(removed_releases),
                    'evidence': len(removed_packets), 'scenes': len(removed_scenes)}
         public = {'job_ids': sorted(selected), 'jobs': [{'job_id': j, 'status': jobs[j]['status']} for j in sorted(selected)],
+                  'research_drafts': [{key: study[key] for key in ('study_id', 'title', 'reserved_targets')}
+                                      for study in draft_studies],
                   'summary': summary, 'retained_shared': {'runs': len(candidates & kept_runs),
                    'evidence': len(packet_candidates & protected), 'scenes': len(scene_candidates & protected)}}
         removal = {'batches': selected, 'runs': removed_runs, 'audit_cohorts': removed_cohorts,
@@ -492,7 +513,7 @@ class TaskCleaner:
         # Bind frozen selected data and the actual removal/transfer scope, not
         # unrelated snapshots, global event counts or append-only log contents.
         selected_run_ids = {item['run_id'] for item in own_items if item['run_id']}
-        public['token'] = digest([defer_shared,[row for row in rows['batches'] if row['job_id'] in selected], own_items,
+        public['token'] = digest([defer_shared,[row for row in rows['batches'] if row['job_id'] in selected], own_items, draft_studies,
             [state for state in rows['runs'] if state['batch_id'] in selected or state['run_id'] in selected_run_ids],
             [states[rid] for rid in sorted(removed_runs)], revisions,
             [cohorts[cid] for cid in sorted(removed_cohorts)],
@@ -515,7 +536,8 @@ class TaskCleaner:
                                        'label_releases': removed_releases, 'history_updates': history_updates,
                                        'excluded_tracks': sorted(pool_keys) if not return_to_pool else [],
                                        'log_policy': (deleted_ids,orphan_targets,orphan_frames,orphan_pairs),
-                                       'guard': {'generations': generations, 'states': states,
+                                       'paper_studies': study_ids,
+                                       'guard': {'generations': generations, 'states': states, 'draft_studies': draft_studies,
                                            'strict_runs': selected_run_ids | removed_runs | {rid for rid,s in states.items() if s['batch_id'] in selected},
                                            'rows': rows, 'deleted_ids': deleted_ids,
                                            'revisions': revisions,
@@ -527,6 +549,8 @@ class TaskCleaner:
         active_jobs, active_runs = self.guard(db,requested)
         frozen = removal['guard']
         invalid = '任务或关联数据已变化，请重新查看删除范围后确认。'
+        if self.draft_studies(db, requested) != frozen['draft_studies']:
+            raise ValueError(invalid)
         if ({r['run_id'] for r in active_runs} & removal['runs']
                 or (active_jobs or active_runs) and frozen['shared_removed']):
             raise ValueError(invalid)
@@ -730,6 +754,8 @@ class TaskCleaner:
                     from app.infrastructure.candidate_pool import exclude
                     exclude(db,removal['excluded_tracks'],'deleted-tasks:'+digest(sorted(requested)))
                     for table,column,key in (('events','run_id','runs'),('controls','run_id','runs'),('runs','run_id','runs'),
+                            ('paper_trials','study_id','paper_studies'),('paper_reviewers','study_id','paper_studies'),
+                            ('paper_targets','study_id','paper_studies'),('paper_studies','study_id','paper_studies'),
                             ('batch_items','job_id','batches'),('batch_events','job_id','batches'),('batches','job_id','batches'),
                             ('audit_localizations','cohort_id','audit_cohorts'),('audit_answers','cohort_id','audit_cohorts'),
                             ('audit_answer_events','cohort_id','audit_cohorts'),('audit_cohorts','cohort_id','audit_cohorts'),

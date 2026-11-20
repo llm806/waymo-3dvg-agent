@@ -6,14 +6,17 @@ import random
 import secrets
 import time
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, model_validator
 
+from app.agent.selection import passed_description
 from app.schemas.contracts import Contract, EvidencePacket
 from app.quality.research import digest, final_text, wilson
 
 PROTOCOL = 'prospective-paired-single-frame-human-v1'
 BASELINE = 'fixed-vlm-one-request-v1'
+QUALITY_METRICS = 'agent-quality-metrics-v2'
 
 
 class StudySpec(Contract):
@@ -23,6 +26,7 @@ class StudySpec(Contract):
     seed: int = Field(default=42, ge=0, le=2147483647)
     review_sample_size: int | None = Field(default=None, ge=1, le=500)
     review_all_deliveries: bool = False
+    quality_protocol: Literal['agent-quality-metrics-v2'] | None = None
     dataset_split: str = Field(default='train', pattern=r'^(train|validation)$')
     reviewers: list[str] = Field(min_length=1, max_length=3)
     input_price_per_million: float | None = Field(default=None, ge=0, allow_inf_nan=False)
@@ -33,6 +37,9 @@ class StudySpec(Contract):
         self.title = self.title.strip()
         self.reviewers = [r.strip() for r in self.reviewers]
         count=len(self.reviewers)
+        if self.quality_protocol == QUALITY_METRICS and (
+                self.review_sample_size is None or self.review_all_deliveries or count != 1):
+            raise ValueError('三指标评估需要一名独立审核者和固定的随机抽样数。')
         allowed=(3,) if self.review_sample_size is None else (1,3)
         if count not in allowed:
             raise ValueError('请填写一名审核者，或为原有多人流程填写三名审核者。')
@@ -43,12 +50,23 @@ class StudySpec(Contract):
 
 class Judgment(Contract):
     factual_correct: bool
-    unique: bool
-    input_sufficient: bool
-    # Legacy answers retain their exposure flag; new forms do not collect it.
+    unique: bool | None = None
+    input_sufficient: bool | None = None
     prior_target_exposure: bool | None = None
     notes: str = Field(default='', max_length=2000)
     elapsed_seconds: float = Field(ge=0, le=86400, allow_inf_nan=False)
+
+
+def quality_metrics(rows):
+    delivered = [row for row in rows if row['accepted']]
+    sampled = [row for row in delivered if row['sampled']]
+    independent = not any(row['exposure_excluded'] for row in sampled)
+    return {
+        'automatic_completion_rate': wilson(len(delivered), len(rows)),
+        'text_accuracy': wilson(sum(row['factual_correct'] is True for row in sampled), len(sampled)),
+        'blind_target_identification_accuracy': wilson(
+            sum(row['localization_correct'] is True for row in sampled), len(sampled)) if independent else None,
+    }
 
 
 def exists(db):
@@ -205,31 +223,8 @@ class PaperStudyStore:
                 batch.update(dict(header))
                 batch['finished']=db.execute("SELECT COUNT(*) FROM batch_items WHERE job_id=? AND status NOT IN ('pending','running','preparing')",(s['job_id'],)).fetchone()[0]
         return {k:s[k] for k in ('study_id','job_id','spec','status','created_at','report')} | {
-            'protocol':PROTOCOL,'baseline':BASELINE,'cases':cases,'reviewers':reviewers,
+            'protocol':s['spec'].get('quality_protocol') or PROTOCOL,'baseline':BASELINE,'cases':cases,'reviewers':reviewers,
             'batch':batch,'method_sha256':s['method_sha256'],'automatic_completion_rate':completion}
-
-    def delete_empty(self, sid, service):
-        with service.runner.lock:
-            study=self.private(sid)
-            job=study['job_id']
-            if study['status']!='ready' or not job or service.store.detail(job)['executor_active']:
-                raise ValueError('仅可删除尚未生成结果且已退出执行的评估。')
-            with self.runs.connect() as db:
-                db.execute('BEGIN IMMEDIATE')
-                batch=db.execute('SELECT status FROM batches WHERE job_id=?',(job,)).fetchone()
-                current=db.execute('SELECT status FROM paper_studies WHERE study_id=?',(sid,)).fetchone()
-                if (not current or current['status']!='ready' or not batch or batch['status'] not in {'ready','paused','stopped'}
-                    or db.execute("SELECT 1 FROM batch_items WHERE job_id=? AND (status!='pending' OR run_id IS NOT NULL OR packet_id IS NOT NULL)",(job,)).fetchone()
-                    or db.execute('SELECT 1 FROM paper_trials WHERE study_id=?',(sid,)).fetchone()
-                    or db.execute('SELECT 1 FROM paper_cases WHERE study_id=?',(sid,)).fetchone()):
-                    raise ValueError('评估已开始生成证据或已有运行记录，不能按空评估删除。')
-                db.execute('DELETE FROM paper_reviewers WHERE study_id=?',(sid,))
-                db.execute('DELETE FROM paper_targets WHERE study_id=?',(sid,))
-                db.execute('DELETE FROM paper_studies WHERE study_id=?',(sid,))
-                db.execute('DELETE FROM batch_items WHERE job_id=?',(job,))
-                db.execute('DELETE FROM batch_events WHERE job_id=?',(job,))
-                db.execute('DELETE FROM batches WHERE job_id=?',(job,))
-        return {'study_id':sid,'deleted':True}
 
     def ensure_method(self, job):
         from app.agent.batch import method_fingerprint
@@ -294,7 +289,10 @@ class PaperStudyStore:
             if s['status'] in {'review','sealed'}:return self.detail(sid,service)
             self.ensure_method(s['job_id'])
             batch=service.store.detail(s['job_id'])
-            if batch['status'] not in {'completed','blocked'} or batch['executor_active']:
+            quality_study = s['spec'].get('quality_protocol') == QUALITY_METRICS
+            allowed = {'completed'} if quality_study else {'completed', 'blocked'}
+            unfinished = quality_study and any(item['status'] in {'pending', 'preparing', 'running'} for item in batch['items'])
+            if batch['status'] not in allowed or batch['executor_active'] or unfinished:
                 raise ValueError('请等待全部固定任务结束；暂停或排队中的实验不能进入盲审。')
             rows=[]
             sample_size=s['spec'].get('review_sample_size')
@@ -313,6 +311,10 @@ class PaperStudyStore:
                     state=states[-1] if states else {}
                     text=final_text(state)
                     accepted=bool(state.get('diagnostic_pass') if method=='agent' else state.get('research_baseline_delivered'))
+                    if quality_study:
+                        accepted = bool(passed_description(state) and all(
+                            not run.get('manual_review') and not (run.get('current_packet') or {}).get('task', {}).get('manual_review_feedback')
+                            for run in states))
                     case={'expression':text,'accepted':accepted,'status':state.get('status',item['status']),
                         'reason':state.get('stop_reason',item.get('reason')),'packet':state.get('current_packet'),
                         'run_ids':runs,'input_sha256':trial['input_sha256'] if trial else None,
@@ -331,6 +333,8 @@ class PaperStudyStore:
                 selected=set(random.Random(s['spec']['seed']).sample(delivered,min(sample_size,len(delivered))))
                 for i,payload in enumerate(payloads):
                     payload['sampled']=i in selected
+                    if quality_study:
+                        payload['quality_protocol'] = QUALITY_METRICS
                     payload['review_required']=payload['sampled'] or (s['spec'].get('review_all_deliveries',False) and payload['accepted'])
                     if payload['review_required'] and (not payload['expression'] or not payload.get('mapping')):
                         raise ValueError('抽中的交付样本缺少盲审证据，无法冻结。')
@@ -381,6 +385,7 @@ class PaperStudyStore:
     def inbox(self,token):
         person,s,cases,reviews,localized,complete=self.assigned(token)
         return {'title':s['spec']['title'],'reviewer':person['name'],'role':person['role'],'status':s['status'],
+            'quality_protocol':s['spec'].get('quality_protocol'),
             'phase':'judgment' if localized else 'localization','waiting':person['role']==2 and not complete,
             'cases':[{'case_id':c['case_id'],'localized':reviews.get((c['case_id'],token),{}).get('selection') is not None,
                 'answered':bool(reviews.get((c['case_id'],token),{}).get('answer'))} for c in cases]}
@@ -396,6 +401,8 @@ class PaperStudyStore:
             c,old,localized=self.case(token,cid)
             if self.private(c['study_id'])['status']=='sealed':raise ValueError('报告已封存。')
             if len(set(labels))!=len(labels) or not set(labels)<=c['payload']['mapping'].keys():raise ValueError('候选编号无效。')
+            if c['payload'].get('quality_protocol') == QUALITY_METRICS and len(labels) > 1:
+                raise ValueError('盲测须提交一个目标，或明确选择无法唯一定位。')
             if old.get('selection') is not None:
                 if old['selection']!=labels:raise ValueError('定位已锁定，不能在查看目标后修改。')
                 return self.inbox(token)
@@ -407,6 +414,11 @@ class PaperStudyStore:
             c,old,localized=self.case(token,cid)
             if self.private(c['study_id'])['status']=='sealed':raise ValueError('报告已封存。')
             if not localized or old.get('selection') is None:raise ValueError('必须先锁定全部定位，才能核对目标及事实。')
+            if c['payload'].get('quality_protocol') == QUALITY_METRICS:
+                if answer.prior_target_exposure is None:
+                    raise ValueError('请注明在盲测前是否已经知道预期目标。')
+            elif answer.unique is None or answer.input_sufficient is None:
+                raise ValueError('请完成原评估协议要求的全部判断。')
             if old.get('answer') and old['answer']!=answer.model_dump():raise ValueError('已提交的独立判断不能覆写。')
             with self.runs.connect() as db:db.execute('UPDATE paper_reviews SET answer=?,updated_at=? WHERE case_id=? AND token=?',
                 (json.dumps(answer.model_dump()),time.time(),cid,token))
@@ -418,8 +430,10 @@ class PaperStudyStore:
             if s['status']=='sealed':return self.detail(sid,service)
             if s['status']!='review':raise ValueError('请先冻结生成结果并完成盲审。')
             cases,reviews,people=self.records(sid);rows=[];disputes=0
+            quality_study = s['spec'].get('quality_protocol') == QUALITY_METRICS
             for c in cases:
                 data=c['payload'];judgments=[];effective=False;excluded=False
+                independent_scores = {}
                 review_required=data.get('review_required',data.get('sampled',True))
                 if not review_required:
                     effective=None
@@ -435,10 +449,31 @@ class PaperStudyStore:
                         if not review.get('answer'):raise ValueError('分歧尚未由第三人裁定。')
                         selected={'reviewer':people[2]['name'],**review};judgments.append(selected)
                     excluded=any(j['answer'].get('prior_target_exposure') is True for j in judgments)
-                    effective=self.verdict(c,selected) if not excluded else None
+                    if quality_study:
+                        independent_scores = {
+                            'factual_correct': selected['answer']['factual_correct'],
+                            'localization_correct': selected['selection'] == [data['expected']] if not excluded else None,
+                        }
+                        effective = None
+                    else:
+                        effective=self.verdict(c,selected) if not excluded else None
                 rows.append({'case_id':c['case_id'],'ordinal':c['ordinal'],'method':c['method'],
                     **{k:v for k,v in data.items() if k not in {'packet','mapping'}},
-                    'judgments':judgments,'valid':effective,'exposure_excluded':excluded})
+                    'judgments':judgments,'valid':effective,'exposure_excluded':excluded, **independent_scores})
+            if quality_study:
+                report = {
+                    'protocol': QUALITY_METRICS, 'study_id': sid, 'spec': s['spec'],
+                    'method_sha256': s['method_sha256'], 'generation_configuration': service.store.detail(s['job_id'])['spec'],
+                    'sampling_frame': '固定任务中通过自动验证且无人工干预的交付，按冻结种子无放回抽样。',
+                    'review_protocol': '先锁定全部单选定位，再揭示原生目标核对文本中的全部属性和空间关系。',
+                    'limitations': ['定位为原生候选中的人工选取。', '95% Wilson 区间未校正同片段样本相关性。',
+                        '抽中条目若存在预先知晓目标的情况，盲测定位比例不发布。'],
+                    'prior_exposure_count': sum(row['exposure_excluded'] for row in rows),
+                    'rows': rows, 'quality': quality_metrics(rows),
+                }
+                with self.runs.connect() as db:
+                    db.execute("UPDATE paper_studies SET status='sealed',report=? WHERE study_id=?", (json.dumps(report), sid))
+                return self.detail(sid,service)
             if s['spec'].get('review_sample_size') is not None:
                 delivered=[r for r in rows if r['accepted']]
                 sampled=[r for r in rows if r['sampled']]
@@ -495,9 +530,11 @@ class PaperStudyStore:
         s=self.private(sid)
         if s['status']!='sealed':raise ValueError('完成盲审并封存后才能导出结果。')
         output=io.StringIO();fields=['ordinal','method','expression','accepted','valid','status','reason','input_sha256','run_ids','cost','judgments','exposure_excluded']
+        if s['report'].get('protocol') == QUALITY_METRICS:
+            fields += ['sampled', 'expected', 'factual_correct', 'localization_correct']
         writer=csv.DictWriter(output,fieldnames=fields);writer.writeheader()
         for row in s['report']['rows']:
-            record={k:json.dumps(row[k],ensure_ascii=False) if isinstance(row[k],(dict,list)) else row[k] for k in fields}
+            record={k:json.dumps(row[k],ensure_ascii=False) if isinstance(row.get(k),(dict,list)) else row.get(k) for k in fields}
             for key,value in record.items():
                 if isinstance(value,str) and value.startswith(('=','+','-','@','\t','\r')):record[key]="'"+value
             writer.writerow(record)

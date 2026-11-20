@@ -10,20 +10,47 @@ import { taskLocation, taskUrl, openTask, sampleUrl } from '../src/navigation.ts
 import * as resultViewState from '../src/features/results/resultViewState.ts'
 import { renderToStaticMarkup } from 'react-dom/server'
 
+import * as localeSupport from '../src/shared/locale.ts'
+
+const localeMock = { ...localeSupport, useLocale: () => 'zh' }
 const require = createRequire(import.meta.url)
 const ts = require('typescript')
 
+test('switching languages updates labels, templates and service messages', () => {
+  const { t, localeTag, serviceText, setLocale } = localeSupport
+  const notes = '请保留原始审核备注。'
+  const exportStatus = ['任务尚未完成（{0}），暂不可导出。', '已暂停']
+  try {
+    setLocale('en')
+    assert.equal(localeTag(), 'en-US')
+    assert.equal(t('质量评估'), 'Evaluation')
+    assert.equal(categoryLabel('vehicle'), 'Vehicle')
+    assert.equal(t('排队第 {0} 位', 2), 'Queue position 2')
+    assert.equal(serviceText('37 个可标注物体'), '37 eligible targets')
+    assert.equal(serviceText('请求失败（HTTP 503）'), 'Request failed (HTTP 503)')
+    assert.equal(serviceText(exportStatus), 'Task incomplete (Paused). Export is unavailable.')
+    assert.equal(serviceText(notes), notes)
+  } finally {
+    setLocale('zh')
+  }
+  assert.equal(categoryLabel('vehicle'), '车辆')
+  assert.equal(t('质量评估'), '质量评估')
+  assert.equal(serviceText('37 个可标注物体'), '37 个可标注物体')
+  assert.equal(serviceText(exportStatus), '任务尚未完成（已暂停），暂不可导出。')
+})
+
 test('blind review synchronizes picked boxes and safely advances through localization and judgment', async () => {
   const source = readFileSync(new URL('../src/features/research/ResearchWorkspace.tsx', import.meta.url), 'utf8')
-  const code = ts.transpileModule(source + '\nexport { BlindReview, studyStatus, selectedStudy };', {
+  const code = ts.transpileModule(source + '\nexport { BlindReview, studyStatus, studyWorkflow, selectedStudy };', {
     compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },
   }).outputText
   const savedFetch = globalThis.fetch
   const slots = [], dependencies = [], cleanups = [], pendingEffects = []
-  let cursor = 0, tree, fail = false, release, hold = false, failLoad = false
+  let cursor = 0, tree, fail = false, release, hold = false, failLoad = false, singleTargetMode = false
   const records = [{case_id:'a', localized:false, answered:false}, {case_id:'b', localized:false, answered:false}]
   const selections = {}, judgments = {}, posts = []
   const inbox = () => ({title:'Test', reviewer:'test', role:0, status:'review', waiting:false,
+    quality_protocol:singleTargetMode?'agent-quality-metrics-v2':null,
     phase:records.every(c=>c.localized)?'judgment':'localization', cases:structuredClone(records)})
   globalThis.fetch = async (url, options) => {
     const parts = url.split('/'), cid = parts[6], kind = parts[7]
@@ -52,10 +79,13 @@ test('blind review synchronizes picked boxes and safely advances through localiz
   }
   const exports = {}, Scene = ()=>null
   new Function('require','exports',code)(name=>{
+    if (name.endsWith('/locale.ts')) return localeMock
     if(name==='react')return hooks
     if(name.endsWith('/annotationDisplay'))return {readJson,errorMessage,categoryLabel}
     if(name.endsWith('/duration'))return {formatDuration,hasIncompleteTiming}
+    if (name.endsWith('/Help')) return {HelpHint:()=>null}
     if(name.endsWith('/TaskScene'))return {__esModule:true,default:Scene}
+    if(name.endsWith('/TaskManager'))return {}
     if(name.endsWith('.css'))return {}
     return require(name)
   },exports)
@@ -135,10 +165,48 @@ test('blind review synchronizes picked boxes and safely advances through localiz
     assert.equal(exports.studyStatus({...study,reviewers:[{answered:9}]}),'独立盲审中')
     assert.equal(exports.studyStatus({...study,reviewers:[{answered:10},{answered:0},{answered:0}]}),'独立盲审中')
     assert.equal(exports.studyStatus({...study,status:'sealed'}),'已封存')
+    const generation={...study,status:'ready',spec:{...study.spec,quality_protocol:'agent-quality-metrics-v2'}}
+    const workflow=(status,progress,stale=false,control=null)=>exports.studyWorkflow({...generation,batch:{status,control}},progress,stale)
+    assert.equal(workflow('queued',{executor_active:false,queue_paused:true}).action.label,'继续队列')
+    assert.equal(workflow('queued',{executor_active:false,queue_position:2}).cancelQueue,true)
+    assert.equal(workflow('queued',{executor_active:false,queue_paused:true},true).action,undefined)
+    assert.equal(workflow('running',{executor_active:false,control:'pause'}).action.label,'继续生成')
+    assert.equal(workflow('running',{executor_active:true,control:'pause'}).action,undefined)
+    assert.equal(workflow('running',{executor_active:true,control:null}).action.kind,'pause')
+    assert.equal(workflow('completed',{executor_active:true}).action,undefined)
+    assert.equal(workflow('completed',{executor_active:false}).action.kind,'freeze')
+    assert.equal(workflow('paused',{executor_active:true}).action,undefined)
+    assert.equal(workflow('paused',{executor_active:false}).action.kind,'start')
+    assert.equal(workflow('blocked',{executor_active:false}).action.kind,'start')
     const studies=[{study_id:'new',reviewers:[{url:'#research?review=other'}]},{study_id:'reviewed',reviewers:[{url:'#research?review=test'}]}]
     assert.equal(exports.selectedStudy(studies,'','test'),'reviewed')
     assert.equal(exports.selectedStudy(studies,'new','test'),'new')
     assert.equal(exports.selectedStudy(studies,'',null),'new')
+    cleanups.forEach(f=>f?.())
+    slots.length=dependencies.length=cleanups.length=0
+    records.splice(0,records.length,{case_id:'a',localized:false,answered:false})
+    delete selections.a
+    delete judgments.a
+    singleTargetMode=true
+    await settle()
+    pick('C001');pick('C002')
+    assert.equal(nodes().filter(n=>n.props?.['aria-label']?.startsWith('移除所选对象')).length,1)
+    assert.equal(nodes().find(n=>n.props?.['aria-label']==='无法唯一定位').props.disabled,false)
+    button('锁定选择，下一条').props.onClick();await settle()
+    assert.deepEqual(posts.at(-1).body.selected_labels,['C002'])
+    assert.equal(scene().props.data.revealed,true)
+    assert.equal(nodes().some(n=>n.props?.className==='paper-candidates'),false)
+    assert.equal(nodes().filter(n=>n.type==='fieldset').length,2)
+    const submitted=posts.length
+    nodes().find(n=>n.type==='form').props.onSubmit({preventDefault(){}});await settle()
+    assert.equal(posts.length,submitted)
+    for (const name of ['factual_correct','prior_target_exposure']) {
+      nodes().find(n=>n.type==='input'&&n.props.name===name&&n.props.value==='false').props.onChange()
+    }
+    render();nodes().find(n=>n.type==='form').props.onSubmit({preventDefault(){}});await settle()
+    assert.equal(posts.at(-1).body.factual_correct,false)
+    assert.equal(posts.at(-1).body.prior_target_exposure,false)
+    assert.equal('unique' in posts.at(-1).body,false)
   } finally { cleanups.forEach(f=>f?.());globalThis.fetch=savedFetch }
 })
 const compiled = ts.transpileModule(readFileSync(new URL('../src/features/tasks/TaskManager.tsx', import.meta.url), 'utf8'), {
@@ -147,7 +215,7 @@ const compiled = ts.transpileModule(readFileSync(new URL('../src/features/tasks/
 
 // Run the component's event handlers with local hook/DOM substitutes. No server,
 // real deletion request, extra runtime dependency or model call is needed.
-function manager(outcome, taskCount = 2, activeSecond = false) {
+function manager(outcome, taskCount = 2, activeSecond = false, studyId) {
   const original = { fetch: globalThis.fetch, document: globalThis.document, HTMLElement: globalThis.HTMLElement }
   class Element {
     isConnected = true
@@ -168,6 +236,7 @@ function manager(outcome, taskCount = 2, activeSecond = false) {
     const result = currentAction === 'preview'
       ? { requested: ['a'], job_ids: ['a'], token: 'exclude-token', return_to_pool: false, processed_tracks: 2,
         candidate_tokens: { return: 'return-token', exclude: 'exclude-token' },
+        research_drafts: outcome === 'evaluation' ? [{study_id:'study-a',title:'Draft',reserved_targets:2}] : [],
         summary: { tasks: 1, retained_tasks: taskCount - 1 }, retained_shared: {} }
       : { deleted_job_ids: ['a'], cleanup_pending: outcome === 'pending' }
     const running = outcome === 'progress' && (!body ? polls++ === 0 : true)
@@ -193,10 +262,11 @@ function manager(outcome, taskCount = 2, activeSecond = false) {
   }
   const exports = {}
   new Function('require', 'exports', compiled)(name => {
+    if (name.endsWith('/locale.ts')) return localeMock
     if (name === 'react') return hooks
     if (name === 'react/jsx-runtime') return require(name)
     if (name.endsWith('/annotationDisplay')) return { readJson, errorMessage }
-    if (name.endsWith('/Help')) return {TermHelp:()=>null}
+    if (name.endsWith('/Help')) return {TermHelp:()=>null,HelpHint:()=>null}
     if (name.endsWith('/taskName')) return { taskName, taskDetails, exportTaskSelection }
     throw new Error(`Unexpected import: ${name}`)
   }, exports)
@@ -213,7 +283,12 @@ function manager(outcome, taskCount = 2, activeSecond = false) {
   const nodes = () => walk(tree)
   function render() {
     index = 0; effects = []
-    tree = exports.default(props)
+    if (studyId) {
+      const deletion = exports.useTaskDeletion({ studyId, isActive: () => false, onDeleted: props.onDeleted })
+      tree = [require('react/jsx-runtime').jsx('button', {
+        children:'删除所选任务', onClick: () => void deletion.prepare(['a']),
+      }), deletion.dialog, deletion.error]
+    } else tree = exports.default(props)
     for (const node of nodes()) {
       const ref = node.props?.ref
       if (!ref) continue
@@ -227,9 +302,11 @@ function manager(outcome, taskCount = 2, activeSecond = false) {
   }
   const button = text => nodes().find(node => node.type === 'button' && node.props.children === text)
   render()
-  button('管理').props.onClick(); render()
-  nodes().find(node => node.type === 'input' && node.props['aria-label']?.startsWith('选择任务 ')).props.onChange({ target: { checked: true } })
-  render()
+  if (!studyId) {
+    button('管理').props.onClick(); render()
+    nodes().find(node => node.type === 'input' && node.props['aria-label']?.startsWith('选择任务 ')).props.onChange({ target: { checked: true } })
+    render()
+  }
   return { render, button, nodes, deletionRequests, restore: () => Object.assign(globalThis, original), async preview() {
     button('删除所选任务').props.onClick(); render()
     assert.ok(nodes().some(node => node.type === 'dialog' && node.props['aria-busy']))
@@ -242,8 +319,9 @@ function manager(outcome, taskCount = 2, activeSecond = false) {
 test('task quantities accept editable integers and count only passed descriptions', async () => {
   const taskManager = {}
   new Function('require', 'exports', compiled)(name => {
+    if (name.endsWith('/locale.ts')) return localeMock
     if (name.endsWith('/annotationDisplay')) return { readJson, errorMessage }
-    if (name.endsWith('/Help')) return {TermHelp:()=>null}
+    if (name.endsWith('/Help')) return {TermHelp:()=>null,HelpHint:()=>null}
     if (name.endsWith('/taskName')) return { taskName, taskDetails, exportTaskSelection }
     return require(name)
   }, taskManager)
@@ -309,6 +387,8 @@ test('task quantities accept editable integers and count only passed description
   }).outputText
   const component = {}
   new Function('require', 'exports', metricCode)(name => {
+    if (name.endsWith('/locale.ts')) return localeMock
+    if (name.endsWith('/Help')) return {HelpHint:({label})=>label}
     if (name.endsWith('/annotationDisplay')) return { categoryLabel, reasonLabel }
     if (name.endsWith('/duration')) return { formatDuration, formatTiming, hasIncompleteTiming }
     return require(name)
@@ -346,6 +426,7 @@ test('task quantities accept editable integers and count only passed description
   let slotIndex = 0
   const states = [], exportComponent = {}, exportEffects = [], exportCleanups = []
   new Function('require', 'exports', exportCode)(name => {
+    if (name.endsWith('/locale.ts')) return localeMock
     if (name === 'react') return { useState(initial) {
       const key = slotIndex++
       if (!(key in states)) states[key] = initial
@@ -361,7 +442,7 @@ test('task quantities accept editable integers and count only passed description
       }
     } }
     if (name.endsWith('/annotationDisplay')) return {readJson,errorMessage}
-    if (name.endsWith('/Help')) return {TermHelp:()=>null}
+    if (name.endsWith('/Help')) return {TermHelp:()=>null,HelpHint:()=>null}
     if (name.endsWith('/taskName')) return { taskName, taskDetails, exportTaskSelection }
     return require(name)
   }, exportComponent)
@@ -531,6 +612,7 @@ test('deletion and rework preserve user decisions when follow-up operations fail
     }
     const same=(a,b)=>a&&b&&a.length===b.length&&a.every((v,i)=>Object.is(v,b[i]))
     new Function('require','exports',workspaceCode)(name=>{
+    if (name.endsWith('/locale.ts')) return localeMock
       if(name==='react')return {
         useState(initial){const key=slot++;if(!(key in slots))slots[key]=typeof initial==='function'?initial():initial
           return [slots[key],v=>{slots[key]=typeof v==='function'?v(slots[key]):v}]},
@@ -630,13 +712,14 @@ test('deletion and rework preserve user decisions when follow-up operations fail
       expression:'The visible red vehicle in the left-side view.',status:'calibration_hold',legacy_rules:true,
       target:{category:'vehicle',context:'same-context',object_id:'native-object',timestamp:123},manual_review:null}]
     new Function('require','exports',workspaceCode)(name=>{
+    if (name.endsWith('/locale.ts')) return localeMock
       if (name==='react') return {useEffect(){},useMemo:fn=>fn(),useState(initial){
         const key=slot++
         if (!(key in states)) states[key]=key===7?paused:typeof initial==='function'?initial():initial
         return [states[key],value=>{states[key]=typeof value==='function'?value(states[key]):value}]
       }}
       if (name.endsWith('/annotationDisplay')) return {readJson,readPollingJson,errorMessage,isAnnotationResult,isProcessingRecord,categoryLabel,reasonLabel,recordStatus,providerDiagnosisLabel,phases:{}}
-      if (name.endsWith('/Help')) return {TermHelp:()=>null}
+      if (name.endsWith('/Help')) return {TermHelp:()=>null,HelpHint:()=>null}
     if (name.endsWith('/taskName')) return {taskName,parseAnnotationCount}
       if (name.endsWith('/duration')) return {formatDuration,formatTiming,hasIncompleteTiming}
       if (name.endsWith('/navigation')) return {taskLocation,taskUrl,openTask,sampleUrl}
@@ -689,7 +772,7 @@ test('deletion and rework preserve user decisions when follow-up operations fail
       assert.equal(calls[0].url,'/api/batches/paused-job/control')
       assert.deepEqual(JSON.parse(calls[0].options.body),{command:'resume'})
       assert.ok(nodes.some(n=>n.type==='progress' && n.props.value===60 && n.props.max===200))
-      assert.ok(nodes.some(n=>n.props?.className==='section-caption' && typeof n.props.children==='string' && /目标 200 条描述$/.test(n.props.children)))
+      assert.ok(nodes.some(n=>n.props?.current===paused.job_id && typeof n.props.onOpen==='function'))
       if (mode==='failure' || mode==='retry') {
         assert.ok(nodes.some(n=>n.props?.role==='alert' && n.props.children.includes('已有标注已保留')))
         if (mode==='retry') {
@@ -749,7 +832,8 @@ test('deletion and rework preserve user decisions when follow-up operations fail
     assert.deepEqual(concurrent.deletionRequests.at(-1).body,
       {job_ids:['a'],token:'return-token',return_to_pool:true,action:'delete'})
     assert.equal(choices().length, 0) // Manager closes; the running task remains.
-    assert.equal(concurrent.nodes().filter(node => node.type === 'li').length, 1)
+    assert.ok(concurrent.nodes().some(node => node.props?.className === 'task-picker'))
+    assert.ok(concurrent.nodes().some(node => node.props?.className === 'count-badge' && node.props.children === 1))
   } finally { concurrent.restore() }
   const progress = manager('progress')
   try {
@@ -766,6 +850,20 @@ test('deletion and rework preserve user decisions when follow-up operations fail
     assert.equal(outdated.button('永久删除'),undefined)
     assert.ok(outdated.nodes().some(n=>n.props?.role==='alert' && /后端尚未加载删除进度功能/.test(n.props.children)))
   } finally { outdated.restore() }
+  for (const [studyId, linked] of [['study-a', true], ['other-study', false]]) {
+    const evaluation = manager('evaluation', 2, false, studyId)
+    try {
+      await evaluation.preview()
+      assert.equal(Boolean(evaluation.button('永久删除')), linked)
+      if (linked) {
+        assert.ok(evaluation.nodes().some(node => node.type === 'h2' && node.props.children === '永久删除评估及其生成任务？'))
+        evaluation.button('永久删除').props.onClick()
+        await setImmediate()
+        assert.deepEqual(evaluation.deletionRequests.at(-1).body,
+          {job_ids:['a'],token:'exclude-token',return_to_pool:false,action:'delete'})
+      } else assert.equal(evaluation.deletionRequests.length, 1)
+    } finally { evaluation.restore() }
+  }
   // Rework sends feedback atomically to the original task. A full task must
   // reject the action without first changing the existing review decision.
   const reviewCode = ts.transpileModule(readFileSync(new URL('../src/features/results/SampleReview.tsx', import.meta.url), 'utf8'), {
@@ -782,6 +880,7 @@ test('deletion and rework preserve user decisions when follow-up operations fail
       taskGoalReached:outcome==='goal_reached', decision:outcome==='already_saved'?feedback:null, localizationCorrect:false, busy:false, repairMode:true,
       onBusy(value) { props.busy=value }, onReviewed(value) { props.decision=value }, onOpenRetry(id) { opened=id }, onRetry(value) { receipt=value } }
     new Function('require','exports',reviewCode)(name => {
+    if (name.endsWith('/locale.ts')) return localeMock
       if (name==='react') return {
         useState(initial) { const index=slotIndex++;if (!(index in states)) states[index]=initial;return [states[index],value=>{states[index]=value}] },
         useRef() { return {current:null} }, useEffect() {},
@@ -839,6 +938,7 @@ test('deletion and rework preserve user decisions when follow-up operations fail
       automaticPassed:false,localizationCorrect:false,busy:false,onBusy(value){props.busy=value},
       onReviewed(value){reviewed=value},onOpenRetry(){}}
     new Function('require','exports',reviewCode)(name=>{
+    if (name.endsWith('/locale.ts')) return localeMock
       if(name==='react')return {useState(initial){const i=slot++;if(!(i in states))states[i]=initial;return [states[i],v=>states[i]=v]},useRef(){return {current:null}},useEffect(){}}
       if(name.endsWith('/annotationDisplay'))return {readJson,errorMessage,manualReviewLabels:{accepted:'审核通过'}}
       if(name.endsWith('/navigation'))return {sampleUrl}
@@ -863,7 +963,7 @@ test('deletion and rework preserve user decisions when follow-up operations fail
     compilerOptions:{module:ts.ModuleKind.CommonJS,jsx:ts.JsxEmit.ReactJSX},
   }).outputText
   const rework={}
-  new Function('require','exports',reworkCode)(name=>name.endsWith('/annotationDisplay')?{phases,reasonLabel}:name.endsWith('/navigation')?{taskUrl}:require(name),rework)
+  new Function('require','exports',reworkCode)(name=>name.endsWith('/locale.ts')?localeMock:name.endsWith('/annotationDisplay')?{phases,reasonLabel}:name.endsWith('/navigation')?{taskUrl}:require(name),rework)
   const base={ordinal:12,status:'running',phase:'generate',model_pending:true,automatic_passed:false,calls:2,call_budget:12,run_id:'run',packet_id:'packet'}
   for(const row of [
     {status:'pending',phase:null,task:'ready',text:'等待启动原任务'},
@@ -960,6 +1060,7 @@ test('sample discard is available outside localization and protects the displaye
       }
       const same=(a,b)=>a&&b&&a.length===b.length&&a.every((v,i)=>Object.is(v,b[i]))
       new Function('require','exports',compiled)(name=>{
+    if (name.endsWith('/locale.ts')) return localeMock
         if(name==='react')return {
           useState(initial){const i=index++;if(!(i in slots))slots[i]=typeof initial==='function'?initial():initial;return [slots[i],v=>{slots[i]=typeof v==='function'?v(slots[i]):v}]},
           useRef(initial){const i=index++;if(!(i in slots))slots[i]={current:initial};return slots[i]},useMemo(fn){return fn()},
@@ -970,6 +1071,7 @@ test('sample discard is available outside localization and protects the displaye
         if(name.endsWith('/taskName'))return {taskName:()=> '原任务'}
         if(name.endsWith('/cameraViews'))return {cameraViewLabel:()=> '前方'}
         if(name.endsWith('/navigation'))return {sampleUrl}
+        if (name.endsWith('/Help')) return {HelpHint:()=>null}
         if(name==='./TaskScene'||name==='./SampleReview'||name==='./ReworkProgress')return {default:()=>null}
         return require(name)
       },component)
@@ -1066,17 +1168,18 @@ test('sample discard is available outside localization and protects the displaye
     const states=[mode==='review',[job],job.job_id,true,list,12,null,'',null,false]
     let index=0
     new Function('require','exports',compiled)(name => {
+    if (name.endsWith('/locale.ts')) return localeMock
       if (name==='react') return {
         useState(initial) { const slot=index++;if (!(slot in states)) states[slot]=initial;return [states[slot],value=>{states[slot]=typeof value==='function'?value(states[slot]):value}] },
         useRef(initial) { return {current:initial} }, useEffect() {}, useMemo(fn) { return fn() },
       }
       if (name.endsWith('/annotationDisplay')) return {readJson,errorMessage,automaticCheckState,automaticCheckLabels,sampleFilterLabels,matchesSampleFilter,categoryLabel,
         objectName:value=>value,manualReviewLabels:{discarded:'已废弃'}}
-      if (name.endsWith('/Help')) return {TermHelp:()=>null}
-    if (name.endsWith('/taskName')) return {taskName:()=> '原任务'}
+      if (name.endsWith('/taskName')) return {taskName:()=> '原任务'}
       if (name.endsWith('/cameraViews')) return {cameraViewLabel:()=> '前方'}
       if (name.endsWith('/navigation')) return {taskLocation,taskUrl,openTask,sampleUrl}
       if(name==='./resultViewState')return resultViewState
+      if (name.endsWith('/Help')) return {HelpHint:()=>null}
       if (name==='./TaskScene'||name==='./SampleReview'||name==='./ReworkProgress') return {default:()=>null}
       return require(name)
     },component)
@@ -1187,6 +1290,7 @@ test('sample discard is available outside localization and protects the displaye
     globalThis.clearTimeout=id=>timers.delete(id)
     const same=(a,b)=>a&&b&&a.length===b.length&&a.every((v,i)=>Object.is(v,b[i]))
     new Function('require','exports',compiled)(name=>{
+    if (name.endsWith('/locale.ts')) return localeMock
       if(name==='react')return {
         useState(initial){const i=index++;if(!(i in states))states[i]=typeof initial==='function'?initial():initial;return [states[i],v=>{states[i]=typeof v==='function'?v(states[i]):v}]},
         useRef(initial){const i=index++;if(!(i in states))states[i]={current:initial};return states[i]},
@@ -1198,6 +1302,7 @@ test('sample discard is available outside localization and protects the displaye
       if(name.endsWith('/cameraViews'))return {cameraViewLabel:()=> '前方'}
       if(name.endsWith('/navigation'))return {sampleUrl}
       if(name==='./resultViewState')return resultViewState
+      if (name.endsWith('/Help')) return {HelpHint:()=>null}
       if(name==='./TaskScene'||name==='./SampleReview'||name==='./ReworkProgress')return {default:()=>null}
       return require(name)
     },component)

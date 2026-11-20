@@ -40,7 +40,7 @@ def study_detail(study_id:Id,request:Request):
 
 
 class StudyControl(Contract):
-    action:Literal['start','pause','freeze','seal','delete_empty']
+    action:Literal['start','pause','freeze','seal']
 
 
 @router.post('/studies/{study_id}/control')
@@ -48,7 +48,6 @@ def study_control(study_id:Id,body:StudyControl,request:Request):
     mutation_origin(request);store=request.app.state.paper_studies;batch=request.app.state.batches
     try:
         s=store.private(study_id)
-        if body.action=='delete_empty':return store.delete_empty(study_id,batch)
         if body.action=='freeze':return store.freeze(study_id,batch)
         if body.action=='seal':return store.seal(study_id,batch)
         if s['status'] in {'review','sealed'}:raise ValueError('已进入盲审的实验不能重新执行。')

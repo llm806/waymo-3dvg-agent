@@ -1,11 +1,14 @@
 """Short wire aliases; observations retain the full validated domain contract."""
 import copy
 import json
-from typing import Literal
+from typing import Literal, get_args
 
 from pydantic import ConfigDict, Field
 
-from app.schemas.contracts import CandidateVisualObservation, SceneVisualObservation, VisualAttribute, VisualObservation, VehicleColors, VISUAL_ATTRIBUTE_VALUES, VISUAL_COLORS, valid_inscription
+from app.schemas.contracts import AbsentVisualFeature, CandidateVisualObservation, SceneVisualObservation, VisualAttribute, VisualObservation, VehicleColors, VISUAL_ATTRIBUTE_VALUES, VISUAL_COLORS, valid_inscription
+
+
+ABSENT_FEATURES = frozenset(get_args(AbsentVisualFeature))
 
 
 def compact_alias(name):
@@ -41,6 +44,38 @@ class CompactCandidateObservation(CandidateVisualObservation):
 class CompactSceneObservation(SceneVisualObservation):
     model_config = ConfigDict(alias_generator=compact_alias)
     candidates: list[CompactCandidateObservation] = Field(default_factory=list, max_length=32)
+
+
+def scene_candidate_array(value, output_type, expected_ids):
+    """Wrap only the complete set of requested candidate observations."""
+    if (not issubclass(output_type, SceneVisualObservation) or not expected_ids
+            or not isinstance(value, list) or len(value) != len(expected_ids)
+            or not all(isinstance(record, dict) for record in value)):
+        return None
+    compact = issubclass(output_type, CompactSceneObservation)
+    if compact:
+        # Convert only field names. Duplicate spellings stay invalid, even
+        # when their values agree, so a claim cannot overwrite another.
+        converted = []
+        for record in value:
+            renamed = {compact_alias(key): item for key, item in record.items()}
+            if len(renamed) != len(record):
+                return None
+            if isinstance(renamed.get('a'), list):
+                for attribute in renamed['a']:
+                    if isinstance(attribute, dict) and len({compact_alias(key) for key in attribute}) != len(attribute):
+                        return None
+                renamed['a'] = [{compact_alias(key): item for key, item in attribute.items()}
+                    if isinstance(attribute, dict) else attribute for attribute in renamed['a']]
+            converted.append(renamed)
+        value = converted
+    fields = CompactCandidateObservation.model_fields if compact else CandidateVisualObservation.model_fields
+    identity = fields['candidate_id'].alias or 'candidate_id'
+    observed_ids = [record.get(identity) for record in value]
+    if not all(isinstance(candidate_id, str) for candidate_id in observed_ids) or set(observed_ids) != set(expected_ids):
+        return None
+    key = output_type.model_fields['candidates'].alias or 'candidates'
+    return {key: value}
 
 
 def unknown_optional_evidence(value, output_type):
@@ -92,6 +127,16 @@ def unknown_optional_evidence(value, output_type):
                     # Feature uncertainty cannot leave behind negative proof.
                     record[absence_key] = []
                     changes.append({'path': [*path, absence_key], 'unknown_features': True})
+        if path:
+            absence_key = 'absent' if compact else 'absent_features'
+            absent = record.get(absence_key)
+            if (isinstance(absent, list) and len(absent) <= 6
+                    and all(isinstance(feature, str) and feature in VISUAL_ATTRIBUTE_VALUES['feature'] for feature in absent)
+                    and not set(absent) <= ABSENT_FEATURES):
+                # The record used a positive-only feature to claim absence.
+                # Treat this whole optional negative check as unknown.
+                record[absence_key] = []
+                changes.append({'path': [*path, absence_key], 'unknown_features': True})
         colors = record.get('vehicle_colors')
         if isinstance(colors, dict):
             for role in ('body', 'roof'):
