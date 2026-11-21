@@ -5018,9 +5018,19 @@ def _check_paired_paper_study(root,monkeypatch):
         with store.connect() as db:
             db.execute('INSERT INTO batch_items(job_id,ordinal,target,status,run_id) VALUES(?,?,?,?,?)',(job,ordinal,json.dumps(target),'needs_evidence',agent))
             db.execute('INSERT INTO paper_trials VALUES(?,?,?,?,?,?)',(sid,ordinal,packet.model_dump_json(),digest({'initial':ordinal}),json.dumps([agent]),base))
-    batch={'job_id':job,'status':'completed','executor_active':False,'items':items,'spec':{'model':'fixture'}}
+    batch={'job_id':job,'status':'completed','executor_active':False,'items':items,'spec':{'model':'fixture'},
+        'method_sha256':method_fingerprint()}
     service=SimpleNamespace(store=SimpleNamespace(detail=lambda _:batch,execution_progress=batches.execution_progress))
-    detail=papers.freeze(sid,service)
+    with monkeypatch.context() as source_change:
+        source_change.setattr('app.agent.batch.method_fingerprint',lambda:'f'*64)
+        with pytest.raises(ValueError,match='不能混合方法'):
+            papers.ensure_method(job)
+        saved_method=batch['method_sha256']
+        batch['method_sha256']='f'*64
+        with pytest.raises(ValueError,match='无法进入盲审'):
+            papers.freeze(sid,service)
+        batch['method_sha256']=saved_method
+        detail=papers.freeze(sid,service)
     assert detail['cases']==4 and detail['status']=='review'
     cases,reviews,people=papers.records(sid);visible=[c for c in cases if c['payload']['expression']]
     assert len(visible)==2 and all('method' not in c for c in papers.inbox('token-0')['cases'])
@@ -5169,7 +5179,8 @@ def _check_independent_quality_metrics(papers, batches, packet, template):
         with papers.runs.connect() as db:
             db.execute('INSERT INTO paper_trials VALUES(?,?,?,?,?,NULL)',
                        (study_id, ordinal, current.model_dump_json(), 'input', json.dumps([run_id])))
-    batch = {'status': 'blocked', 'executor_active': False, 'items': items, 'spec': {}}
+    batch = {'status': 'blocked', 'executor_active': False, 'items': items, 'spec': {},
+             'method_sha256': method_fingerprint()}
     service = SimpleNamespace(store=SimpleNamespace(detail=lambda _: batch, execution_progress=batches.execution_progress))
     with pytest.raises(ValueError, match='固定任务'):
         papers.freeze(study_id, service)
@@ -5184,20 +5195,37 @@ def _check_independent_quality_metrics(papers, batches, packet, template):
     wrong = next(label for label in first['payload']['mapping'] if label != expected)
     with pytest.raises(ValueError, match='一个目标'):
         papers.select(token, first['case_id'], [expected, wrong])
-    papers.select(token, first['case_id'], [wrong])
+    saved = papers.select(token, first['case_id'], [wrong])
     assert not papers.case(token, first['case_id'])[2]
+    assert saved['phase']=='localization'
+    assert next(row for row in saved['cases'] if row['case_id']==first['case_id'])['localization_result']=='incorrect'
+    assert all('localization_result' not in row for row in saved['cases'] if not row['localized'])
     papers.select(token, sampled[1]['case_id'], [sampled[1]['payload']['expected']])
     papers.select(token, sampled[2]['case_id'], [])
     assert papers.case(token, first['case_id'])[2]
-    with pytest.raises(ValueError, match='已经知道'):
-        papers.answer(token, first['case_id'], Judgment(factual_correct=True, elapsed_seconds=1))
+    assert {row['localization_result'] for row in papers.inbox(token)['cases']}=={'correct','incorrect','unmatched'}
+    assert papers.detail(study_id,service)['quality_preview'] is None
+    with pytest.raises(ValueError, match='完成全部'):
+        papers.correct_selection(token,first['case_id'],[expected])
     for index, case in enumerate(sampled):
-        papers.answer(token, case['case_id'], Judgment(factual_correct=index != 1,
-                      prior_target_exposure=False, elapsed_seconds=1))
+        papers.answer(token, case['case_id'], Judgment(factual_correct=index != 1,elapsed_seconds=1))
+    preview=papers.detail(study_id,service)['quality_preview']
+    assert preview['quality']['blind_target_identification_accuracy']['numerator']==1
+    assert papers.correct_selection(token,first['case_id'],[expected])=={
+        'corrected_selection':[expected],'localization_result':'correct'}
+    _,review,_=papers.case(token,first['case_id'])
+    assert review['selection']==[wrong] and review['corrected_selection']==[expected]
+    updated=papers.detail(study_id,service)['quality_preview']['quality']
+    assert updated['blind_target_identification_accuracy']['numerator']==2
+    assert updated['first_selection_accuracy']==preview['quality']['first_selection_accuracy']
     report = papers.seal(study_id, service)['report']
     quality = report['quality']
     assert report['protocol'] == QUALITY_METRICS
-    assert [(r['numerator'], r['denominator']) for r in quality.values()] == [(4, 6), (2, 3), (1, 3)]
+    assert quality==updated
+    papers.correct_selection(token,first['case_id'],[])
+    assert papers.private(study_id)['report']==report
+    assert papers.detail(study_id,service)['quality_preview']['quality']['blind_target_identification_accuracy']['numerator']==1
+    assert [(r['numerator'], r['denominator']) for r in quality.values()] == [(4, 6), (2, 3), (2, 3), (1, 3)]
     assert 'factual_correct,localization_correct' in papers.export_csv(study_id).splitlines()[0]
     rows = [{**row, 'exposure_excluded': row['case_id'] == first['case_id']} for row in report['rows']]
     assert quality_metrics(rows)['text_accuracy'] == quality['text_accuracy']

@@ -1,4 +1,4 @@
-import { serviceText, localeTag, localizeLabels, t, useLocale } from '../../shared/locale.ts'
+import { defaultEvaluationTitle, evaluationTitle, serviceText, localeTag, localizeLabels, t, useLocale } from '../../shared/locale.ts'
 import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { readJson, readPollingJson, errorMessage, categoryLabel } from '../../shared/annotationDisplay'
@@ -14,10 +14,11 @@ const qualityProtocol = 'agent-quality-metrics-v2'
 type Quality = { automatic_completion_rate:Rate; text_accuracy?:Rate|null; blind_target_identification_accuracy?:Rate|null; accepted_validity?:Rate|null; random_sample_pass_rate?:Rate|null }
 type Report = { quality?:Quality; methods?:{agent:Quality}; prior_exposure_count?:number }
 type Study = { study_id:string;job_id:string;status:string;created_at:number;spec:{ title:string;sample_size:number;seed:number;dataset_split:string;reviewers:string[];review_sample_size?:number|null;review_all_deliveries?:boolean;quality_protocol?:string|null };cases:number;
-  reviewers:{name:string;role:number;url:string;localized:number;answered:number}[];batch:{status:string;calls:number;finished:number;passed?:number;control?:string|null;reason?:string};report:Report|null;automatic_completion_rate:Rate|null }
-type Inbox = {title:string;reviewer:string;role:number;status:string;phase:string;waiting:boolean;quality_protocol?:string|null;cases:{case_id:string;localized:boolean;answered:boolean}[]}
+  reviewers:{name:string;role:number;url:string;localized:number;answered:number}[];batch:{status:string;calls:number;finished:number;passed?:number;control?:string|null;reason?:string};report:Report|null;quality_preview?:Report|null;automatic_completion_rate:Rate|null }
+type LocalizationResult = 'correct'|'incorrect'|'unmatched'
+type Inbox = {title:string;reviewer:string;role:number;status:string;phase:string;waiting:boolean;quality_protocol?:string|null;cases:{case_id:string;localized:boolean;answered:boolean;localization_result?:LocalizationResult}[]}
 type Answer = { factual_correct:boolean;unique?:boolean|null;input_sufficient?:boolean|null;prior_target_exposure?:boolean|null;notes:string;elapsed_seconds:number }
-type BlindCase = Pick<TaskSceneData,'preview'|'candidates'|'cameras'> & {case_id:string;expression:string;selection:string[]|null;answer:Answer|null;revealed:boolean;expected:string|null;full_cloud:string;point_count:number}
+type BlindCase = Pick<TaskSceneData,'preview'|'candidates'|'cameras'> & {case_id:string;expression:string;selection:string[]|null;corrected_selection?:string[]|null;answer:Answer|null;revealed:boolean;expected:string|null;full_cloud:string;point_count:number}
 const names:Record<string,string>=localizeLabels({ready:'待开始',running:'生成中',queued:'已排队',paused:'已暂停',stopped:'已停止',completed:'生成结束',blocked:'生成受阻',review:'独立盲审中',sealed:'已封存',creating:'建立中'})
 function singleReviewComplete(study:Study){
   const delivered=study.automatic_completion_rate?.numerator??study.batch.passed
@@ -61,7 +62,7 @@ function StudyManager(){
   const [creating,setCreating]=useState(false),[loading,setLoading]=useState(true)
   const [loadError,setLoadError]=useState(''),[reload,setReload]=useState(0)
   const [draftTitle,setTitle]=useState<string|null>(null),[size,setSize]=useState('50'),[reviewSize,setReviewSize]=useState('20'),[split,setSplit]=useState('train')
-  const title=draftTitle??t("标注质量评估")
+  const title=draftTitle??evaluationTitle()
   const [reviewer,setReviewer]=useState('')
   const [requestId,setRequestId]=useState(()=>crypto.randomUUID().replaceAll('-','').slice(0,24))
   const completedReview=new URLSearchParams(window.location.hash.split('?')[1]).get('review_done')
@@ -113,7 +114,7 @@ function StudyManager(){
     },
   })
   async function create(e:FormEvent){e.preventDefault();setBusy(true);setError('')
-    try{const data=await post<Study>('studies',{request_id:requestId,title,sample_size:Number(size),seed:parseInt(requestId.slice(0,7),16),dataset_split:split,reviewers:[reviewer],
+    try{const data=await post<Study>('studies',{request_id:requestId,title:draftTitle??defaultEvaluationTitle,sample_size:Number(size),seed:parseInt(requestId.slice(0,7),16),dataset_split:split,reviewers:[reviewer],
       review_sample_size:Number(reviewSize),quality_protocol:qualityProtocol})
       setStudies(old=>[data,...old.filter(s=>s.study_id!==data.study_id)]);setSelected(data.study_id)
       setLoading(false);setCreating(false);setReload(v=>v+1);setRequestId(crypto.randomUUID().replaceAll('-','').slice(0,24))
@@ -140,7 +141,7 @@ function StudyManager(){
           {studies.length>0?<label>
             <span>{t("评估记录")}</span>
             <select value={selected} onChange={e=>setSelected(e.target.value)} disabled={busy}>
-              {studies.map(s=><option key={s.study_id} value={s.study_id}>{s.spec.title} · {new Date(s.created_at*1000).toLocaleDateString(localeTag())}</option>)}
+              {studies.map(s=><option key={s.study_id} value={s.study_id}>{evaluationTitle(s.spec.title)} · {new Date(s.created_at*1000).toLocaleDateString(localeTag())}</option>)}
             </select>
           </label>:!loadError&&<p className="muted" role="status">{loading?t("正在读取…"):t("暂无评估记录")}</p>}
           {legacy&&<p className="muted">{t("历史评估 · 原统计口径")}</p>}
@@ -150,7 +151,9 @@ function StudyManager(){
           <button className="primary" aria-expanded={creating} aria-controls={creating?'evaluation-plan':undefined} onClick={()=>setCreating(!creating)} disabled={busy}>{creating?t("收起设置"):t("新建评估")}</button>
         </div>
       </div>
-      <StudyReport report={study?.report??null} completion={study?.automatic_completion_rate??null} legacy={legacy}/>
+      <StudyReport report={study?.quality_preview??study?.report??null} completion={study?.automatic_completion_rate??null} legacy={legacy}/>
+      {study?.report?.quality&&study.quality_preview?.quality&&study.report.quality.blind_target_identification_accuracy?.numerator!==study.quality_preview.quality.blind_target_identification_accuracy?.numerator&&
+        <p className="muted">{t("当前指标含封存后的更正；下载报告采用封存时的结果。")}</p>}
     </section>
     {creating&&<form id="evaluation-plan" className="paper-card paper-create" aria-labelledby="evaluation-plan-title" onSubmit={create}>
       <h2 id="evaluation-plan-title">{t("评估设置")}</h2>
@@ -170,7 +173,7 @@ function StudyManager(){
             <label>{t("计划抽审数")}<input type="number" min={1} max={500} required value={reviewSize} aria-describedby="review-plan" onChange={e=>setReviewSize(e.target.value)}/></label>
             <label>{t("独立审核者")}<input required maxLength={80} placeholder={t("审核者标识")} value={reviewer} onChange={e=>setReviewer(e.target.value)}/></label>
           </div>
-          <p id="review-plan">{reviewPlan} {t("同一批样本先盲选目标，再核对文本，据此计算盲测目标识别准确率和文本准确率。")}</p>
+          <p id="review-plan">{reviewPlan} {t("同一批样本先盲选目标，再核对文本，据此计算人工盲审准确率和文本准确率。")}</p>
         </fieldset>
       </div>
       <div className="paper-form-footer"><p>{t("创建评估时建立专用标注任务并锁定目标。点击「开始生成」后调用模型。")}</p><button className="primary" disabled={busy}>{busy?t("正在创建…"):t("创建评估")}</button></div>
@@ -319,8 +322,8 @@ function StudyReport({report,completion,legacy}:{report:Report|null;completion:R
       {label:t("交付有效率"), rate:quality?.accepted_validity, detail:t("盲审有效交付 ÷ 全部交付")},
       {label:t("随机抽样通过率"), rate:quality?.random_sample_pass_rate, detail:t("盲审有效样本 ÷ 实际抽样数")},
     ] : [
+      {label:t("人工盲审准确率"), rate:quality?.blind_target_identification_accuracy, detail:t("人工盲选命中数 ÷ 实际抽审数")},
       {label:t("文本准确率"), rate:quality?.text_accuracy, detail:t("属性与关系均正确的描述数 ÷ 实际抽审数")},
-      {label:t("盲测目标识别准确率"), rate:quality?.blind_target_identification_accuracy, detail:t("揭示目标前单选命中数 ÷ 实际抽审数")},
     ]),
   ]
   return <>
@@ -334,13 +337,17 @@ function StudyReport({report,completion,legacy}:{report:Report|null;completion:R
               : <strong>{(rate.value*100).toFixed(1)}%</strong>}
           </div>
           <small className="paper-metric-definition">{detail}</small>
-          {rate&&<small className="paper-ci">{rate.numerator} / {rate.denominator}{rate.ci95&&t(" · 95% Wilson 区间 {0}%–{1}%", (rate.ci95[0]*100).toFixed(1), (rate.ci95[1]*100).toFixed(1))}</small>}
+          <div className="paper-stat-details">
+            {rate&&<small className="paper-ci">{rate.numerator} / {rate.denominator}{rate.ci95&&t(" · 95% Wilson 区间 {0}%–{1}%", (rate.ci95[0]*100).toFixed(1), (rate.ci95[1]*100).toFixed(1))}</small>}
+          </div>
         </dd>
       </div>
     ))}</dl>
-    {!!report?.prior_exposure_count&&<p className="notice" role="status">{t("有 {0} 条样本在盲测前已知目标，盲测目标识别准确率不发布。", report.prior_exposure_count)}</p>}
+    {!!report?.prior_exposure_count&&<p className="notice" role="status">{t("有 {0} 条样本在盲测前已知目标，人工盲审准确率不发布。", report.prior_exposure_count)}</p>}
   </>
 }
+
+const localizationLabel=(result:LocalizationResult)=>result==='correct'?t("命中"):result==='incorrect'?t("选错目标"):t("未选目标")
 
 function BlindReview({token}:{token:string}){
   useLocale()
@@ -351,43 +358,108 @@ function BlindReview({token}:{token:string}){
   const [noMatch,setNoMatch]=useState(false),[loadVersion,setLoadVersion]=useState(0)
   const [inboxVersion,setInboxVersion]=useState(0)
   const [inspectCompleted,setInspectCompleted]=useState(false)
+  const [wrongOnly,setWrongOnly]=useState(false),[correctionDrafts,setCorrectionDrafts]=useState<Record<string,string>>({})
+  const [jumpIndex,setJumpIndex]=useState(''),[navigationError,setNavigationError]=useState('')
+  const [savedBlind,setSavedBlind]=useState<{index:number;result:LocalizationResult}|null>(null)
   const reviewComplete=!!inbox?.cases.length&&inbox.cases.every(c=>c.answered)
   const singleTarget=inbox?.quality_protocol===qualityProtocol
+  const entries=(inbox?.cases??[]).map((entry,index)=>({entry,index}))
+  const isMiss=(entry:Inbox['cases'][number])=>entry.localization_result==='incorrect'||entry.localization_result==='unmatched'
+  const misses=entries.filter(({entry})=>isMiss(entry))
+  const visibleEntries=wrongOnly?entries.filter(({entry})=>entry.case_id===cid||isMiss(entry)):entries
+  const position=visibleEntries.findIndex(({entry})=>entry.case_id===cid)
   const submitting=useRef(false)
   useEffect(()=>{let live=true;get<Inbox>(`review/${token}`).then(v=>{if(live){setInbox(v);setCid(v.cases.find(c=>v.phase==='localization'?!c.localized:!c.answered)?.case_id??v.cases[0]?.case_id??'')}}).catch(e=>{if(live)setError(errorMessage(e))});return()=>{live=false}},[token,inboxVersion])
   useEffect(()=>{let live=true
-    if(cid)void get<BlindCase>(`review/${token}/cases/${cid}`).then(v=>{if(live){setData(v);setNoMatch(false);setError('');setFocus('');setStarted(Date.now());setSelection(v.selection??[]);setAnswers(v.answer?Object.fromEntries(Object.entries(v.answer).filter(([,value])=>typeof value==='boolean').map(([k,v])=>[k,String(v)])):{});setNotes(v.answer?.notes??'')}}).catch(e=>{if(live)setError(errorMessage(e))})
+    if(cid)void get<BlindCase>(`review/${token}/cases/${cid}`).then(v=>{if(live){setData(v);setNoMatch(false);setError('');setFocus('');setStarted(Date.now());setSelection(v.selection??[]);setAnswers(v.answer?Object.fromEntries(Object.entries(v.answer).filter(([key,value])=>key!=='prior_target_exposure'&&typeof value==='boolean').map(([k,v])=>[k,String(v)])):{});setNotes(v.answer?.notes??'')}}).catch(e=>{if(live)setError(errorMessage(e))})
     return()=>{live=false}
   },[token,cid,inbox?.phase,loadVersion])
   const current=data?.case_id===cid&&data.revealed===(inbox?.phase==='judgment')
   const locked=data?.selection!=null||!!inbox?.cases.find(c=>c.case_id===cid)?.localized
   const selectionDisabled=!current||locked||busy||inbox?.status==='sealed'
   const judgmentDisabled=!current||busy||!!data?.answer||inbox?.status==='sealed'
+  const canCorrect=singleTarget&&reviewComplete&&current&&data?.revealed
+  const savedCorrection=(data?.corrected_selection??data?.selection)?.[0]??''
+  const correction=correctionDrafts[cid]??savedCorrection
   async function submit(kind:'localization'|'answer'){
     if(submitting.current||!current||inbox?.status==='sealed')return
     if(kind==='localization'&&(locked||data?.revealed||(!selection.length&&!noMatch)))return
     if(kind==='answer'&&(!data?.revealed||data.answer||fields.some(([key])=>!['true','false'].includes(answers[key]))))return
     submitting.current=true;setBusy(true);setError('')
     try{const v=await post<Inbox>(`review/${token}/cases/${cid}/${kind}`,kind==='localization'?{selected_labels:selection,elapsed_seconds:elapsedSince(started)}:{...Object.fromEntries(Object.entries(answers).map(([k,v])=>[k,v==='true'])),notes,elapsed_seconds:elapsedSince(started)})
+      const result=v.cases.find(c=>c.case_id===cid)?.localization_result
+      if(kind==='localization'&&result)setSavedBlind({index:entries.findIndex(({entry})=>entry.case_id===cid)+1,result})
       setData(null);setInbox(v);setCid(v.cases.find(c=>v.phase==='localization'?!c.localized:!c.answered)?.case_id??cid)
       setLoadVersion(old=>old+1)
     }catch(e){setError(errorMessage(e))}finally{submitting.current=false;setBusy(false)}
   }
   function choose(id:string){setFocus(id);if(!selectionDisabled&&!submitting.current){setNoMatch(false);setSelection(old=>singleTarget?[id]:old.includes(id)?old:[...old,id])}}
   function toggle(id:string){setFocus(id);if(!selectionDisabled&&!submitting.current){setNoMatch(false);setSelection(old=>old.includes(id)?old.filter(v=>v!==id):singleTarget?[id]:[...old,id])}}
+  function openEntry(id:string){
+    if(submitting.current)return
+    setNavigationError('')
+    if(id!==cid){setData(null);setCid(id);setError('');setJumpIndex('')}
+  }
+  function goToIndex(event:FormEvent){
+    event.preventDefault()
+    if(submitting.current)return
+    const number=Number(jumpIndex)
+    const target=/^\d+$/.test(jumpIndex.trim())&&visibleEntries.find(({index})=>index+1===number)
+    if(!target){setNavigationError(t("请输入当前列表中的条目序号。"));return}
+    openEntry(target.entry.case_id);setJumpIndex('')
+  }
+  function inspectMisses(checked:boolean){
+    if(submitting.current)return
+    setWrongOnly(checked)
+    setNavigationError('')
+    if(checked&&!misses.some(({entry})=>entry.case_id===cid)){
+      openEntry(misses[0]?.entry.case_id??'')
+    }
+  }
+  function chooseCorrection(id:string){
+    if(canCorrect&&!submitting.current)setCorrectionDrafts(old=>({...old,[cid]:id}))
+  }
+  async function saveCorrection(event:FormEvent){
+    event.preventDefault()
+    if(submitting.current||!canCorrect||correction===savedCorrection)return
+    submitting.current=true;setBusy(true);setError('')
+    try{
+      const result=await post<{corrected_selection:string[];localization_result:LocalizationResult}>(`review/${token}/cases/${cid}/correction`,{selected_labels:correction?[correction]:[]})
+      setData(old=>old?.case_id===cid?{...old,corrected_selection:result.corrected_selection}:old)
+      setInbox(old=>old?{...old,cases:old.cases.map(c=>c.case_id===cid?{...c,localization_result:result.localization_result}:c)}:old)
+      setCorrectionDrafts(old=>{const next={...old};delete next[cid];return next})
+    }catch(e){setError(errorMessage(e))}finally{submitting.current=false;setBusy(false)}
+  }
   const fields=singleTarget
-    ? [['factual_correct',t("针对框出的原生目标，描述中的全部属性和空间关系是否都与场景一致？无法确认时选“否”。")],['prior_target_exposure',t("在锁定选择前，你是否已经知道这条描述的预期目标？")]]
+    ? [['factual_correct',t("针对框出的原生目标，描述中的全部属性和空间关系是否都与场景一致？无法确认时选“否”。")]]
     : [['factual_correct',t("表达中的事实是否都正确？")],['unique',t("表达是否只符合一个对象，没有其他可能对象？")],['input_sufficient',t("只凭这张原图与同帧点云，是否足以理解表达？")]]
   const blindStep=reviewComplete?2:inbox?.phase==='judgment'?1:0
   return <div className="paper-workspace paper-blind"><section className="paper-card paper-intro">
-    <div className="section-heading"><div><h2>{inbox?.title??t("审核任务")}</h2><p className="section-caption">{inbox?`${inbox.reviewer} · ${inbox.role===2?t("第三人裁定"):t("独立审核")}`:error?t("读取失败"):t("正在读取审核任务…")}</p></div></div>
+    <div className="section-heading"><div><h2>{inbox?evaluationTitle(inbox.title):t("审核任务")}</h2><p className="section-caption">{inbox?`${inbox.reviewer} · ${inbox.role===2?t("第三人裁定"):t("独立审核")}`:error?t("读取失败"):t("正在读取审核任务…")}</p></div></div>
     {inbox&&<ol className="sample-steps blind-steps" aria-label={t("独立审核流程")}>{[t("目标识别盲测"),t("文本事实核对")].map((label,index)=><li key={label}
       aria-current={index===blindStep?'step':undefined} className={index<blindStep?'done':index===blindStep?'current':''}><span aria-hidden="true">{index<blindStep?'✓':index+1}</span>{label}</li>)}</ol>}
     {inbox&&!inbox.waiting&&inbox.cases.length>0&&(!reviewComplete||inspectCompleted)&&<div className="paper-review-progress">
-      <label>{t("审核条目")}<select disabled={busy} value={cid} onChange={e=>{if(!submitting.current){setData(null);setCid(e.target.value)}}}>
-        {inbox.cases.map((c,i)=><option key={c.case_id} value={c.case_id}>{i+1} / {inbox.cases.length} · {c.answered?t("已判断"):c.localized?t("已锁定定位"):t("待定位")}</option>)}
+      <div className="paper-review-entries">
+      <label>{t("审核条目")}<select disabled={busy} value={cid} onChange={e=>openEntry(e.target.value)}>
+        {visibleEntries.map(({entry:c,index})=><option key={c.case_id} value={c.case_id}>{index+1} / {inbox.cases.length} · {c.localization_result
+          ? localizationLabel(c.localization_result)
+          : c.answered?t("已判断"):c.localized?t("已锁定定位"):t("待定位")}</option>)}
       </select></label>
+      <nav className="paper-entry-nav" aria-label={t("审核条目导航")}>
+        <button type="button" disabled={busy||position<=0} onClick={()=>openEntry(visibleEntries[position-1].entry.case_id)}>{t("上一条")}</button>
+        <button type="button" disabled={busy||position<0||position>=visibleEntries.length-1} onClick={()=>openEntry(visibleEntries[position+1].entry.case_id)}>{t("下一条")}</button>
+      </nav>
+      <form className="paper-entry-jump" onSubmit={goToIndex}>
+        <input type="text" inputMode="numeric" aria-label={t("条目序号")} placeholder={t("序号")} value={jumpIndex}
+          aria-invalid={!!navigationError} disabled={busy} onChange={e=>{setJumpIndex(e.target.value);setNavigationError('')}}/>
+        <button disabled={busy}>{t("跳转")}</button>
+      </form>
+      {singleTarget&&reviewComplete&&<label className="review-checkbox"><input type="checkbox" checked={wrongOnly} disabled={busy||(!wrongOnly&&!misses.length)}
+        onChange={e=>inspectMisses(e.target.checked)}/>{t("只看未命中（{0}）",misses.length)}</label>}
+      </div>
       <span>{t("已定位 ")}{inbox.cases.filter(c=>c.localized).length}{t(" · 已核对 ")}{inbox.cases.filter(c=>c.answered).length}</span>
+      {navigationError&&<p className="error paper-entry-error" role="alert">{navigationError}</p>}
+      {savedBlind&&inbox.phase==='judgment'&&!reviewComplete&&<p className="paper-selection-receipt" role="status">{t("第 {0} 条已保存 · {1}",savedBlind.index,localizationLabel(savedBlind.result))}</p>}
     </div>}
   </section>
     {error&&<div role="alert" className="error results-error"><span>{serviceText(error)}</span>{!inbox&&<button onClick={()=>{setError('');setInboxVersion(v=>v+1)}}>{t("重试读取审核任务")}</button>}</div>}
@@ -395,20 +467,31 @@ function BlindReview({token}:{token:string}){
     {reviewComplete&&<section className="paper-card paper-review-complete" role="status" aria-label={t("审核完成")}>
       <h3>{t("审核已完成 · ")}{inbox.cases.length} / {inbox.cases.length}</h3>
       <p>{t("全部独立判断已保存，审核完成。")}</p>
-      <p>{inbox.status==='sealed'?t("评估报告已封存，可返回质量评估页查看结果。"):t("本入口已无待审条目。下一步返回本次评估，点击“生成并封存评估报告”查看质量指标；多人评估需等所有审核者及必要裁定完成。")}</p>
-      <div className="paper-actions"><a className="primary paper-completion-link" href={`#research?review_done=${encodeURIComponent(token)}`}>{inbox.status==='sealed'?t("返回评估，查看报告"):t("下一步：返回评估生成报告")}</a><button onClick={()=>setInspectCompleted(old=>!old)}>{inspectCompleted?t("收起已提交判断"):t("查看已提交判断")}</button></div>
+      <div className="paper-actions"><a className="primary paper-completion-link" href={`#research?review_done=${encodeURIComponent(token)}`}>{inbox.status==='sealed'?t("返回评估，查看报告"):singleTarget?t("返回评估，查看指标"):t("下一步：返回评估生成报告")}</a><button onClick={()=>setInspectCompleted(old=>!old)}>{inspectCompleted?t("收起已提交判断"):t("查看已提交判断")}</button></div>
     </section>}
     {(!reviewComplete||inspectCompleted)&&<>
     {cid&&!current&&<p role="status">{error?<button onClick={()=>{setError('');setLoadVersion(old=>old+1)}}>{t("重新加载当前条目")}</button>:t("正在加载审核条目…")}</p>}
-    {current&&data&&<section className="paper-card"><blockquote className="paper-expression" lang="en">{data.expression}</blockquote><p className="paper-note">{data.revealed?(singleTarget?t("紫框标出原生目标 {0}，请逐项核对描述。", data.expected):t("预期目标：{0}。你之前锁定的候选：{1}。请独立判断事实和唯一性。", data.expected, data.selection?.join('、')||t("没有匹配对象"))):singleTarget?t("根据描述和场景选择一个目标。没有匹配对象或有多个合理对象时，选“无法唯一定位”。全部选择锁定后才会揭示目标。"):t("请选择所有符合表达的对象，可多选或明确提交空选。全部条目定位锁定前不会揭示目标。")}</p>
+    {current&&data&&<section className="paper-card"><blockquote className="paper-expression" lang="en">{data.expression}</blockquote>
+      {(!data.revealed||!singleTarget)&&<p className="paper-note">{data.revealed?t("预期目标：{0}。你之前锁定的候选：{1}。请独立判断事实和唯一性。", data.expected, data.selection?.join('、')||t("没有匹配对象")):singleTarget?t("根据描述和场景选择一个目标。没有匹配对象或有多个合理对象时，选“无法唯一定位”。全部选择锁定后才会揭示目标。"):t("请选择所有符合表达的对象，可多选或明确提交空选。全部条目定位锁定前不会揭示目标。")}</p>}
+      {canCorrect&&<form className="paper-correction" onSubmit={saveCorrection}>
+        <p>{t("当前选择 {0} · 正确目标 {1}",savedCorrection||t("无法唯一定位"),data.expected)}</p>
+        <div className="paper-actions"><label>{t("更正选择")} <select value={correction} disabled={busy} onChange={e=>chooseCorrection(e.target.value)}>
+          <option value="">{t("无法唯一定位")}</option>
+          {data.candidates.map(c=><option key={c.candidate_id} value={c.candidate_id}>{c.candidate_id} · {categoryLabel(c.category)}</option>)}
+        </select></label><button disabled={busy||correction===savedCorrection}>{t("保存更正")}</button></div>
+        <small>{t("保存更正后，人工盲审准确率按最终选择更新。")}</small>
+        {data.corrected_selection&&<p role="status">{t("更正已保存 · {0}",localizationLabel(
+          data.corrected_selection[0]===data.expected?'correct':data.corrected_selection.length?'incorrect':'unmatched'))}</p>}
+      </form>}
       {!data.revealed&&<div className="paper-localization-actions" aria-label={t("盲评定位确认")}>
         <div aria-live="polite"><strong>{locked?t("定位已锁定"):selection.length?singleTarget?t("已选 ")+selection[0]:t("已选 {0} 个对象", selection.length):noMatch&&singleTarget?t("无法唯一定位"):t("尚未选择匹配对象")}</strong><p className="muted">{locked?t("完成其余条目后进入事实核对。"):singleTarget?t("点击场景中的框或候选编号选择目标。"):t("点击框即可加入答案。点击下方编号可移除。")}</p>
+          {savedBlind&&<p className="paper-selection-receipt">{t("第 {0} 条已保存 · {1}",savedBlind.index,localizationLabel(savedBlind.result))}</p>}
           <div className="paper-selected-objects">{selection.map(id=><button key={id} disabled={selectionDisabled} aria-label={t("移除所选对象 {0}", id)} onClick={()=>toggle(id)}>{id} ×</button>)}</div>
         </div>
         <div className="paper-actions"><label><input type="checkbox" aria-label={singleTarget?t("无法唯一定位"):t("没有匹配对象")} checked={noMatch} disabled={selectionDisabled||(!singleTarget&&selection.length>0)} onChange={e=>{setNoMatch(e.target.checked);if(singleTarget&&e.target.checked){setSelection([]);setFocus('')}}}/>{singleTarget?t("无法唯一定位"):t("没有匹配对象")}</label><button className="primary" disabled={selectionDisabled||(!selection.length&&!noMatch)} onClick={()=>void submit('localization')}>{busy?t("正在保存…"):locked?t("定位已锁定"):singleTarget?t("锁定选择，下一条"):noMatch?t("确认无匹配对象，下一条"):t("确认所选对象，下一条")}</button></div>
         {error&&<p role="alert" className="error">{serviceText(error)}</p>}
       </div>}
-      <TaskScene key={`${cid}:${data.revealed?'revealed':'blind'}`} data={{...data,job_id:'',ordinal:0,revision:'',run_id:'',can_confirm:false,review:true,selected_candidate_id:null,confirmation:null,image_box_source:'official_lidar_box_projection'}} selected={data.revealed?(data.expected??''):focus} onSelect={data.revealed?undefined:choose} candidatePicker={false}/>
+      <TaskScene key={`${cid}:${data.revealed?'revealed':'blind'}`} data={{...data,job_id:'',ordinal:0,revision:'',run_id:'',can_confirm:false,review:true,selected_candidate_id:null,confirmation:null,image_box_source:'official_lidar_box_projection'}} selected={canCorrect?correction:data.revealed?(data.expected??''):focus} onSelect={canCorrect?chooseCorrection:data.revealed?undefined:choose} candidatePicker={false}/>
       {(!singleTarget||!data.revealed)&&<div className="paper-candidates">{data.candidates.map(c=><label key={c.candidate_id} className={selection.includes(c.candidate_id)?'checked':''}><input type={singleTarget?'radio':'checkbox'} name={singleTarget?'blind-target':undefined} disabled={locked||busy||inbox?.status==='sealed'} checked={selection.includes(c.candidate_id)} onChange={()=>singleTarget?choose(c.candidate_id):toggle(c.candidate_id)}/>{c.candidate_id}<small>{categoryLabel(c.category)}</small></label>)}</div>}
       <p className="muted">{t("完整点云 ")}{number(data.point_count)}{t(" 点 · ")}<a href={data.full_cloud}>{t("下载单帧点云")}</a></p>
       {data.revealed&&<form onSubmit={e=>{e.preventDefault();void submit('answer')}} className="paper-judgment"><h3>{t("独立事实判断")}</h3>{fields.map(([key,label])=><fieldset key={key} disabled={judgmentDisabled}><legend>{label}</legend>{['true','false'].map(value=><label key={value}><input type="radio" name={key} required value={value} checked={answers[key]===value} onChange={()=>setAnswers(old=>({...old,[key]:value}))}/>{value==='true'?t("是"):t("否")}</label>)}</fieldset>)}<label>{t("原因与备注")}<textarea maxLength={2000} value={notes} onChange={e=>setNotes(e.target.value)} disabled={judgmentDisabled} placeholder={t("指出错误事实、其他可能对象或输入缺失")}/></label><button className="primary" disabled={judgmentDisabled}>{data.answer?t("判断已保存"):busy?t("正在保存…"):t("提交独立判断，下一条")}</button></form>}

@@ -20,7 +20,9 @@
 .paper-stat-dash { color: var(--ui-muted); font-weight: 400; }
 .paper-stat small { display: block; color: var(--ui-muted); font-size: 13px; line-height: 1.55; }
 .paper-stat .paper-metric-definition { overflow-wrap: anywhere; }
-.paper-stat .paper-ci { padding-top: 4px; color: var(--ui-text); font-variant-numeric: tabular-nums; }
+.paper-stat-details { display: grid; align-content: start; gap: 4px; }
+.paper-stat-details:not(:empty) { padding-top: 4px; }
+.paper-stat .paper-ci { color: var(--ui-text); font-variant-numeric: tabular-nums; }
 .study-steps { margin-top:16px; padding-top:12px; border-top:1px solid var(--ui-border); }
 .blind-steps { margin:14px 0 0; padding:12px 0 0; border-top:1px solid var(--ui-border); border-bottom:0; }
 .paper-progress { margin: 14px 0; }
@@ -45,6 +47,12 @@
 .paper-empty p { margin: 4px 0; }
 .paper-review-progress { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:end; gap:10px; margin-top:12px; padding-top:12px; border-top:1px solid var(--ui-border); }
 .paper-review-progress label { display:grid; gap:5px; max-width:280px; font-weight:600; }
+.paper-review-entries { display:flex; flex-wrap:wrap; align-items:end; gap:8px 16px; }
+.paper-entry-nav, .paper-entry-jump { display:flex; align-items:center; gap:6px; }
+.paper-entry-jump input { width:5.5rem; min-width:0; }
+.paper-entry-error, .paper-selection-receipt { grid-column:1/-1; margin:0; }
+.paper-selection-receipt { color:var(--ui-accent-dark); font-size:13px; }
+.paper-review-entries .review-checkbox { display:inline-flex; align-items:center; min-height:var(--control-height); font-weight:400; }
 .paper-review-progress > span { display:flex; align-items:center; min-height:var(--control-height); color:var(--ui-muted); font-size:13px; }
 .paper-intro h2, .paper-intro p { margin: 0; }
 .paper-intro p { color: var(--ui-muted); }
@@ -58,6 +66,9 @@
 .paper-judgment legend { color: var(--ui-text); font-size: 14px; font-weight: 600; }
 .paper-judgment fieldset label { margin-right: 22px; font-size: 13px; }
 .paper-judgment textarea { min-height: 78px; resize: vertical; margin-bottom: 13px; }
+.paper-correction { display:grid; gap:8px; margin-bottom:var(--field-gap); padding-bottom:var(--field-gap); border-bottom:1px solid var(--ui-border); }
+.paper-correction p { margin:0; }
+.paper-correction small { color:var(--ui-muted); }
 .paper-review-complete { border-top: 2px solid var(--ui-accent-line); }
 .paper-completion-link { display: inline-flex; align-items: center; min-height: 36px; border-radius: 5px; padding: 7px 12px; text-decoration: none; font-size: 13px; line-height: 1.5; }
 .paper-blind:has(.paper-localization-actions) { padding-bottom: 170px; }

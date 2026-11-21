@@ -17,13 +17,15 @@ const require = createRequire(import.meta.url)
 const ts = require('typescript')
 
 test('switching languages updates labels, templates and service messages', () => {
-  const { t, localeTag, serviceText, setLocale } = localeSupport
+  const { t, localeTag, serviceText, setLocale, evaluationTitle } = localeSupport
   const notes = '请保留原始审核备注。'
   const exportStatus = ['任务尚未完成（{0}），暂不可导出。', '已暂停']
   try {
     setLocale('en')
     assert.equal(localeTag(), 'en-US')
     assert.equal(t('质量评估'), 'Evaluation')
+    assert.equal(evaluationTitle('标注质量评估'), 'Annotation quality evaluation')
+    assert.equal(evaluationTitle('夜间样本评估'), '夜间样本评估')
     assert.equal(categoryLabel('vehicle'), 'Vehicle')
     assert.equal(t('排队第 {0} 位', 2), 'Queue position 2')
     assert.equal(serviceText('37 个可标注物体'), '37 eligible targets')
@@ -35,6 +37,7 @@ test('switching languages updates labels, templates and service messages', () =>
   }
   assert.equal(categoryLabel('vehicle'), '车辆')
   assert.equal(t('质量评估'), '质量评估')
+  assert.equal(evaluationTitle('Annotation quality evaluation'), '标注质量评估')
   assert.equal(serviceText('37 个可标注物体'), '37 个可标注物体')
   assert.equal(serviceText(exportStatus), '任务尚未完成（已暂停），暂不可导出。')
 })
@@ -48,10 +51,14 @@ test('blind review synchronizes picked boxes and safely advances through localiz
   const slots = [], dependencies = [], cleanups = [], pendingEffects = []
   let cursor = 0, tree, fail = false, release, hold = false, failLoad = false, singleTargetMode = false
   const records = [{case_id:'a', localized:false, answered:false}, {case_id:'b', localized:false, answered:false}]
-  const selections = {}, judgments = {}, posts = []
+  const selections = {}, judgments = {}, corrections = {}, posts = []
+  const expected = cid => cid==='a'?'C002':'C001'
+  const resultFor=(cid,selection)=>selection?.[0]===expected(cid)?'correct':selection?.length?'incorrect':'unmatched'
   const inbox = () => ({title:'Test', reviewer:'test', role:0, status:'review', waiting:false,
     quality_protocol:singleTargetMode?'agent-quality-metrics-v2':null,
-    phase:records.every(c=>c.localized)?'judgment':'localization', cases:structuredClone(records)})
+    phase:records.every(c=>c.localized)?'judgment':'localization', cases:records.map(c=>({...c,
+      first_localization_result:singleTargetMode&&c.localized?resultFor(c.case_id,selections[c.case_id]):undefined,
+      localization_result:singleTargetMode&&c.localized?resultFor(c.case_id,corrections[c.case_id]??selections[c.case_id]):undefined}))})
   globalThis.fetch = async (url, options) => {
     const parts = url.split('/'), cid = parts[6], kind = parts[7]
     if (options?.method==='POST') {
@@ -59,6 +66,10 @@ test('blind review synchronizes picked boxes and safely advances through localiz
       if (hold) await new Promise(resolve=>{release=resolve})
       if (fail) return new Response(JSON.stringify({detail:'保存失败'}),{status:503})
       const row = records.find(c=>c.case_id===cid)
+      if (kind==='correction') {
+        corrections[cid]=posts.at(-1).body.selected_labels
+        return Response.json({corrected_selection:corrections[cid],localization_result:resultFor(cid,corrections[cid])})
+      }
       if (kind==='localization') { row.localized=true; selections[cid]=posts.at(-1).body.selected_labels }
       else { row.answered=true; judgments[cid]=posts.at(-1).body }
       return Response.json(inbox())
@@ -66,8 +77,8 @@ test('blind review synchronizes picked boxes and safely advances through localiz
     if (!cid) return Response.json(inbox())
     if(failLoad) return new Response(JSON.stringify({detail:'加载失败'}),{status:503})
     const revealed = records.every(c=>c.localized)
-    return Response.json({case_id:cid, expression:`Expression ${cid}`,selection:selections[cid]??null,
-      answer:judgments[cid]??null,revealed,expected:revealed?(cid==='a'?'C002':'C001'):null,preview:{},cameras:[],
+    return Response.json({case_id:cid, expression:`Expression ${cid}`,selection:selections[cid]??null,corrected_selection:corrections[cid]??null,
+      answer:judgments[cid]??null,revealed,expected:revealed?expected(cid):null,preview:{},cameras:[],
       candidates:[{candidate_id:'C001',category:'vehicle'},{candidate_id:'C002',category:'vehicle'}],point_count:10,full_cloud:'/test'})
   }
   const hooks = {
@@ -94,6 +105,7 @@ test('blind review synchronizes picked boxes and safely advances through localiz
   const button = text=>nodes().find(n=>n.type==='button'&&n.props.children===text)
   const scene = ()=>nodes().find(n=>n.type===Scene)
   const picker = ()=>nodes().find(n=>n.type==='select')
+  const judgmentForm = ()=>nodes().find(n=>n.props?.className==='paper-judgment')
   const empty = ()=>nodes().find(n=>n.props?.['aria-label']==='没有匹配对象')
   const render = ()=>{cursor=0;tree=exports.BlindReview({token:'test'});pendingEffects.splice(0).forEach(f=>f())}
   const settle = async()=>{for(let i=0;i<4;i++){render();await setImmediate()}render()}
@@ -145,10 +157,10 @@ test('blind review synchronizes picked boxes and safely advances through localiz
       assert.deepEqual(scene().props.data.selection,id==='a'?['C001']:[])
       assert.equal(nodes().filter(n=>n.type==='fieldset').length,3)
       const count=posts.length
-      nodes().find(n=>n.type==='form').props.onSubmit({preventDefault(){}});await settle()
+      judgmentForm().props.onSubmit({preventDefault(){}});await settle()
       assert.equal(posts.length,count)
       for(const n of nodes().filter(n=>n.type==='input'&&n.props.type==='radio'&&n.props.value==='false'))n.props.onChange()
-      render();nodes().find(n=>n.type==='form').props.onSubmit({preventDefault(){}});await settle()
+      render();judgmentForm().props.onSubmit({preventDefault(){}});await settle()
       assert.equal(posts.at(-1).kind,'answer')
       assert.equal('prior_target_exposure' in posts.at(-1).body,false)
     }
@@ -184,29 +196,63 @@ test('blind review synchronizes picked boxes and safely advances through localiz
     assert.equal(exports.selectedStudy(studies,'',null),'new')
     cleanups.forEach(f=>f?.())
     slots.length=dependencies.length=cleanups.length=0
-    records.splice(0,records.length,{case_id:'a',localized:false,answered:false})
+    records.splice(0,records.length,{case_id:'a',localized:false,answered:false},{case_id:'b',localized:true,answered:true})
     delete selections.a
     delete judgments.a
+    selections.b=['C001']
+    judgments.b={factual_correct:true}
     singleTargetMode=true
     await settle()
-    pick('C001');pick('C002')
+    pick('C002');pick('C001')
     assert.equal(nodes().filter(n=>n.props?.['aria-label']?.startsWith('移除所选对象')).length,1)
     assert.equal(nodes().find(n=>n.props?.['aria-label']==='无法唯一定位').props.disabled,false)
     button('锁定选择，下一条').props.onClick();await settle()
-    assert.deepEqual(posts.at(-1).body.selected_labels,['C002'])
+    assert.deepEqual(posts.at(-1).body.selected_labels,['C001'])
     assert.equal(scene().props.data.revealed,true)
+    assert.ok(nodes().some(n=>n.props?.children==='第 1 条已保存 · 选错目标'))
     assert.equal(nodes().some(n=>n.props?.className==='paper-candidates'),false)
-    assert.equal(nodes().filter(n=>n.type==='fieldset').length,2)
+    assert.equal(nodes().filter(n=>n.type==='fieldset').length,1)
+    assert.equal(nodes().some(n=>n.props?.className==='paper-note'),false)
     const submitted=posts.length
-    nodes().find(n=>n.type==='form').props.onSubmit({preventDefault(){}});await settle()
+    judgmentForm().props.onSubmit({preventDefault(){}});await settle()
     assert.equal(posts.length,submitted)
-    for (const name of ['factual_correct','prior_target_exposure']) {
-      nodes().find(n=>n.type==='input'&&n.props.name===name&&n.props.value==='false').props.onChange()
-    }
-    render();nodes().find(n=>n.type==='form').props.onSubmit({preventDefault(){}});await settle()
+    nodes().find(n=>n.type==='input'&&n.props.name==='factual_correct'&&n.props.value==='false').props.onChange()
+    render();judgmentForm().props.onSubmit({preventDefault(){}});await settle()
     assert.equal(posts.at(-1).body.factual_correct,false)
-    assert.equal(posts.at(-1).body.prior_target_exposure,false)
+    assert.equal('prior_target_exposure' in posts.at(-1).body,false)
     assert.equal('unique' in posts.at(-1).body,false)
+    button('查看已提交判断').props.onClick();await settle()
+    const reviewEntries=()=>nodes().find(n=>n.props?.className==='paper-review-entries')
+    const setMisses=checked=>walk(reviewEntries()).find(n=>n.type==='input'&&n.props.type==='checkbox').props.onChange({target:{checked}})
+    const jump=number=>{
+      nodes().find(n=>n.props?.['aria-label']==='条目序号').props.onChange({target:{value:number}})
+      render()
+      nodes().find(n=>n.props?.className==='paper-entry-jump').props.onSubmit({preventDefault(){}})
+    }
+    setMisses(true)
+    render()
+    assert.ok(walk(reviewEntries()).find(n=>n.type==='option').props.children.includes('选错目标'))
+    assert.equal(button('下一条').props.disabled,true)
+    jump('2');await settle()
+    assert.equal(scene().props.data.case_id,'a')
+    assert.ok(nodes().some(n=>n.props?.className==='error paper-entry-error'))
+    setMisses(false);render()
+    const correction=()=>nodes().find(n=>n.props?.className==='paper-correction')
+    pick('C002')
+    assert.equal(walk(correction()).find(n=>n.type==='select').props.value,'C002')
+    assert.equal(scene().props.selected,'C002')
+    button('下一条').props.onClick();await settle()
+    assert.equal(scene().props.data.case_id,'b')
+    button('上一条').props.onClick();await settle()
+    assert.equal(scene().props.selected,'C002') // Keep an unsaved correction when navigating.
+    jump('2');await settle()
+    assert.equal(scene().props.data.case_id,'b')
+    jump('1');await settle()
+    render();correction().props.onSubmit({preventDefault(){}});await settle()
+    assert.deepEqual(posts.at(-1),{cid:'a',kind:'correction',body:{selected_labels:['C002']}})
+    assert.deepEqual(scene().props.data.selection,['C001'])
+    assert.deepEqual(scene().props.data.corrected_selection,['C002'])
+    assert.ok(nodes().some(n=>n.props?.children==='更正已保存 · 命中'))
   } finally { cleanups.forEach(f=>f?.());globalThis.fetch=savedFetch }
 })
 const compiled = ts.transpileModule(readFileSync(new URL('../src/features/tasks/TaskManager.tsx', import.meta.url), 'utf8'), {

@@ -43,6 +43,14 @@ export function t(message: string, ...values: unknown[]) {
     Number(index) < values.length ? String(values[Number(index)]) : match) : translated
 }
 
+export const defaultEvaluationTitle = '标注质量评估'
+
+export function evaluationTitle(title: string = defaultEvaluationTitle) {
+  // Older evaluations stored the default title in the language used at creation.
+  return title === defaultEvaluationTitle || title === english[defaultEvaluationTitle]
+    ? t(defaultEvaluationTitle) : title
+}
+
 const servicePatterns = serviceTemplates.map(message => ({
   message,
   pattern: new RegExp('^' + message.split(/\{\d+\}/g).map(part =>

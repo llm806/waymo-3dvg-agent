@@ -1,4 +1,4 @@
-import { serviceText, t, useLocale } from '../../shared/locale.ts'
+import { evaluationTitle, serviceText, t, useLocale } from '../../shared/locale.ts'
 import type { InterfaceMessage } from '../../shared/locale.ts'
 import { useEffect, useRef, useState } from 'react'
 import { errorMessage, readJson } from '../../shared/annotationDisplay'
@@ -99,7 +99,7 @@ export function useTaskDeletion({ onDeleted, isActive, studyId }: {
       {!!review.research_drafts?.length && <div className="notice">
         <p>{t("以下评估尚未进入盲审，将随任务删除并解除候选预留。")}</p>
         <ul>{review.research_drafts.map(study => <li key={study.study_id}>
-          {t("「{0}」 · 预留 {1} 个目标", study.title, study.reserved_targets)}
+          {t("「{0}」 · 预留 {1} 个目标", evaluationTitle(study.title), study.reserved_targets)}
         </li>)}</ul>
       </div>}
       <label><input type="checkbox" checked={review.return_to_pool} disabled={busy || pending} onChange={e => {

@@ -66,7 +66,23 @@ def quality_metrics(rows):
         'text_accuracy': wilson(sum(row['factual_correct'] is True for row in sampled), len(sampled)),
         'blind_target_identification_accuracy': wilson(
             sum(row['localization_correct'] is True for row in sampled), len(sampled)) if independent else None,
+        'first_selection_accuracy': wilson(
+            sum(row.get('first_localization_correct',row['localization_correct']) is True
+                for row in sampled), len(sampled)) if independent else None,
     }
+
+
+def localization_result(selection, expected):
+    return 'correct' if selection == [expected] else 'incorrect' if selection else 'unmatched'
+
+
+def independent_quality_scores(expected, judgment, excluded):
+    first = judgment['selection']
+    corrected = judgment.get('corrected_selection')
+    final = first if corrected is None else corrected
+    return {'factual_correct': judgment['answer']['factual_correct'],
+            'first_localization_correct': first == [expected] if not excluded else None,
+            'localization_correct': final == [expected] if not excluded else None}
 
 
 def exists(db):
@@ -132,6 +148,8 @@ class PaperStudyStore:
             ''')
             if 'localization_seconds' not in {r['name'] for r in db.execute('PRAGMA table_info(paper_reviews)')}:
                 db.execute('ALTER TABLE paper_reviews ADD COLUMN localization_seconds REAL NOT NULL DEFAULT 0')
+            if 'corrected_selection' not in {r['name'] for r in db.execute('PRAGMA table_info(paper_reviews)')}:
+                db.execute('ALTER TABLE paper_reviews ADD COLUMN corrected_selection TEXT')
 
     def private(self, sid):
         with self.runs.connect() as db:
@@ -216,6 +234,11 @@ class PaperStudyStore:
                 r['localized']=db.execute('SELECT COUNT(*) FROM paper_reviews WHERE token=? AND selection IS NOT NULL',(r['token'],)).fetchone()[0]
                 r['answered']=db.execute('SELECT COUNT(*) FROM paper_reviews WHERE token=? AND answer IS NOT NULL',(r['token'],)).fetchone()[0]
                 r['url']='#research?review='+r.pop('token')
+            preview = None
+            if (s['status'] in {'review','sealed'} and s['spec'].get('quality_protocol') == QUALITY_METRICS
+                    and completion and reviewers
+                    and reviewers[0]['answered'] >= min(completion['numerator'], s['spec']['review_sample_size'])):
+                preview = self.quality_preview(db, sid)
         batch=service.store.execution_progress(s['job_id']) if s['job_id'] else {}
         if s['job_id']:
             with self.runs.connect() as db:
@@ -224,7 +247,31 @@ class PaperStudyStore:
                 batch['finished']=db.execute("SELECT COUNT(*) FROM batch_items WHERE job_id=? AND status NOT IN ('pending','running','preparing')",(s['job_id'],)).fetchone()[0]
         return {k:s[k] for k in ('study_id','job_id','spec','status','created_at','report')} | {
             'protocol':s['spec'].get('quality_protocol') or PROTOCOL,'baseline':BASELINE,'cases':cases,'reviewers':reviewers,
-            'batch':batch,'method_sha256':s['method_sha256'],'automatic_completion_rate':completion}
+            'batch':batch,'method_sha256':s['method_sha256'],'automatic_completion_rate':completion,
+            'quality_preview':preview}
+
+    @staticmethod
+    def quality_preview(db, sid):
+        """Preview the same metrics as sealing without reading scene packets."""
+        rows = []
+        for item in db.execute("""SELECT json_extract(c.payload,'$.accepted') AS accepted,
+                json_extract(c.payload,'$.sampled') AS sampled, json_extract(c.payload,'$.expected') AS expected,
+                r.selection,r.answer,r.corrected_selection
+                FROM paper_cases c JOIN paper_reviewers p ON p.study_id=c.study_id AND p.role=0
+                LEFT JOIN paper_reviews r ON r.case_id=c.case_id AND r.token=p.token WHERE c.study_id=?""",(sid,)):
+            if not (item['accepted'] and item['sampled']):
+                rows.append({'accepted':item['accepted'],'sampled':item['sampled'],'exposure_excluded':False})
+                continue
+            if item['answer'] is None or item['selection'] is None:
+                return None
+            answer = json.loads(item['answer'])
+            excluded = answer.get('prior_target_exposure') is True
+            rows.append({'accepted':True,'sampled':True,'exposure_excluded':excluded,
+                         **independent_quality_scores(item['expected'],
+                            {'selection':json.loads(item['selection']),'answer':answer,
+                             'corrected_selection':json.loads(item['corrected_selection'])
+                             if item['corrected_selection'] is not None else None},excluded)})
+        return {'quality':quality_metrics(rows),'prior_exposure_count':sum(r['exposure_excluded'] for r in rows)}
 
     def ensure_method(self, job):
         from app.agent.batch import method_fingerprint
@@ -287,13 +334,16 @@ class PaperStudyStore:
         with self.runs.maintenance():
             s=self.private(sid)
             if s['status'] in {'review','sealed'}:return self.detail(sid,service)
-            self.ensure_method(s['job_id'])
             batch=service.store.detail(s['job_id'])
             quality_study = s['spec'].get('quality_protocol') == QUALITY_METRICS
             allowed = {'completed'} if quality_study else {'completed', 'blocked'}
             unfinished = quality_study and any(item['status'] in {'pending', 'preparing', 'running'} for item in batch['items'])
             if batch['status'] not in allowed or batch['executor_active'] or unfinished:
                 raise ValueError('请等待全部固定任务结束；暂停或排队中的实验不能进入盲审。')
+            # Freezing reads completed results without running the generator.
+            # Compare the recorded generation method to the study's contract.
+            if batch['method_sha256'] != s['method_sha256']:
+                raise ValueError('生成任务的记录与评估冻结的方法不一致，无法进入盲审。')
             rows=[]
             sample_size=s['spec'].get('review_sample_size')
             methods=('agent',) if sample_size is not None else ('agent','baseline')
@@ -350,11 +400,16 @@ class PaperStudyStore:
         if not r:raise ValueError('审核链接无效。')
         return dict(r)
 
-    def records(self,sid):
+    def records(self,sid,*,include_corrections=False):
         with self.runs.connect() as db:
             cases=[{**dict(r),'payload':json.loads(r['payload'])} for r in db.execute('SELECT * FROM paper_cases WHERE study_id=?',(sid,))]
-            reviews={(r['case_id'],r['token']):{'selection':json.loads(r['selection']) if r['selection'] is not None else None,
-                'answer':json.loads(r['answer']) if r['answer'] else None,'localization_seconds':r['localization_seconds']} for r in db.execute('SELECT r.* FROM paper_reviews r JOIN paper_cases c ON c.case_id=r.case_id WHERE c.study_id=?',(sid,))}
+            reviews={}
+            for r in db.execute('SELECT r.* FROM paper_reviews r JOIN paper_cases c ON c.case_id=r.case_id WHERE c.study_id=?',(sid,)):
+                review={'selection':json.loads(r['selection']) if r['selection'] is not None else None,
+                    'answer':json.loads(r['answer']) if r['answer'] else None,'localization_seconds':r['localization_seconds']}
+                if include_corrections and r['corrected_selection'] is not None:
+                    review['corrected_selection']=json.loads(r['corrected_selection'])
+                reviews[(r['case_id'],r['token'])]=review
             people=[dict(r) for r in db.execute('SELECT * FROM paper_reviewers WHERE study_id=? ORDER BY role',(sid,))]
         return cases,reviews,people
 
@@ -371,7 +426,7 @@ class PaperStudyStore:
 
     def assigned(self,token):
         person=self.reviewer(token);s=self.private(person['study_id'])
-        cases,reviews,people=self.records(s['study_id'])
+        cases,reviews,people=self.records(s['study_id'],include_corrections=True)
         visible=[c for c in cases if c['payload']['expression'] and c['payload'].get('review_required',c['payload'].get('sampled',True))]
         complete=all(reviews.get((c['case_id'],p['token']),{}).get('answer') for c in visible for p in people[:2])
         if person['role']==2:
@@ -384,11 +439,20 @@ class PaperStudyStore:
 
     def inbox(self,token):
         person,s,cases,reviews,localized,complete=self.assigned(token)
+        entries=[]
+        for c in cases:
+            review=reviews.get((c['case_id'],token),{})
+            selection=review.get('selection')
+            entry={'case_id':c['case_id'],'localized':selection is not None,'answered':bool(review.get('answer'))}
+            if selection is not None and c['payload'].get('quality_protocol')==QUALITY_METRICS:
+                expected=c['payload']['expected']
+                entry['first_localization_result']=localization_result(selection,expected)
+                entry['localization_result']=localization_result(review.get('corrected_selection',selection),expected)
+            entries.append(entry)
         return {'title':s['spec']['title'],'reviewer':person['name'],'role':person['role'],'status':s['status'],
             'quality_protocol':s['spec'].get('quality_protocol'),
             'phase':'judgment' if localized else 'localization','waiting':person['role']==2 and not complete,
-            'cases':[{'case_id':c['case_id'],'localized':reviews.get((c['case_id'],token),{}).get('selection') is not None,
-                'answered':bool(reviews.get((c['case_id'],token),{}).get('answer'))} for c in cases]}
+            'cases':entries}
 
     def case(self,token,cid):
         person,s,cases,reviews,localized,_=self.assigned(token)
@@ -406,7 +470,9 @@ class PaperStudyStore:
             if old.get('selection') is not None:
                 if old['selection']!=labels:raise ValueError('定位已锁定，不能在查看目标后修改。')
                 return self.inbox(token)
-            with self.runs.connect() as db:db.execute('INSERT INTO paper_reviews VALUES(?,?,?,NULL,?,?)',(cid,token,json.dumps(labels),time.time(),elapsed_seconds))
+            with self.runs.connect() as db:
+                db.execute('INSERT INTO paper_reviews(case_id,token,selection,updated_at,localization_seconds) VALUES(?,?,?,?,?)',
+                           (cid,token,json.dumps(labels),time.time(),elapsed_seconds))
         return self.inbox(token)
 
     def answer(self,token,cid,answer):
@@ -414,23 +480,35 @@ class PaperStudyStore:
             c,old,localized=self.case(token,cid)
             if self.private(c['study_id'])['status']=='sealed':raise ValueError('报告已封存。')
             if not localized or old.get('selection') is None:raise ValueError('必须先锁定全部定位，才能核对目标及事实。')
-            if c['payload'].get('quality_protocol') == QUALITY_METRICS:
-                if answer.prior_target_exposure is None:
-                    raise ValueError('请注明在盲测前是否已经知道预期目标。')
-            elif answer.unique is None or answer.input_sufficient is None:
+            if c['payload'].get('quality_protocol') != QUALITY_METRICS and (answer.unique is None or answer.input_sufficient is None):
                 raise ValueError('请完成原评估协议要求的全部判断。')
             if old.get('answer') and old['answer']!=answer.model_dump():raise ValueError('已提交的独立判断不能覆写。')
             with self.runs.connect() as db:db.execute('UPDATE paper_reviews SET answer=?,updated_at=? WHERE case_id=? AND token=?',
                 (json.dumps(answer.model_dump()),time.time(),cid,token))
         return self.inbox(token)
 
+    def correct_selection(self,token,cid,labels):
+        with self.runs.maintenance():
+            _,study,cases,reviews,revealed,_=self.assigned(token)
+            case=next((c for c in cases if c['case_id']==cid),None)
+            if (case is None or study['status'] not in {'review','sealed'}
+                    or study['spec'].get('quality_protocol') != QUALITY_METRICS or not revealed
+                    or not all(reviews.get((c['case_id'],token),{}).get('answer') for c in cases)):
+                raise ValueError('请完成全部独立判断后再更正定位。')
+            if len(labels)>1 or not set(labels)<=case['payload']['mapping'].keys():
+                raise ValueError('候选编号无效。')
+            with self.runs.connect() as db:
+                db.execute('UPDATE paper_reviews SET corrected_selection=? WHERE case_id=? AND token=?',
+                           (json.dumps(labels),cid,token))
+        return {'corrected_selection':labels,'localization_result':localization_result(labels,case['payload']['expected'])}
+
     def seal(self,sid,service):
         with self.runs.maintenance():
             s=self.private(sid)
             if s['status']=='sealed':return self.detail(sid,service)
             if s['status']!='review':raise ValueError('请先冻结生成结果并完成盲审。')
-            cases,reviews,people=self.records(sid);rows=[];disputes=0
             quality_study = s['spec'].get('quality_protocol') == QUALITY_METRICS
+            cases,reviews,people=self.records(sid,include_corrections=quality_study);rows=[];disputes=0
             for c in cases:
                 data=c['payload'];judgments=[];effective=False;excluded=False
                 independent_scores = {}
@@ -450,10 +528,7 @@ class PaperStudyStore:
                         selected={'reviewer':people[2]['name'],**review};judgments.append(selected)
                     excluded=any(j['answer'].get('prior_target_exposure') is True for j in judgments)
                     if quality_study:
-                        independent_scores = {
-                            'factual_correct': selected['answer']['factual_correct'],
-                            'localization_correct': selected['selection'] == [data['expected']] if not excluded else None,
-                        }
+                        independent_scores = independent_quality_scores(data['expected'],selected,excluded)
                         effective = None
                     else:
                         effective=self.verdict(c,selected) if not excluded else None
@@ -465,9 +540,10 @@ class PaperStudyStore:
                     'protocol': QUALITY_METRICS, 'study_id': sid, 'spec': s['spec'],
                     'method_sha256': s['method_sha256'], 'generation_configuration': service.store.detail(s['job_id'])['spec'],
                     'sampling_frame': '固定任务中通过自动验证且无人工干预的交付，按冻结种子无放回抽样。',
-                    'review_protocol': '先锁定全部单选定位，再揭示原生目标核对文本中的全部属性和空间关系。',
+                    'review_protocol': '选择锁定后可显示是否命中。全部锁定后显示原生目标，再核对文本事实。报告分别统计首次选择与最终选择。',
                     'limitations': ['定位为原生候选中的人工选取。', '95% Wilson 区间未校正同片段样本相关性。',
-                        '抽中条目若存在预先知晓目标的情况，盲测定位比例不发布。'],
+                        '最终选择可包含揭示目标后的更正，不能作为独立盲测成绩。',
+                        '历史记录若标记预先知晓目标，定位比例不发布。当前流程不采集审核者在系统外预先知晓目标的情况。'],
                     'prior_exposure_count': sum(row['exposure_excluded'] for row in rows),
                     'rows': rows, 'quality': quality_metrics(rows),
                 }
@@ -531,7 +607,7 @@ class PaperStudyStore:
         if s['status']!='sealed':raise ValueError('完成盲审并封存后才能导出结果。')
         output=io.StringIO();fields=['ordinal','method','expression','accepted','valid','status','reason','input_sha256','run_ids','cost','judgments','exposure_excluded']
         if s['report'].get('protocol') == QUALITY_METRICS:
-            fields += ['sampled', 'expected', 'factual_correct', 'localization_correct']
+            fields += ['sampled', 'expected', 'factual_correct', 'localization_correct', 'first_localization_correct']
         writer=csv.DictWriter(output,fieldnames=fields);writer.writeheader()
         for row in s['report']['rows']:
             record={k:json.dumps(row[k],ensure_ascii=False) if isinstance(row.get(k),(dict,list)) else row.get(k) for k in fields}
