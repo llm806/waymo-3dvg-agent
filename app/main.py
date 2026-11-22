@@ -2,8 +2,11 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 import asyncio
 import json
+import logging
+import shutil
 import sqlite3
 import os
+import subprocess
 import time
 
 from fastapi import FastAPI
@@ -23,6 +26,28 @@ from app.infrastructure.deletion_operations import DeletionOperations
 
 LOG_ROOT = Path(__file__).resolve().parents[1] / "runtime" / "annotation"
 LOADED_METHOD_SHA256 = method_fingerprint()
+logger = logging.getLogger("uvicorn.error")
+
+
+def start_public_tunnel() -> subprocess.Popen | None:
+    url = os.getenv("WAYMO_NGROK_URL", "").strip()
+    if not url:
+        return None
+    ngrok = shutil.which("ngrok")
+    if ngrok is None:
+        logger.warning("Public tunnel unavailable: ngrok was not found on PATH")
+        return None
+    try:
+        process = subprocess.Popen(
+            [ngrok, "http", "127.0.0.1:8000", "--url", url,
+             "--inspect=false", "--log=stderr", "--log-level=warn"],
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except OSError as exc:
+        logger.warning("Could not start the ngrok tunnel: %s", exc)
+        return None
+    logger.info("Started ngrok for %s", url)
+    return process
 
 
 async def recover_batches(service, exports):
@@ -49,10 +74,14 @@ async def lifespan(app: FastAPI):
     app.state.deletions = DeletionOperations(app.state.batches)
     diagnostic_event(LOG_ROOT, "service_started", pid=os.getpid())
     recovery = asyncio.create_task(recover_batches(app.state.batches, app.state.exports))
+    tunnel = start_public_tunnel()
     try:
         yield
     finally:
         recovery.cancel()
+        if tunnel is not None:
+            tunnel.terminate()
+            await asyncio.to_thread(tunnel.wait)
         try:
             await recovery
         except asyncio.CancelledError:

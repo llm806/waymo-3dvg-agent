@@ -485,7 +485,7 @@ export default function BatchWorkspace({ onOpenPacket, active = true }: { onOpen
             {detail.spec.prepare_only && <p className="muted">{t("本任务仅准备数据，不生成文本或调用模型。")}</p>}
             {detail.status === 'queued' && <p className="notice" role="status">{t("排队第 ")}{detail.queue_position ?? '—'}{t(" 位。")}{detail.queue_paused ? t("队列已暂停，点击“继续队列”后恢复自动调度。") : t("前面的任务完成后自动开始，排队期间不调用模型。")}</p>}
             {detail.status === 'paused' && detail.reason && detail.reason !== 'repeated_response_shape_failures' && !detail.executor_active && <p className="notice">{t("执行异常已暂停，其它目标的进度已保存。排查失败记录后可继续。")}</p>}
-            {detail.resume && detail.resume.mode !== 'resume' && <p className="notice" role="status">{serviceText(detail.resume.message)}</p>}
+            {(detail.status !== 'completed' || canContinue) && detail.resume && detail.resume.mode !== 'resume' && <p className="notice" role="status">{serviceText(detail.resume.message)}</p>}
             {error && <p className="error" role="alert">{serviceText(error)}</p>}
             {failureReason && <div className="task-alert" role="status"><strong>{t("任务执行中断")}</strong><p>{reason(failureReason, failureItem?.provider_diagnosis, failureItem?.failure_diagnostic?.provider_error_code)}</p>{failureReason !== 'repeated_response_shape_failures' && failureItem?.failure_diagnostic?.http_status && <p>HTTP {failureItem.failure_diagnostic.http_status}{failureItem.failure_diagnostic.provider_error_code && ` · ${failureItem.failure_diagnostic.provider_error_code}`}</p>}</div>}
             {activeJob && activeJob !== detail.job_id && <p className="notice">{t("另一任务正在执行，可从上方任务列表切换查看。")}</p>}

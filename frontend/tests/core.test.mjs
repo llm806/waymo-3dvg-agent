@@ -745,15 +745,23 @@ test('deletion and rework preserve user decisions when follow-up operations fail
       Object.assign(globalThis,saved)
     }
   }
-  for (const mode of ['recover','resume','failure','retry','delete','delete_failure','delete_cancel','restart_required']) {
+  for (const mode of ['recover','resume','failure','retry','delete','delete_failure','delete_cancel','restart_required',
+    'completed','completed_goal','completed_recoverable']) {
     const originalFetch=globalThis.fetch, originalWindow=globalThis.window, states=[], calls=[], component={}, confirmations=[]
     globalThis.window={confirm:text=>{confirmations.push(text);return mode!=='delete_cancel'}}
     let slot=0, rejected=false
     const paused={job_id:'paused-job',status:'paused',created_at:0,counts:{calibration_hold:60},reason:'RunBusy',executor_active:false,control:null,
       spec:{prepare_only:false,max_model_calls:null,desired_count:200,catalog_id:'a'.repeat(24)},model_calls_reserved:500,
       selection_progress:{requested:200,diagnostic_passed:60,attempted:95,candidate_pool:300},items:[],events:[],
-      resume:{mode:mode==='resume'?'resume':'recover',message:'系统已更新，已完成的标注会保留。点击“继续标注”处理剩余数量。'}}
+      resume:{mode:mode==='resume'?'resume':'recover',message:'系统已更新。继续时将保留已完成标注，清理中断进度，并在原任务中处理剩余数量。'}}
     if (mode==='restart_required') paused.resume={mode:'unavailable',message:'后端运行期间代码已更新，请先重启后端服务。'}
+    if (mode.startsWith('completed')) {
+      paused.status='completed'
+      const statuses=mode==='completed'?['calibration_hold','needs_evidence','failed']:['pending']
+      paused.items=statuses.map((status,index)=>({ordinal:index+1,status,target:{category:'vehicle'}}))
+      if (mode==='completed') paused.spec.desired_count=null
+      if (mode==='completed_goal') paused.selection_progress.diagnostic_passed=200
+    }
     if (mode.startsWith('delete')) paused.items=[{ordinal:5059,run_id:'a'.repeat(24),packet_id:'b'.repeat(24),
       expression:'The visible red vehicle in the left-side view.',status:'calibration_hold',legacy_rules:true,
       target:{category:'vehicle',context:'same-context',object_id:'native-object',timestamp:123},manual_review:null}]
@@ -784,6 +792,14 @@ test('deletion and rework preserve user decisions when follow-up operations fail
     }
     try {
       let nodes=render()
+      if (mode.startsWith('completed')) {
+        const resumable=mode==='completed_recoverable'
+        assert.equal(nodes.some(n=>n.props?.className==='notice' && n.props.children===paused.resume.message),resumable)
+        assert.equal(nodes.some(n=>n.type==='button' && n.props.children==='继续标注'),resumable)
+        if (!resumable) assert.ok(nodes.some(n=>n.type==='progress' && n.props.value===n.props.max))
+        assert.equal(calls.length,0)
+        continue
+      }
       if (mode==='restart_required') {
         assert.equal(nodes.find(n=>n.type==='button' && n.props.children==='继续标注').props.disabled,true)
         assert.equal(calls.length,0)
