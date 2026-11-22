@@ -17,7 +17,8 @@ from app.quality.research import digest, final_text, wilson
 PROTOCOL = 'prospective-paired-single-frame-human-v1'
 BASELINE = 'fixed-vlm-one-request-v1'
 QUALITY_METRICS = 'agent-quality-metrics-v2'
-QUALITY_REVIEW_PROTOCOL = '人工盲选准确率按目标揭示前锁定的选择统计。全部选择锁定后显示原生目标，再核对文本事实。'
+QUALITY_REVIEW_PROTOCOL = ('全部选择锁定后显示原生目标，再核对文本事实。'
+                           '封存前可更正误点，人工盲审准确率按审核者确认的目标选择统计。')
 QUALITY_LIMITATIONS = [
     '定位为原生候选中的人工选取。',
     '95% Wilson 区间未校正同片段样本相关性。',
@@ -66,12 +67,12 @@ class Judgment(Contract):
 def quality_metrics(rows):
     delivered = [row for row in rows if row['accepted']]
     sampled = [row for row in delivered if row['sampled']]
-    independent = not any(row['exposure_excluded'] for row in sampled)
+    publish_localization = not any(row['exposure_excluded'] for row in sampled)
     return {
         'automatic_completion_rate': wilson(len(delivered), len(rows)),
         'text_accuracy': wilson(sum(row['factual_correct'] is True for row in sampled), len(sampled)),
         'blind_target_identification_accuracy': wilson(
-            sum(row['localization_correct'] is True for row in sampled), len(sampled)) if independent else None,
+            sum(row['localization_correct'] is True for row in sampled), len(sampled)) if publish_localization else None,
     }
 
 
@@ -79,24 +80,25 @@ def localization_result(selection, expected):
     return 'correct' if selection == [expected] else 'incorrect' if selection else 'unmatched'
 
 
-def independent_quality_scores(expected, judgment, excluded):
+def reviewed_selection(judgment):
+    return judgment.get('corrected_selection', judgment.get('selection'))
+
+
+def review_scores(expected, judgment, excluded):
     return {'factual_correct': judgment['answer']['factual_correct'],
-            'localization_correct': judgment['selection'] == [expected] if not excluded else None}
+            'localization_correct': reviewed_selection(judgment) == [expected] if not excluded else None}
 
 
 def study_report(report):
-    """Present older sealed scores on the blind basis without changing stored reports."""
-    if not report or report.get('protocol') != QUALITY_METRICS or 'first_selection_accuracy' not in report['quality']:
+    """Expose one score and one submitted selection per case, preserving stored records."""
+    if not report or report.get('protocol') != QUALITY_METRICS:
         return report
-    quality = report['quality'].copy()
-    quality['blind_target_identification_accuracy'] = quality.pop('first_selection_accuracy')
+    quality = {key: value for key, value in report['quality'].items() if key != 'first_selection_accuracy'}
     rows = []
     for saved in report['rows']:
-        row = saved.copy()
-        if 'first_localization_correct' in row:
-            row['localization_correct'] = row.pop('first_localization_correct')
+        row = {key: value for key, value in saved.items() if key != 'first_localization_correct'}
         row['judgments'] = [{k: v for k, v in judgment.items() if k != 'corrected_selection'}
-                            for judgment in row['judgments']]
+                           | {'selection': reviewed_selection(judgment)} for judgment in row['judgments']]
         rows.append(row)
     return {**report, 'quality': quality, 'rows': rows,
             'review_protocol': QUALITY_REVIEW_PROTOCOL, 'limitations': QUALITY_LIMITATIONS}
@@ -161,10 +163,14 @@ class PaperStudyStore:
             CREATE TABLE IF NOT EXISTS paper_cases(case_id TEXT PRIMARY KEY,study_id TEXT NOT NULL,ordinal INTEGER NOT NULL,
                 method TEXT NOT NULL,payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS paper_reviews(case_id TEXT NOT NULL,token TEXT NOT NULL,selection TEXT,answer TEXT,
-                updated_at REAL NOT NULL,localization_seconds REAL NOT NULL DEFAULT 0,PRIMARY KEY(case_id,token));
+                updated_at REAL NOT NULL,localization_seconds REAL NOT NULL DEFAULT 0,corrected_selection TEXT,
+                PRIMARY KEY(case_id,token));
             ''')
-            if 'localization_seconds' not in {r['name'] for r in db.execute('PRAGMA table_info(paper_reviews)')}:
+            columns = {r['name'] for r in db.execute('PRAGMA table_info(paper_reviews)')}
+            if 'localization_seconds' not in columns:
                 db.execute('ALTER TABLE paper_reviews ADD COLUMN localization_seconds REAL NOT NULL DEFAULT 0')
+            if 'corrected_selection' not in columns:
+                db.execute('ALTER TABLE paper_reviews ADD COLUMN corrected_selection TEXT')
 
     def private(self, sid):
         with self.runs.connect() as db:
@@ -272,7 +278,7 @@ class PaperStudyStore:
         rows = []
         for item in db.execute("""SELECT json_extract(c.payload,'$.accepted') AS accepted,
                 json_extract(c.payload,'$.sampled') AS sampled, json_extract(c.payload,'$.expected') AS expected,
-                r.selection,r.answer
+                COALESCE(r.corrected_selection,r.selection) AS selection,r.answer
                 FROM paper_cases c JOIN paper_reviewers p ON p.study_id=c.study_id AND p.role=0
                 LEFT JOIN paper_reviews r ON r.case_id=c.case_id AND r.token=p.token WHERE c.study_id=?""",(sid,)):
             if not (item['accepted'] and item['sampled']):
@@ -283,7 +289,7 @@ class PaperStudyStore:
             answer = json.loads(item['answer'])
             excluded = answer.get('prior_target_exposure') is True
             rows.append({'accepted':True,'sampled':True,'exposure_excluded':excluded,
-                         **independent_quality_scores(item['expected'],
+                         **review_scores(item['expected'],
                             {'selection':json.loads(item['selection']),'answer':answer},excluded)})
         return {'quality':quality_metrics(rows),'prior_exposure_count':sum(r['exposure_excluded'] for r in rows)}
 
@@ -419,8 +425,11 @@ class PaperStudyStore:
             cases=[{**dict(r),'payload':json.loads(r['payload'])} for r in db.execute('SELECT * FROM paper_cases WHERE study_id=?',(sid,))]
             reviews={}
             for r in db.execute('SELECT r.* FROM paper_reviews r JOIN paper_cases c ON c.case_id=r.case_id WHERE c.study_id=?',(sid,)):
-                reviews[(r['case_id'],r['token'])]={'selection':json.loads(r['selection']) if r['selection'] is not None else None,
+                review={'selection':json.loads(r['selection']) if r['selection'] is not None else None,
                     'answer':json.loads(r['answer']) if r['answer'] else None,'localization_seconds':r['localization_seconds']}
+                if r['corrected_selection'] is not None:
+                    review['corrected_selection']=json.loads(r['corrected_selection'])
+                reviews[(r['case_id'],r['token'])]=review
             people=[dict(r) for r in db.execute('SELECT * FROM paper_reviewers WHERE study_id=? ORDER BY role',(sid,))]
         return cases,reviews,people
 
@@ -438,6 +447,10 @@ class PaperStudyStore:
     def assigned(self,token):
         person=self.reviewer(token);s=self.private(person['study_id'])
         cases,reviews,people=self.records(s['study_id'])
+        report=s['report']
+        if s['status']=='sealed' and person['role']==0 and report and report.get('protocol')==QUALITY_METRICS:
+            # Older installations allowed corrections after sealing. Use the same snapshot as the report.
+            reviews.update({(row['case_id'],token):row['judgments'][0] for row in report['rows'] if row['judgments']})
         visible=[c for c in cases if c['payload']['expression'] and c['payload'].get('review_required',c['payload'].get('sampled',True))]
         complete=all(reviews.get((c['case_id'],p['token']),{}).get('answer') for c in visible for p in people[:2])
         if person['role']==2:
@@ -456,7 +469,7 @@ class PaperStudyStore:
             selection=review.get('selection')
             entry={'case_id':c['case_id'],'localized':selection is not None,'answered':bool(review.get('answer'))}
             if selection is not None and c['payload'].get('quality_protocol')==QUALITY_METRICS:
-                entry['localization_result']=localization_result(selection,c['payload']['expected'])
+                entry['localization_result']=localization_result(reviewed_selection(review),c['payload']['expected'])
             entries.append(entry)
         return {'title':s['spec']['title'],'reviewer':person['name'],'role':person['role'],'status':s['status'],
             'quality_protocol':s['spec'].get('quality_protocol'),
@@ -477,7 +490,7 @@ class PaperStudyStore:
             if c['payload'].get('quality_protocol') == QUALITY_METRICS and len(labels) > 1:
                 raise ValueError('盲测须提交一个目标，或明确选择无法唯一定位。')
             if old.get('selection') is not None:
-                if old['selection']!=labels:raise ValueError('定位已锁定，不能在查看目标后修改。')
+                if old['selection']!=labels:raise ValueError('定位已锁定。')
                 return self.inbox(token)
             with self.runs.connect() as db:
                 db.execute('INSERT INTO paper_reviews(case_id,token,selection,updated_at,localization_seconds) VALUES(?,?,?,?,?)',
@@ -496,6 +509,22 @@ class PaperStudyStore:
                 (json.dumps(answer.model_dump()),time.time(),cid,token))
         return self.inbox(token)
 
+    def correct_selection(self,token,cid,labels):
+        with self.runs.maintenance():
+            case,review,revealed=self.case(token,cid)
+            if self.private(case['study_id'])['status']=='sealed':
+                raise ValueError('报告已封存。')
+            if case['payload'].get('quality_protocol')!=QUALITY_METRICS or not revealed or not review.get('answer'):
+                raise ValueError('请先提交此条审核判断，再更正误点。')
+            if len(labels)>1 or not set(labels)<=case['payload']['mapping'].keys():
+                raise ValueError('候选编号无效。')
+            if labels!=reviewed_selection(review):
+                correction=None if labels==review['selection'] else json.dumps(labels)
+                with self.runs.connect() as db:
+                    db.execute('UPDATE paper_reviews SET corrected_selection=?,updated_at=? WHERE case_id=? AND token=?',
+                               (correction,time.time(),cid,token))
+        return self.inbox(token)
+
     def seal(self,sid,service):
         with self.runs.maintenance():
             s=self.private(sid)
@@ -505,7 +534,7 @@ class PaperStudyStore:
             cases,reviews,people=self.records(sid);rows=[];disputes=0
             for c in cases:
                 data=c['payload'];judgments=[];effective=False;excluded=False
-                independent_scores = {}
+                scores = {}
                 review_required=data.get('review_required',data.get('sampled',True))
                 if not review_required:
                     effective=None
@@ -522,13 +551,13 @@ class PaperStudyStore:
                         selected={'reviewer':people[2]['name'],**review};judgments.append(selected)
                     excluded=any(j['answer'].get('prior_target_exposure') is True for j in judgments)
                     if quality_study:
-                        independent_scores = independent_quality_scores(data['expected'],selected,excluded)
+                        scores = review_scores(data['expected'],selected,excluded)
                         effective = None
                     else:
                         effective=self.verdict(c,selected) if not excluded else None
                 rows.append({'case_id':c['case_id'],'ordinal':c['ordinal'],'method':c['method'],
                     **{k:v for k,v in data.items() if k not in {'packet','mapping'}},
-                    'judgments':judgments,'valid':effective,'exposure_excluded':excluded, **independent_scores})
+                    'judgments':judgments,'valid':effective,'exposure_excluded':excluded, **scores})
             if quality_study:
                 report = {
                     'protocol': QUALITY_METRICS, 'study_id': sid, 'spec': s['spec'],

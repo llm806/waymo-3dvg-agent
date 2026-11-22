@@ -65,8 +65,9 @@ test('blind review synchronizes picked boxes and safely advances through localiz
       if (hold) await new Promise(resolve=>{release=resolve})
       if (fail) return new Response(JSON.stringify({detail:'保存失败'}),{status:503})
       const row = records.find(c=>c.case_id===cid)
-      assert.ok(['localization','answer'].includes(kind))
+      assert.ok(['localization','answer','correction'].includes(kind))
       if (kind==='localization') { row.localized=true; selections[cid]=posts.at(-1).body.selected_labels }
+      else if (kind==='correction') { selections[cid]=posts.at(-1).body.selected_labels }
       else { row.answered=true; judgments[cid]=posts.at(-1).body }
       return Response.json(inbox())
     }
@@ -236,7 +237,7 @@ test('blind review synchronizes picked boxes and safely advances through localiz
     const completedPosts=posts.length
     assert.equal(scene().props.onSelect,undefined)
     assert.deepEqual(scene().props.data.selection,['C001'])
-    assert.ok(nodes().some(n=>n.props?.children==='锁定选择 C001 · 原生目标 C002'))
+    assert.ok(nodes().some(n=>n.props?.children==='已选目标 C001 · 原生目标 C002'))
     assert.equal(scene().props.selected,'C002')
     button('下一条').props.onClick();await settle()
     assert.equal(scene().props.data.case_id,'b')
@@ -246,9 +247,23 @@ test('blind review synchronizes picked boxes and safely advances through localiz
     assert.equal(scene().props.data.case_id,'b')
     jump('1');await settle()
     assert.equal(posts.length,completedPosts)
+    button('更正误点').props.onClick();render()
+    assert.equal(button('保存更正').props.disabled,true)
+    pick('C002')
+    assert.equal(scene().props.selected,'C002')
+    button('取消').props.onClick();render()
+    assert.equal(posts.length,completedPosts)
+    assert.deepEqual(scene().props.data.selection,['C001'])
+    button('更正误点').props.onClick();render();pick('C002')
+    const selectionForm=nodes().find(n=>n.type==='form' && walk(n).some(child=>child.props?.children==='保存更正'))
+    selectionForm.props.onSubmit({preventDefault(){}});await settle()
+    assert.deepEqual(posts.at(-1),{cid:'a',kind:'correction',body:{selected_labels:['C002']}})
+    assert.deepEqual(scene().props.data.selection,['C002'])
+    assert.ok(nodes().some(n=>n.props?.children==='已选目标 C002 · 原生目标 C002'))
+    assert.ok(walk(reviewEntries()).find(n=>n.type==='option').props.children.includes('命中'))
     const rate={numerator:1,denominator:2,value:0.5,ci95:null}
     const metrics=walk(exports.StudyReport({legacy:false,report:{quality:{blind_target_identification_accuracy:rate}}}))
-    assert.deepEqual(metrics.filter(n=>n.type==='dt').map(n=>n.props.children),['自动完成率','人工盲选准确率','文本准确率'])
+    assert.deepEqual(metrics.filter(n=>n.type==='dt').map(n=>n.props.children),['自动完成率','人工盲审准确率','文本准确率'])
   } finally { cleanups.forEach(f=>f?.());globalThis.fetch=savedFetch }
 })
 const compiled = ts.transpileModule(readFileSync(new URL('../src/features/tasks/TaskManager.tsx', import.meta.url), 'utf8'), {

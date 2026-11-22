@@ -5211,43 +5211,54 @@ def _check_independent_quality_metrics(papers, batches, packet, template):
     assert papers.detail(study_id,service)['quality_preview'] is None
     with pytest.raises(ValueError, match='定位已锁定'):
         papers.select(token, first['case_id'], [expected])
-    # Restored databases may contain a correction made after target reveal.
-    with papers.runs.connect() as db:
-        db.execute('ALTER TABLE paper_reviews ADD COLUMN corrected_selection TEXT')
-        db.execute('UPDATE paper_reviews SET corrected_selection=? WHERE case_id=? AND token=?',
-                   (json.dumps([expected]), first['case_id'], token))
+    with pytest.raises(ValueError, match='提交此条审核判断'):
+        papers.correct_selection(token, first['case_id'], [expected])
     for index, case in enumerate(sampled):
         papers.answer(token, case['case_id'], Judgment(factual_correct=index != 1,elapsed_seconds=1))
+    assert papers.detail(study_id,service)['quality_preview']['quality']['blind_target_identification_accuracy'] == wilson(1,3)
+    with pytest.raises(ValueError, match='候选编号无效'):
+        papers.correct_selection(token, first['case_id'], [expected, wrong])
+    saved = papers.correct_selection(token, first['case_id'], [expected])
+    assert next(row for row in saved['cases'] if row['case_id']==first['case_id']) == {
+        'case_id':first['case_id'], 'localized':True, 'answered':True, 'localization_result':'correct'}
+    assert papers.correct_selection(token, first['case_id'], [expected]) == saved
+    _, review, _ = papers.case(token, first['case_id'])
+    assert review['selection'] == [wrong] and review['corrected_selection'] == [expected]
+    saved = papers.correct_selection(token, first['case_id'], [])
+    assert next(row for row in saved['cases'] if row['case_id']==first['case_id'])['localization_result'] == 'unmatched'
+    assert papers.detail(study_id,service)['quality_preview']['quality']['blind_target_identification_accuracy'] == wilson(1,3)
+    papers.correct_selection(token, first['case_id'], [expected])
     preview=papers.detail(study_id,service)['quality_preview']
-    assert next(row for row in papers.inbox(token)['cases'] if row['case_id']==first['case_id']) == {
-        'case_id':first['case_id'], 'localized':True, 'answered':True, 'localization_result':'incorrect'}
     report = papers.seal(study_id, service)['report']
     quality = report['quality']
     assert report['protocol'] == QUALITY_METRICS
     assert quality==preview['quality']=={'automatic_completion_rate':wilson(4,6), 'text_accuracy':wilson(2,3),
-                                       'blind_target_identification_accuracy':wilson(1,3)}
-    assert papers.private(study_id)['report']==report
+                                       'blind_target_identification_accuracy':wilson(2,3)}
+    stored = papers.private(study_id)['report']
+    judged = next(row for row in stored['rows'] if row['case_id'] == first['case_id'])['judgments'][0]
+    assert judged['selection'] == [wrong] and judged['corrected_selection'] == [expected]
     assert papers.detail(study_id,service)['quality_preview'] is None
     with pytest.raises(ValueError, match='已封存'):
-        papers.select(token, first['case_id'], [expected])
+        papers.correct_selection(token, first['case_id'], [])
 
-    legacy = json.loads(json.dumps(report))
+    legacy = json.loads(json.dumps(stored))
     legacy['quality']['first_selection_accuracy'] = wilson(1,3)
-    legacy['quality']['blind_target_identification_accuracy'] = wilson(2,3)
     row = next(row for row in legacy['rows'] if row['case_id'] == first['case_id'])
     row['first_localization_correct'] = False
-    row['localization_correct'] = True
-    row['judgments'][0]['corrected_selection'] = [expected]
     with papers.runs.connect() as db:
         db.execute('UPDATE paper_studies SET report=? WHERE study_id=?', (json.dumps(legacy), study_id))
+        db.execute('UPDATE paper_reviews SET corrected_selection=? WHERE case_id=? AND token=?',
+                   ('[]', first['case_id'], token))
     assert papers.detail(study_id,service)['report'] == report
+    assert papers.case(token,first['case_id'])[1]['corrected_selection'] == [expected]
+    assert next(row for row in papers.inbox(token)['cases'] if row['case_id']==first['case_id'])['localization_result']=='correct'
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(paper_studies=papers)))
     assert json.loads(study_export(study_id, 'json', request).body) == report
     reader = csv.DictReader(io.StringIO(study_export(study_id, 'csv', request).body.decode('utf-8-sig')))
     assert 'first_localization_correct' not in reader.fieldnames
     exported = next(row for row in reader if row['ordinal'] == str(first['ordinal']))
-    assert exported['localization_correct'] == 'False'
-    assert json.loads(exported['judgments'])[0]['selection'] == [wrong]
+    assert exported['localization_correct'] == 'True'
+    assert json.loads(exported['judgments'])[0]['selection'] == [expected]
     assert papers.private(study_id)['report'] == legacy
 
     rows = [{**row, 'exposure_excluded': row['case_id'] == first['case_id']} for row in report['rows']]
