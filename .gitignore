@@ -11,6 +11,7 @@ runtime/
 /datasets/
 /exports/
 /artifacts/
+/output/
 .venv/
 venv/
 __pycache__/
