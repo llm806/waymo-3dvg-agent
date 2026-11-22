@@ -19,7 +19,7 @@ from app.datasets.training import read_scene
 router = APIRouter(prefix='/api/research',tags=['independent research audit'])
 
 
-from app.quality.paper_study import StudySpec,Judgment
+from app.quality.paper_study import StudySpec,Judgment,study_report
 
 
 @router.get('/studies')
@@ -70,7 +70,7 @@ def study_export(study_id:Id,format:Literal['json','csv'],request:Request):
         total=report['spec']['sample_size']
         sampled=sum(bool(row.get('sampled', row.get('judgments'))) for row in report['rows'] if row['method']=='agent')
         if format=='csv':data=store.export_csv(study_id)
-        else:data=json.dumps(report,ensure_ascii=False,indent=2)
+        else:data=json.dumps(study_report(report),ensure_ascii=False,indent=2)
         return Response(data,media_type='text/csv' if format=='csv' else 'application/json',
             headers={'Content-Disposition':f'attachment; filename="eval-{date}-n{total}-s{sampled}.{format}"'})
     except ValueError as exc:raise HTTPException(409,str(exc)) from exc
@@ -104,7 +104,6 @@ def study_case(token:str,case_id:Id,request:Request):
         boxes=[{'box_id':f'P{i}','candidate_id':labels.get(b['object_id']),'category':b['category'],'xyxy':b['xyxy']}
             for i,b in enumerate(p.provenance.get('scene_image_candidates',[])) if b.get('camera_name')==camera]
         return {'case_id':case_id,'expression':case['payload']['expression'],'selection':review.get('selection'),
-            'corrected_selection':review.get('corrected_selection') if revealed else None,
             'answer':review.get('answer'),'revealed':revealed,'expected':case['payload']['expected'] if revealed else None,
             'preview':{'points':arrays['points'][selected,:3].tolist(),'target_points':[],'target_corners':[],
                 'candidate_boxes':[{'object_id':label,'category':by_id[oid].category,'corners':corners(by_id[oid])} for label,oid in mapping.items()],
@@ -151,13 +150,6 @@ def study_select(token:str,case_id:Id,body:PaperSelection,request:Request):
 def study_answer(token:str,case_id:Id,body:Judgment,request:Request):
     mutation_origin(request)
     try:return request.app.state.paper_studies.answer(token,case_id,body)
-    except ValueError as exc:raise HTTPException(409,str(exc)) from exc
-
-
-@router.post('/review/{token}/cases/{case_id}/correction')
-def study_correct_selection(token:str,case_id:Id,body:PaperSelection,request:Request):
-    mutation_origin(request)
-    try:return request.app.state.paper_studies.correct_selection(token,case_id,body.selected_labels)
     except ValueError as exc:raise HTTPException(409,str(exc)) from exc
 
 

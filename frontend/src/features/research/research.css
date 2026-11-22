@@ -66,9 +66,6 @@
 .paper-judgment legend { color: var(--ui-text); font-size: 14px; font-weight: 600; }
 .paper-judgment fieldset label { margin-right: 22px; font-size: 13px; }
 .paper-judgment textarea { min-height: 78px; resize: vertical; margin-bottom: 13px; }
-.paper-correction { display:grid; gap:8px; margin-bottom:var(--field-gap); padding-bottom:var(--field-gap); border-bottom:1px solid var(--ui-border); }
-.paper-correction p { margin:0; }
-.paper-correction small { color:var(--ui-muted); }
 .paper-review-complete { border-top: 2px solid var(--ui-accent-line); }
 .paper-completion-link { display: inline-flex; align-items: center; min-height: 36px; border-radius: 5px; padding: 7px 12px; text-decoration: none; font-size: 13px; line-height: 1.5; }
 .paper-blind:has(.paper-localization-actions) { padding-bottom: 170px; }

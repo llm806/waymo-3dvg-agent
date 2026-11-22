@@ -18,7 +18,7 @@ type Study = { study_id:string;job_id:string;status:string;created_at:number;spe
 type LocalizationResult = 'correct'|'incorrect'|'unmatched'
 type Inbox = {title:string;reviewer:string;role:number;status:string;phase:string;waiting:boolean;quality_protocol?:string|null;cases:{case_id:string;localized:boolean;answered:boolean;localization_result?:LocalizationResult}[]}
 type Answer = { factual_correct:boolean;unique?:boolean|null;input_sufficient?:boolean|null;prior_target_exposure?:boolean|null;notes:string;elapsed_seconds:number }
-type BlindCase = Pick<TaskSceneData,'preview'|'candidates'|'cameras'> & {case_id:string;expression:string;selection:string[]|null;corrected_selection?:string[]|null;answer:Answer|null;revealed:boolean;expected:string|null;full_cloud:string;point_count:number}
+type BlindCase = Pick<TaskSceneData,'preview'|'candidates'|'cameras'> & {case_id:string;expression:string;selection:string[]|null;answer:Answer|null;revealed:boolean;expected:string|null;full_cloud:string;point_count:number}
 const names:Record<string,string>=localizeLabels({ready:'待开始',running:'生成中',queued:'已排队',paused:'已暂停',stopped:'已停止',completed:'生成结束',blocked:'生成受阻',review:'独立盲审中',sealed:'已封存',creating:'建立中'})
 function singleReviewComplete(study:Study){
   const delivered=study.automatic_completion_rate?.numerator??study.batch.passed
@@ -151,9 +151,7 @@ function StudyManager(){
           <button className="primary" aria-expanded={creating} aria-controls={creating?'evaluation-plan':undefined} onClick={()=>setCreating(!creating)} disabled={busy}>{creating?t("收起设置"):t("新建评估")}</button>
         </div>
       </div>
-      <StudyReport report={study?.quality_preview??study?.report??null} completion={study?.automatic_completion_rate??null} legacy={legacy}/>
-      {study?.report?.quality&&study.quality_preview?.quality&&study.report.quality.blind_target_identification_accuracy?.numerator!==study.quality_preview.quality.blind_target_identification_accuracy?.numerator&&
-        <p className="muted">{t("当前指标含封存后的更正；下载报告采用封存时的结果。")}</p>}
+      <StudyReport report={study?.report??study?.quality_preview??null} completion={study?.automatic_completion_rate??null} legacy={legacy}/>
     </section>
     {creating&&<form id="evaluation-plan" className="paper-card paper-create" aria-labelledby="evaluation-plan-title" onSubmit={create}>
       <h2 id="evaluation-plan-title">{t("评估设置")}</h2>
@@ -173,7 +171,7 @@ function StudyManager(){
             <label>{t("计划抽审数")}<input type="number" min={1} max={500} required value={reviewSize} aria-describedby="review-plan" onChange={e=>setReviewSize(e.target.value)}/></label>
             <label>{t("独立审核者")}<input required maxLength={80} placeholder={t("审核者标识")} value={reviewer} onChange={e=>setReviewer(e.target.value)}/></label>
           </div>
-          <p id="review-plan">{reviewPlan} {t("同一批样本先盲选目标，再核对文本，据此计算人工盲审准确率和文本准确率。")}</p>
+          <p id="review-plan">{reviewPlan} {t("同一批样本先盲选目标，再核对文本，据此计算人工盲选准确率和文本准确率。")}</p>
         </fieldset>
       </div>
       <div className="paper-form-footer"><p>{t("创建评估时建立专用标注任务并锁定目标。点击「开始生成」后调用模型。")}</p><button className="primary" disabled={busy}>{busy?t("正在创建…"):t("创建评估")}</button></div>
@@ -322,7 +320,7 @@ function StudyReport({report,completion,legacy}:{report:Report|null;completion:R
       {label:t("交付有效率"), rate:quality?.accepted_validity, detail:t("盲审有效交付 ÷ 全部交付")},
       {label:t("随机抽样通过率"), rate:quality?.random_sample_pass_rate, detail:t("盲审有效样本 ÷ 实际抽样数")},
     ] : [
-      {label:t("人工盲审准确率"), rate:quality?.blind_target_identification_accuracy, detail:t("人工盲选命中数 ÷ 实际抽审数")},
+      {label:t("人工盲选准确率"), rate:quality?.blind_target_identification_accuracy, detail:t("锁定的盲选命中数 ÷ 实际抽审数")},
       {label:t("文本准确率"), rate:quality?.text_accuracy, detail:t("属性与关系均正确的描述数 ÷ 实际抽审数")},
     ]),
   ]
@@ -343,7 +341,7 @@ function StudyReport({report,completion,legacy}:{report:Report|null;completion:R
         </dd>
       </div>
     ))}</dl>
-    {!!report?.prior_exposure_count&&<p className="notice" role="status">{t("有 {0} 条样本在盲测前已知目标，人工盲审准确率不发布。", report.prior_exposure_count)}</p>}
+    {!!report?.prior_exposure_count&&<p className="notice" role="status">{t("有 {0} 条样本在盲测前已知目标，人工盲选准确率不发布。", report.prior_exposure_count)}</p>}
   </>
 }
 
@@ -358,7 +356,7 @@ function BlindReview({token}:{token:string}){
   const [noMatch,setNoMatch]=useState(false),[loadVersion,setLoadVersion]=useState(0)
   const [inboxVersion,setInboxVersion]=useState(0)
   const [inspectCompleted,setInspectCompleted]=useState(false)
-  const [wrongOnly,setWrongOnly]=useState(false),[correctionDrafts,setCorrectionDrafts]=useState<Record<string,string>>({})
+  const [wrongOnly,setWrongOnly]=useState(false)
   const [jumpIndex,setJumpIndex]=useState(''),[navigationError,setNavigationError]=useState('')
   const [savedBlind,setSavedBlind]=useState<{index:number;result:LocalizationResult}|null>(null)
   const reviewComplete=!!inbox?.cases.length&&inbox.cases.every(c=>c.answered)
@@ -378,9 +376,6 @@ function BlindReview({token}:{token:string}){
   const locked=data?.selection!=null||!!inbox?.cases.find(c=>c.case_id===cid)?.localized
   const selectionDisabled=!current||locked||busy||inbox?.status==='sealed'
   const judgmentDisabled=!current||busy||!!data?.answer||inbox?.status==='sealed'
-  const canCorrect=singleTarget&&reviewComplete&&current&&data?.revealed
-  const savedCorrection=(data?.corrected_selection??data?.selection)?.[0]??''
-  const correction=correctionDrafts[cid]??savedCorrection
   async function submit(kind:'localization'|'answer'){
     if(submitting.current||!current||inbox?.status==='sealed')return
     if(kind==='localization'&&(locked||data?.revealed||(!selection.length&&!noMatch)))return
@@ -415,20 +410,6 @@ function BlindReview({token}:{token:string}){
     if(checked&&!misses.some(({entry})=>entry.case_id===cid)){
       openEntry(misses[0]?.entry.case_id??'')
     }
-  }
-  function chooseCorrection(id:string){
-    if(canCorrect&&!submitting.current)setCorrectionDrafts(old=>({...old,[cid]:id}))
-  }
-  async function saveCorrection(event:FormEvent){
-    event.preventDefault()
-    if(submitting.current||!canCorrect||correction===savedCorrection)return
-    submitting.current=true;setBusy(true);setError('')
-    try{
-      const result=await post<{corrected_selection:string[];localization_result:LocalizationResult}>(`review/${token}/cases/${cid}/correction`,{selected_labels:correction?[correction]:[]})
-      setData(old=>old?.case_id===cid?{...old,corrected_selection:result.corrected_selection}:old)
-      setInbox(old=>old?{...old,cases:old.cases.map(c=>c.case_id===cid?{...c,localization_result:result.localization_result}:c)}:old)
-      setCorrectionDrafts(old=>{const next={...old};delete next[cid];return next})
-    }catch(e){setError(errorMessage(e))}finally{submitting.current=false;setBusy(false)}
   }
   const fields=singleTarget
     ? [['factual_correct',t("针对框出的原生目标，描述中的全部属性和空间关系是否都与场景一致？无法确认时选“否”。")]]
@@ -473,16 +454,7 @@ function BlindReview({token}:{token:string}){
     {cid&&!current&&<p role="status">{error?<button onClick={()=>{setError('');setLoadVersion(old=>old+1)}}>{t("重新加载当前条目")}</button>:t("正在加载审核条目…")}</p>}
     {current&&data&&<section className="paper-card"><blockquote className="paper-expression" lang="en">{data.expression}</blockquote>
       {(!data.revealed||!singleTarget)&&<p className="paper-note">{data.revealed?t("预期目标：{0}。你之前锁定的候选：{1}。请独立判断事实和唯一性。", data.expected, data.selection?.join('、')||t("没有匹配对象")):singleTarget?t("根据描述和场景选择一个目标。没有匹配对象或有多个合理对象时，选“无法唯一定位”。全部选择锁定后才会揭示目标。"):t("请选择所有符合表达的对象，可多选或明确提交空选。全部条目定位锁定前不会揭示目标。")}</p>}
-      {canCorrect&&<form className="paper-correction" onSubmit={saveCorrection}>
-        <p>{t("当前选择 {0} · 正确目标 {1}",savedCorrection||t("无法唯一定位"),data.expected)}</p>
-        <div className="paper-actions"><label>{t("更正选择")} <select value={correction} disabled={busy} onChange={e=>chooseCorrection(e.target.value)}>
-          <option value="">{t("无法唯一定位")}</option>
-          {data.candidates.map(c=><option key={c.candidate_id} value={c.candidate_id}>{c.candidate_id} · {categoryLabel(c.category)}</option>)}
-        </select></label><button disabled={busy||correction===savedCorrection}>{t("保存更正")}</button></div>
-        <small>{t("保存更正后，人工盲审准确率按最终选择更新。")}</small>
-        {data.corrected_selection&&<p role="status">{t("更正已保存 · {0}",localizationLabel(
-          data.corrected_selection[0]===data.expected?'correct':data.corrected_selection.length?'incorrect':'unmatched'))}</p>}
-      </form>}
+      {singleTarget&&data.revealed&&inspectCompleted&&<p className="paper-note">{t("锁定选择 {0} · 原生目标 {1}",data.selection?.[0]??t("无法唯一定位"),data.expected)}</p>}
       {!data.revealed&&<div className="paper-localization-actions" aria-label={t("盲评定位确认")}>
         <div aria-live="polite"><strong>{locked?t("定位已锁定"):selection.length?singleTarget?t("已选 ")+selection[0]:t("已选 {0} 个对象", selection.length):noMatch&&singleTarget?t("无法唯一定位"):t("尚未选择匹配对象")}</strong><p className="muted">{locked?t("完成其余条目后进入事实核对。"):singleTarget?t("点击场景中的框或候选编号选择目标。"):t("点击框即可加入答案。点击下方编号可移除。")}</p>
           {savedBlind&&<p className="paper-selection-receipt">{t("第 {0} 条已保存 · {1}",savedBlind.index,localizationLabel(savedBlind.result))}</p>}
@@ -491,7 +463,7 @@ function BlindReview({token}:{token:string}){
         <div className="paper-actions"><label><input type="checkbox" aria-label={singleTarget?t("无法唯一定位"):t("没有匹配对象")} checked={noMatch} disabled={selectionDisabled||(!singleTarget&&selection.length>0)} onChange={e=>{setNoMatch(e.target.checked);if(singleTarget&&e.target.checked){setSelection([]);setFocus('')}}}/>{singleTarget?t("无法唯一定位"):t("没有匹配对象")}</label><button className="primary" disabled={selectionDisabled||(!selection.length&&!noMatch)} onClick={()=>void submit('localization')}>{busy?t("正在保存…"):locked?t("定位已锁定"):singleTarget?t("锁定选择，下一条"):noMatch?t("确认无匹配对象，下一条"):t("确认所选对象，下一条")}</button></div>
         {error&&<p role="alert" className="error">{serviceText(error)}</p>}
       </div>}
-      <TaskScene key={`${cid}:${data.revealed?'revealed':'blind'}`} data={{...data,job_id:'',ordinal:0,revision:'',run_id:'',can_confirm:false,review:true,selected_candidate_id:null,confirmation:null,image_box_source:'official_lidar_box_projection'}} selected={canCorrect?correction:data.revealed?(data.expected??''):focus} onSelect={canCorrect?chooseCorrection:data.revealed?undefined:choose} candidatePicker={false}/>
+      <TaskScene key={`${cid}:${data.revealed?'revealed':'blind'}`} data={{...data,job_id:'',ordinal:0,revision:'',run_id:'',can_confirm:false,review:true,selected_candidate_id:null,confirmation:null,image_box_source:'official_lidar_box_projection'}} selected={data.revealed?(data.expected??''):focus} onSelect={data.revealed?undefined:choose} candidatePicker={false}/>
       {(!singleTarget||!data.revealed)&&<div className="paper-candidates">{data.candidates.map(c=><label key={c.candidate_id} className={selection.includes(c.candidate_id)?'checked':''}><input type={singleTarget?'radio':'checkbox'} name={singleTarget?'blind-target':undefined} disabled={locked||busy||inbox?.status==='sealed'} checked={selection.includes(c.candidate_id)} onChange={()=>singleTarget?choose(c.candidate_id):toggle(c.candidate_id)}/>{c.candidate_id}<small>{categoryLabel(c.category)}</small></label>)}</div>}
       <p className="muted">{t("完整点云 ")}{number(data.point_count)}{t(" 点 · ")}<a href={data.full_cloud}>{t("下载单帧点云")}</a></p>
       {data.revealed&&<form onSubmit={e=>{e.preventDefault();void submit('answer')}} className="paper-judgment"><h3>{t("独立事实判断")}</h3>{fields.map(([key,label])=><fieldset key={key} disabled={judgmentDisabled}><legend>{label}</legend>{['true','false'].map(value=><label key={value}><input type="radio" name={key} required value={value} checked={answers[key]===value} onChange={()=>setAnswers(old=>({...old,[key]:value}))}/>{value==='true'?t("是"):t("否")}</label>)}</fieldset>)}<label>{t("原因与备注")}<textarea maxLength={2000} value={notes} onChange={e=>setNotes(e.target.value)} disabled={judgmentDisabled} placeholder={t("指出错误事实、其他可能对象或输入缺失")}/></label><button className="primary" disabled={judgmentDisabled}>{data.answer?t("判断已保存"):busy?t("正在保存…"):t("提交独立判断，下一条")}</button></form>}

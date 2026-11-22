@@ -44,21 +44,20 @@ test('switching languages updates labels, templates and service messages', () =>
 
 test('blind review synchronizes picked boxes and safely advances through localization and judgment', async () => {
   const source = readFileSync(new URL('../src/features/research/ResearchWorkspace.tsx', import.meta.url), 'utf8')
-  const code = ts.transpileModule(source + '\nexport { BlindReview, studyStatus, studyWorkflow, selectedStudy };', {
+  const code = ts.transpileModule(source + '\nexport { BlindReview, StudyReport, studyStatus, studyWorkflow, selectedStudy };', {
     compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },
   }).outputText
   const savedFetch = globalThis.fetch
   const slots = [], dependencies = [], cleanups = [], pendingEffects = []
   let cursor = 0, tree, fail = false, release, hold = false, failLoad = false, singleTargetMode = false
   const records = [{case_id:'a', localized:false, answered:false}, {case_id:'b', localized:false, answered:false}]
-  const selections = {}, judgments = {}, corrections = {}, posts = []
+  const selections = {}, judgments = {}, posts = []
   const expected = cid => cid==='a'?'C002':'C001'
   const resultFor=(cid,selection)=>selection?.[0]===expected(cid)?'correct':selection?.length?'incorrect':'unmatched'
   const inbox = () => ({title:'Test', reviewer:'test', role:0, status:'review', waiting:false,
     quality_protocol:singleTargetMode?'agent-quality-metrics-v2':null,
     phase:records.every(c=>c.localized)?'judgment':'localization', cases:records.map(c=>({...c,
-      first_localization_result:singleTargetMode&&c.localized?resultFor(c.case_id,selections[c.case_id]):undefined,
-      localization_result:singleTargetMode&&c.localized?resultFor(c.case_id,corrections[c.case_id]??selections[c.case_id]):undefined}))})
+      localization_result:singleTargetMode&&c.localized?resultFor(c.case_id,selections[c.case_id]):undefined}))})
   globalThis.fetch = async (url, options) => {
     const parts = url.split('/'), cid = parts[6], kind = parts[7]
     if (options?.method==='POST') {
@@ -66,10 +65,7 @@ test('blind review synchronizes picked boxes and safely advances through localiz
       if (hold) await new Promise(resolve=>{release=resolve})
       if (fail) return new Response(JSON.stringify({detail:'保存失败'}),{status:503})
       const row = records.find(c=>c.case_id===cid)
-      if (kind==='correction') {
-        corrections[cid]=posts.at(-1).body.selected_labels
-        return Response.json({corrected_selection:corrections[cid],localization_result:resultFor(cid,corrections[cid])})
-      }
+      assert.ok(['localization','answer'].includes(kind))
       if (kind==='localization') { row.localized=true; selections[cid]=posts.at(-1).body.selected_labels }
       else { row.answered=true; judgments[cid]=posts.at(-1).body }
       return Response.json(inbox())
@@ -77,7 +73,7 @@ test('blind review synchronizes picked boxes and safely advances through localiz
     if (!cid) return Response.json(inbox())
     if(failLoad) return new Response(JSON.stringify({detail:'加载失败'}),{status:503})
     const revealed = records.every(c=>c.localized)
-    return Response.json({case_id:cid, expression:`Expression ${cid}`,selection:selections[cid]??null,corrected_selection:corrections[cid]??null,
+    return Response.json({case_id:cid, expression:`Expression ${cid}`,selection:selections[cid]??null,
       answer:judgments[cid]??null,revealed,expected:revealed?expected(cid):null,preview:{},cameras:[],
       candidates:[{candidate_id:'C001',category:'vehicle'},{candidate_id:'C002',category:'vehicle'}],point_count:10,full_cloud:'/test'})
   }
@@ -237,22 +233,22 @@ test('blind review synchronizes picked boxes and safely advances through localiz
     assert.equal(scene().props.data.case_id,'a')
     assert.ok(nodes().some(n=>n.props?.className==='error paper-entry-error'))
     setMisses(false);render()
-    const correction=()=>nodes().find(n=>n.props?.className==='paper-correction')
-    pick('C002')
-    assert.equal(walk(correction()).find(n=>n.type==='select').props.value,'C002')
+    const completedPosts=posts.length
+    assert.equal(scene().props.onSelect,undefined)
+    assert.deepEqual(scene().props.data.selection,['C001'])
+    assert.ok(nodes().some(n=>n.props?.children==='锁定选择 C001 · 原生目标 C002'))
     assert.equal(scene().props.selected,'C002')
     button('下一条').props.onClick();await settle()
     assert.equal(scene().props.data.case_id,'b')
     button('上一条').props.onClick();await settle()
-    assert.equal(scene().props.selected,'C002') // Keep an unsaved correction when navigating.
+    assert.equal(scene().props.selected,'C002')
     jump('2');await settle()
     assert.equal(scene().props.data.case_id,'b')
     jump('1');await settle()
-    render();correction().props.onSubmit({preventDefault(){}});await settle()
-    assert.deepEqual(posts.at(-1),{cid:'a',kind:'correction',body:{selected_labels:['C002']}})
-    assert.deepEqual(scene().props.data.selection,['C001'])
-    assert.deepEqual(scene().props.data.corrected_selection,['C002'])
-    assert.ok(nodes().some(n=>n.props?.children==='更正已保存 · 命中'))
+    assert.equal(posts.length,completedPosts)
+    const rate={numerator:1,denominator:2,value:0.5,ci95:null}
+    const metrics=walk(exports.StudyReport({legacy:false,report:{quality:{blind_target_identification_accuracy:rate}}}))
+    assert.deepEqual(metrics.filter(n=>n.type==='dt').map(n=>n.props.children),['自动完成率','人工盲选准确率','文本准确率'])
   } finally { cleanups.forEach(f=>f?.());globalThis.fetch=savedFetch }
 })
 const compiled = ts.transpileModule(readFileSync(new URL('../src/features/tasks/TaskManager.tsx', import.meta.url), 'utf8'), {
